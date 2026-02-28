@@ -15,7 +15,7 @@ from core.document_loader import load_single_file
 def _create_llm():
     """根据 provider 创建对应的 LLM 实例（仅 ollama/openai，cursor 不走 LLM）"""
     if settings.is_ollama:
-        from langchain_community.chat_models import ChatOllama
+        from langchain_ollama import ChatOllama
         return ChatOllama(
             model=settings.llm_model,
             base_url=settings.ollama_base_url,

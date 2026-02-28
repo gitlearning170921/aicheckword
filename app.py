@@ -1,11 +1,21 @@
 """Streamlit Web UI：注册文档审核工具"""
 
 import json
+import os
 import time
 import tempfile
 import shutil
 import traceback
+import warnings
 from pathlib import Path
+
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+os.environ["CHROMA_TELEMETRY"] = "False"
+os.environ["POSTHOG_DISABLED"] = "true"
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+import logging
+logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
+logging.getLogger("chromadb").setLevel(logging.WARNING)
 
 import streamlit as st
 
@@ -296,18 +306,22 @@ def _format_time(seconds):
         return f"{m}m{s}s"
 
 
-def _train_single_file(agent, file_path, file_name, log_container, embed_status):
-    """训练单个文件，分步展示进度，返回 (成功?, 块数, 耗时)"""
+def _train_single_file(agent, file_path, file_name, status_box, embed_bar, log_lines):
+    """
+    训练单个文件。通过 st.empty() 实时刷新状态。
+    log_lines: list, 累积日志，每次追加后刷新显示。
+    返回 (成功?, 块数, 耗时)
+    """
     t0 = time.time()
 
-    log_container.info(f"📂 **[{file_name}]** 正在加载文件...")
+    status_box.info(f"📂 [{file_name}] 正在加载文件...")
     try:
         docs = load_single_file(file_path)
     except Exception as e:
         tb = traceback.format_exc()
         err_msg = str(e)
-        log_container.error(f"❌ **[{file_name}]** 加载失败：{err_msg}")
-        log_container.caption("详细原因与堆栈已记入「操作记录」，可到该页查看。")
+        log_lines.append(f"- :x: **{file_name}** 加载失败：{err_msg}")
+        status_box.error(f"加载失败：{err_msg}")
         add_operation_log(
             op_type="train_error",
             collection=agent.collection_name,
@@ -316,30 +330,32 @@ def _train_single_file(agent, file_path, file_name, log_container, embed_status)
             extra={"error": err_msg, "traceback": tb, "stage": "load"},
         )
         return False, 0, time.time() - t0
-    log_container.info(f"📂 **[{file_name}]** 文件加载完成，共 {len(docs)} 页/段")
 
-    log_container.info(f"✂️ **[{file_name}]** 正在分块...")
+    status_box.info(f"✂ [{file_name}] 分块中... ({len(docs)} 页/段)")
     chunks = split_documents(docs)
-    log_container.info(f"✂️ **[{file_name}]** 分块完成，共 {len(chunks)} 个文档块")
 
     if not chunks:
-        log_container.warning(f"⚠️ **[{file_name}]** 文件内容为空，跳过")
+        log_lines.append(f"- :warning: **{file_name}** 内容为空，跳过")
+        status_box.warning(f"[{file_name}] 内容为空")
         return True, 0, time.time() - t0
 
-    log_container.info(f"🔄 **[{file_name}]** 正在向量化并入库（{len(chunks)} 块）...")
+    embed_bar.progress(0)
 
     def on_batch_done(done, total):
-        pct = done / total
-        embed_status.progress(pct)
+        pct = int(done / total * 100)
+        embed_bar.progress(pct)
+        status_box.info(
+            f"🔄 [{file_name}] 向量化 {done}/{total} 块 ({pct}%)"
+        )
 
-    embed_status.progress(0.0)
     try:
-        count = agent.kb.add_documents_with_progress(chunks, batch_size=20, callback=on_batch_done)
+        with st.spinner(f"[{file_name}] 正在向量化 {len(chunks)} 块..."):
+            count = agent.kb.add_documents_with_progress(chunks, batch_size=20, callback=on_batch_done)
     except Exception as e:
         tb = traceback.format_exc()
         err_msg = str(e)
-        log_container.error(f"❌ **[{file_name}]** 入库失败：{err_msg}")
-        log_container.caption("详细原因与堆栈已记入「操作记录」，可到该页查看。")
+        log_lines.append(f"- :x: **{file_name}** 入库失败：{err_msg}")
+        status_box.error(f"入库失败：{err_msg}")
         add_operation_log(
             op_type="train_error",
             collection=agent.collection_name,
@@ -350,9 +366,11 @@ def _train_single_file(agent, file_path, file_name, log_container, embed_status)
         return False, 0, time.time() - t0
 
     elapsed = time.time() - t0
-    embed_status.progress(1.0)
-    log_container.success(f"✅ **[{file_name}]** 完成！入库 {count} 块，耗时 {_format_time(elapsed)}")
-    # 记录成功训练日志
+    embed_bar.progress(100)
+    log_lines.append(
+        f"- :white_check_mark: **{file_name}** — {count} 块, {_format_time(elapsed)}"
+    )
+    status_box.success(f"[{file_name}] 完成! {count} 块, {_format_time(elapsed)}")
     add_operation_log(
         op_type="train",
         collection=agent.collection_name,
@@ -387,19 +405,18 @@ def render_training_page():
             items, temp_dirs = _expand_uploads(uploaded_files)
 
             if not items:
-                st.warning("没有可训练的文件：若上传的是压缩包，请确保包内有 PDF/Word/Excel/TXT/Markdown 等格式的文档。")
+                st.warning("没有可训练的文件。")
                 return
 
             total_files = len(items)
-            st.markdown(f"**共 {total_files} 个文件待训练**（含压缩包内解压出的文档）")
-
-            overall_bar = st.progress(0.0)
+            overall_bar = st.progress(0)
             overall_text = st.empty()
-            st.markdown("---")
+            overall_text.info(f"准备训练 {total_files} 个文件...")
+            status_box = st.empty()
+            embed_bar = st.empty()
+            log_display = st.empty()
 
-            embed_status = st.empty()
-            log_area = st.container()
-
+            log_lines = []
             total_chunks = 0
             success_count = 0
             fail_count = 0
@@ -407,16 +424,17 @@ def render_training_page():
 
             try:
                 for idx, (path, display_name, is_from_archive) in enumerate(items):
-                    overall_text.text(
-                        f"总进度：{idx}/{total_files} | "
-                        f"已成功 {success_count} 个 | 已失败 {fail_count} 个 | "
+                    pct = int(idx / total_files * 100)
+                    overall_bar.progress(pct)
+                    overall_text.info(
+                        f"总进度 {idx+1}/{total_files} | "
+                        f"成功 {success_count} | 失败 {fail_count} | "
                         f"已入库 {total_chunks} 块"
                     )
-                    overall_bar.progress(idx / total_files)
 
                     try:
                         ok, chunks, elapsed = _train_single_file(
-                            agent, path, display_name, log_area, embed_status
+                            agent, path, display_name, status_box, embed_bar, log_lines
                         )
                         if ok:
                             success_count += 1
@@ -424,22 +442,23 @@ def render_training_page():
                         else:
                             fail_count += 1
                     except Exception as e:
-                        log_area.error(f"❌ **[{display_name}]** 异常：{e}")
+                        log_lines.append(f"- :x: **{display_name}** 异常：{e}")
                         fail_count += 1
                     finally:
                         if not is_from_archive:
                             Path(path).unlink(missing_ok=True)
+                        log_display.markdown("\n".join(log_lines))
 
-                overall_bar.progress(1.0)
+                overall_bar.progress(100)
                 total_time = time.time() - t_start
-                overall_text.text(
-                    f"全部完成！成功 {success_count}/{total_files} 个文件，"
-                    f"共入库 {total_chunks} 块，总耗时 {_format_time(total_time)}"
+                status_box.empty()
+                embed_bar.empty()
+                overall_text.success(
+                    f"全部完成! 成功 {success_count}/{total_files} 个文件, "
+                    f"共入库 {total_chunks} 块, 耗时 {_format_time(total_time)}"
                 )
-                embed_status.empty()
                 if fail_count == 0:
                     st.balloons()
-                # 记录本批次训练汇总
                 add_operation_log(
                     op_type=OP_TYPE_TRAIN_BATCH,
                     collection=agent.collection_name,
@@ -476,31 +495,33 @@ def render_training_page():
                 scan_status.warning("⚠️ 目录中没有找到支持格式的文件")
                 return
 
-            scan_status.success(f"🔍 扫描完成，发现 {len(files)} 个文件")
+            scan_status.success(f"扫描完成，发现 {len(files)} 个文件")
 
-            overall_bar = st.progress(0.0)
+            overall_bar = st.progress(0)
             overall_text = st.empty()
-            st.markdown("---")
+            overall_text.info(f"准备训练 {len(files)} 个文件...")
+            status_box = st.empty()
+            embed_bar = st.empty()
+            log_display = st.empty()
 
-            embed_status = st.empty()
-            log_area = st.container()
-
+            log_lines = []
             total_chunks = 0
             success_count = 0
             fail_count = 0
             t_start = time.time()
 
             for idx, fp in enumerate(files):
-                overall_text.text(
-                    f"总进度：{idx}/{len(files)} | "
-                    f"已成功 {success_count} 个 | 已失败 {fail_count} 个 | "
+                pct = int(idx / len(files) * 100)
+                overall_bar.progress(pct)
+                overall_text.info(
+                    f"总进度 {idx+1}/{len(files)} | "
+                    f"成功 {success_count} | 失败 {fail_count} | "
                     f"已入库 {total_chunks} 块"
                 )
-                overall_bar.progress(idx / len(files))
 
                 try:
                     ok, chunks, elapsed = _train_single_file(
-                        agent, str(fp), fp.name, log_area, embed_status
+                        agent, str(fp), fp.name, status_box, embed_bar, log_lines
                     )
                     if ok:
                         success_count += 1
@@ -508,19 +529,21 @@ def render_training_page():
                     else:
                         fail_count += 1
                 except Exception as e:
-                    log_area.error(f"❌ **[{fp.name}]** 异常：{e}")
+                    log_lines.append(f"- :x: **{fp.name}** 异常：{e}")
                     fail_count += 1
+                finally:
+                    log_display.markdown("\n".join(log_lines))
 
-            overall_bar.progress(1.0)
+            overall_bar.progress(100)
             total_time = time.time() - t_start
-            overall_text.text(
-                f"全部完成！成功 {success_count}/{len(files)} 个文件，"
-                f"共入库 {total_chunks} 块，总耗时 {_format_time(total_time)}"
+            status_box.empty()
+            embed_bar.empty()
+            overall_text.success(
+                f"全部完成! 成功 {success_count}/{len(files)} 个文件, "
+                f"共入库 {total_chunks} 块, 耗时 {_format_time(total_time)}"
             )
-            embed_status.empty()
             if fail_count == 0:
                 st.balloons()
-            # 记录本批次训练汇总
             add_operation_log(
                 op_type=OP_TYPE_TRAIN_BATCH,
                 collection=agent.collection_name,
@@ -565,63 +588,66 @@ def render_review_page():
             items, temp_dirs = _expand_uploads(review_files)
 
             if not items:
-                st.warning("没有可审核的文件：若上传的是压缩包，请确保包内有 PDF/Word/Excel/TXT/Markdown 等格式的文档。")
+                st.warning("没有可审核的文件。")
                 return
 
             total_files = len(items)
-            st.markdown(f"**共 {total_files} 个文件待审核**（含压缩包内解压出的文档）")
-
-            review_bar = st.progress(0.0)
+            review_bar = st.progress(0)
             review_status = st.empty()
-            review_log = st.container()
+            review_status.info(f"准备审核 {total_files} 个文件...")
+            review_current = st.empty()
+            log_display = st.empty()
 
+            log_lines = []
             all_reports = []
             t_start = time.time()
 
             try:
                 for idx, (path, display_name, is_from_archive) in enumerate(items):
-                    review_bar.progress(idx / total_files)
-                    review_status.text(
-                        f"审核进度：{idx}/{total_files} | "
+                    pct = int(idx / total_files * 100)
+                    review_bar.progress(pct)
+                    review_status.info(
+                        f"审核进度 {idx+1}/{total_files} | "
                         f"已完成 {len(all_reports)} 个 | "
                         f"耗时 {_format_time(time.time() - t_start)}"
                     )
-                    review_log.info(f"🔍 **[{display_name}]** 正在审核...")
+                    review_current.info(f"正在审核 [{display_name}]...")
 
                     try:
                         t0 = time.time()
-                        report = agent.review(path)
+                        with st.spinner(f"AI 正在审核 [{display_name}]，请耐心等待..."):
+                            report = agent.review(path)
                         elapsed = time.time() - t0
                         report["original_filename"] = display_name
                         all_reports.append(report)
                         n_points = report.get("total_points", 0)
-                        review_log.success(
-                            f"✅ **[{display_name}]** 审核完成，"
-                            f"发现 {n_points} 个审核点，耗时 {_format_time(elapsed)}"
+                        log_lines.append(
+                            f"- :white_check_mark: **{display_name}** — {n_points} 个审核点, {_format_time(elapsed)}"
                         )
                     except Exception as e:
-                        review_log.error(f"❌ **[{display_name}]** 审核失败：{e}")
+                        log_lines.append(f"- :x: **{display_name}** 失败：{e}")
                         add_operation_log(
                             op_type="review_error",
                             collection=agent.collection_name,
                             file_name=display_name,
                             source=str(path),
-                            extra={"error": str(e)},
+                            extra={"error": str(e), "traceback": traceback.format_exc()},
                         )
                     finally:
                         if not is_from_archive:
                             Path(path).unlink(missing_ok=True)
+                        log_display.markdown("\n".join(log_lines))
 
-                review_bar.progress(1.0)
+                review_bar.progress(100)
                 total_time = time.time() - t_start
-                review_status.text(
-                    f"全部完成！共审核 {len(all_reports)}/{total_files} 个文件，"
-                    f"总耗时 {_format_time(total_time)}"
+                review_current.empty()
+                review_status.success(
+                    f"全部完成! 审核 {len(all_reports)}/{total_files} 个文件, "
+                    f"耗时 {_format_time(total_time)}"
                 )
 
                 if all_reports:
                     st.session_state.review_reports = all_reports
-                # 记录本批次审核汇总
                 total_points = sum(r.get("total_points", 0) for r in all_reports)
                 add_operation_log(
                     op_type=OP_TYPE_REVIEW_BATCH,
@@ -653,7 +679,8 @@ def render_review_page():
             text_status.info(f"🔍 正在审核文本（{len(review_text)} 字）...")
             t0 = time.time()
             try:
-                report = agent.review_text(review_text, text_file_name)
+                with st.spinner("AI 正在审核文本，请耐心等待..."):
+                    report = agent.review_text(review_text, text_file_name)
                 elapsed = time.time() - t0
                 st.session_state.review_reports = [report]
                 n_points = report.get("total_points", 0)

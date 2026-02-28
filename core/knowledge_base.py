@@ -15,7 +15,7 @@ def _create_embeddings():
     """根据 provider（及 cursor 时的 cursor_embedding）创建 Embedding 实例"""
     use_ollama = settings.is_ollama or (settings.is_cursor and (settings.cursor_embedding or "").lower() == "ollama")
     if use_ollama:
-        from langchain_community.embeddings import OllamaEmbeddings
+        from langchain_ollama import OllamaEmbeddings
         return OllamaEmbeddings(
             model=settings.embedding_model,
             base_url=settings.ollama_base_url,
@@ -122,4 +122,9 @@ class KnowledgeBase:
 
     def list_collections(self) -> List[str]:
         client = _get_chroma_client()
-        return [c.name for c in client.list_collections()]
+        collections = client.list_collections()
+        if not collections:
+            return []
+        if isinstance(collections[0], str):
+            return collections
+        return [c.name for c in collections]
