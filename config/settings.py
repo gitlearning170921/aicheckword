@@ -1,3 +1,4 @@
+"""配置包：应用与 AI 服务配置"""
 from pydantic_settings import BaseSettings
 from pathlib import Path
 
@@ -19,6 +20,8 @@ class Settings(BaseSettings):
     cursor_repository: str = ""
     cursor_ref: str = "main"
     cursor_embedding: str = "ollama"
+    cursor_verify_ssl: bool = True  # 代理/证书异常时可设为 False
+    cursor_trust_env: bool = True  # False 时不使用系统代理，直连 API（代理导致 SSL EOF 时可设为 False）
 
     # 模型配置
     llm_model: str = "qwen2.5"
@@ -37,8 +40,20 @@ class Settings(BaseSettings):
     training_docs_dir: str = "./training_docs"
     uploads_dir: str = "./uploads"
 
-    # 应用内部使用的 SQLite 数据库
+    # MySQL 数据库（所有配置与操作记录均存于此）
+    mysql_host: str = "10.26.1.221"
+    mysql_port: int = 13306
+    mysql_database: str = "aicheckword"
+    mysql_user: str = "root"
+    mysql_password: str = "mysql170921"
+    mysql_charset: str = "utf8mb4"
+
+    # 兼容旧配置项（已废弃，仅保留避免报错）
     db_path: str = "./aicheckword.db"
+
+    # 金山文档开放平台（审核时通过链接拉取正文；需在 https://developer.kdocs.cn 创建应用）
+    kdocs_app_id: str = ""
+    kdocs_app_key: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

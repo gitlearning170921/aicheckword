@@ -11,7 +11,7 @@ fastapi>=0.115.0
 uvicorn>=0.30.0
 python-multipart>=0.0.12
 pypdf>=5.0.0
-python-docx>=1.1.0
+python-docx>=1.2.0
 docx2txt>=0.8
 openpyxl>=3.1.0
 markdown>=3.0
@@ -22,3 +22,9 @@ pydantic>=2.9.0
 pydantic-settings>=2.5.0
 python-dotenv>=1.0.0
 httpx>=0.27.0
+pymysql>=1.1.0
+reportlab>=4.0.0
+# 解压 .rar 时需安装（系统还需安装 UnRAR 可执行文件）
+rarfile>=4.2
+# Windows 下 .doc 通过 WPS 转换时需安装：pip install pywin32
+pywin32>=306; sys_platform == "win32"

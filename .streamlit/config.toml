@@ -1,0 +1,12 @@
+# Streamlit 配置，减轻 Cursor/本机内存占用（降低 OOM 概率）
+# 详见 https://docs.streamlit.io/develop/concepts/configuration
+
+[server]
+# 单次上传文件总大小上限（MB），避免一次加载过大文件导致 OOM
+maxUploadSize = 200
+# 最大请求体大小（MB）
+maxMessageSize = 200
+
+[browser]
+# 不自动打开浏览器（在 Cursor 内运行时无需）
+gatherUsageStats = false

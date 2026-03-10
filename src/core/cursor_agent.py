@@ -1,7 +1,5 @@
 """
 调用 Cursor Cloud Agents API：发起任务、轮询完成、取回助手回复文本。
-文档: https://cursor.com/docs/cloud-agent/api/overview
-认证: Dashboard → Integrations 创建 API Key，Basic Auth (key: 空密码)。
 """
 
 import base64
@@ -14,7 +12,6 @@ from config import settings
 
 
 def _auth_header() -> str:
-    """Basic Auth: API_KEY 作为用户名，密码为空"""
     raw = f"{settings.cursor_api_key}:"
     return "Basic " + base64.b64encode(raw.encode()).decode()
 
@@ -31,11 +28,19 @@ def _base_url() -> str:
     return base
 
 
+def _http_client(timeout: float = 60) -> httpx.Client:
+    """统一创建 httpx 客户端。支持：关闭 SSL 校验、绕过系统代理（代理导致 SSL EOF 时）"""
+    try:
+        from config.cursor_overrides import get_cursor_verify_ssl, get_cursor_trust_env
+        verify = get_cursor_verify_ssl()
+        trust_env = get_cursor_trust_env()
+    except Exception:
+        verify = True
+        trust_env = True
+    return httpx.Client(timeout=timeout, verify=verify, trust_env=trust_env)
+
+
 def launch_agent(prompt_text: str) -> str:
-    """
-    发起一个 Cloud Agent 任务，返回 agent id。
-    要求 settings 中已配置 cursor_api_key、cursor_repository。
-    """
     if not settings.cursor_api_key or not settings.cursor_repository:
         raise RuntimeError("Cursor 模式下请配置 API Key 和 GitHub 仓库地址（Cursor Dashboard → Integrations）")
     url = f"{_base_url()}/v0/agents"
@@ -47,26 +52,28 @@ def launch_agent(prompt_text: str) -> str:
         },
         "target": {"autoCreatePr": False},
     }
-    with httpx.Client(timeout=60) as client:
+    with _http_client(timeout=90) as client:
         r = client.post(url, json=payload, headers=_get_headers())
         r.raise_for_status()
         data = r.json()
     return data["id"]
 
 
+# 轮询状态/拉取对话时单次请求超时（秒），避免多文档等长任务时 read timeout
+_POLL_REQUEST_TIMEOUT = 120
+
+
 def get_agent_status(agent_id: str) -> dict:
-    """获取 Agent 状态"""
     url = f"{_base_url()}/v0/agents/{agent_id}"
-    with httpx.Client(timeout=30) as client:
+    with _http_client(timeout=_POLL_REQUEST_TIMEOUT) as client:
         r = client.get(url, headers=_get_headers())
         r.raise_for_status()
         return r.json()
 
 
 def get_agent_conversation(agent_id: str) -> list:
-    """获取 Agent 对话记录，返回 messages 列表"""
     url = f"{_base_url()}/v0/agents/{agent_id}/conversation"
-    with httpx.Client(timeout=30) as client:
+    with _http_client(timeout=_POLL_REQUEST_TIMEOUT) as client:
         r = client.get(url, headers=_get_headers())
         r.raise_for_status()
         data = r.json()
@@ -78,10 +85,6 @@ def poll_until_finished(
     poll_interval: float = 2.0,
     timeout: float = 300,
 ) -> str:
-    """
-    轮询直到 Agent 状态为 FINISHED 或 FAILED。
-    返回状态字符串。
-    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status_data = get_agent_status(agent_id)
@@ -93,10 +96,6 @@ def poll_until_finished(
 
 
 def get_last_assistant_reply(agent_id: str) -> Optional[str]:
-    """
-    从 Agent 对话中取最后一条助手回复的 text。
-    若有多条 assistant_message，拼接最后一条（或全部）文本返回。
-    """
     messages = get_agent_conversation(agent_id)
     texts = []
     for m in messages:
@@ -107,11 +106,7 @@ def get_last_assistant_reply(agent_id: str) -> Optional[str]:
     return "\n\n".join(texts)
 
 
-def complete_task(prompt_text: str, poll_interval: float = 2.0, timeout: float = 300) -> str:
-    """
-    发起 Cursor Agent 任务，轮询完成，并返回助手的回复文本。
-    用于「只输出文本、不修改仓库」的提示（如文档审核 JSON 输出）。
-    """
+def complete_task(prompt_text: str, poll_interval: float = 2.0, timeout: float = 600) -> str:
     agent_id = launch_agent(prompt_text)
     status = poll_until_finished(agent_id, poll_interval=poll_interval, timeout=timeout)
     if status != "FINISHED":
