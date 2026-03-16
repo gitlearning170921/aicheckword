@@ -29,6 +29,8 @@ def _meta_info_lines(meta: dict) -> List[str]:
         lines.append(f"项目名称：{meta['project_name']}")
     if meta.get("product_name"):
         lines.append(f"产品名称：{meta['product_name']}")
+    if meta.get("model") or meta.get("model_en"):
+        lines.append(f"型号（Model）：{meta.get('model', '') or '—'} / {meta.get('model_en', '') or '—'}")
     if meta.get("registration_country"):
         lines.append(f"注册国家：{meta['registration_country']}")
     if meta.get("registration_type"):

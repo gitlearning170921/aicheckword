@@ -116,9 +116,10 @@ class ReviewAgent:
         document_language: Optional[str] = None,
         kb_stats: Optional[Dict[str, Any]] = None,
         registration_countries: Optional[List[str]] = None,
+        registration_type: Optional[str] = None,
         progress_callback=None,
     ) -> List[Dict[str, Any]]:
-        """registration_countries 可选；选中国家时按「国家→额外关键词」扩展检索知识库中该国家相关法规。"""
+        """registration_countries 可选；选中国家时按「国家→额外关键词」扩展检索。registration_type 可选；传入时按注册类别注入审核尺度（Ⅲ>Ⅱb>Ⅱa>Ⅱ>Ι）。"""
         if kb_stats is None:
             kb_stats = get_knowledge_stats(self.collection_name)
         return self.checklist_generator.generate_checklist(
@@ -128,6 +129,7 @@ class ReviewAgent:
             document_language=document_language,
             kb_stats=kb_stats,
             registration_countries=registration_countries,
+            registration_type=registration_type,
             progress_callback=progress_callback,
         )
 
@@ -282,6 +284,10 @@ class ReviewAgent:
                         override["system_functionality_text"] = proj.get("system_functionality_text") or ""
                     if "scope_of_application" not in override:
                         override["scope_of_application"] = proj.get("scope_of_application") or ""
+                    if "model" not in override:
+                        override["model"] = proj.get("model") or ""
+                    if "model_en" not in override:
+                        override["model_en"] = proj.get("model_en") or ""
             return override
         if not project_id:
             if extra:
@@ -295,6 +301,8 @@ class ReviewAgent:
             "project_name_en": proj.get("name_en") or "",
             "product_name": proj.get("product_name") or "",
             "product_name_en": proj.get("product_name_en") or "",
+            "model": proj.get("model") or "",
+            "model_en": proj.get("model_en") or "",
             "basic_info_text": proj.get("basic_info_text") or "",
             "system_functionality_text": proj.get("system_functionality_text") or "",
             "scope_of_application": proj.get("scope_of_application") or "",

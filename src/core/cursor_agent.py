@@ -40,6 +40,26 @@ def _http_client(timeout: float = 60) -> httpx.Client:
     return httpx.Client(timeout=timeout, verify=verify, trust_env=trust_env)
 
 
+def _raise_for_status_with_body(r: httpx.Response, context: str = "") -> None:
+    """4xx/5xx 时抛出包含响应体的异常，便于排查 404 等配置错误。"""
+    if r.is_success:
+        return
+    try:
+        body = r.json()
+        if isinstance(body, dict):
+            msg = body.get("error_msg") or body.get("message") or body.get("error") or str(body)
+            if body.get("event_id"):
+                msg = f"{msg} (event_id: {body.get('event_id')})"
+        else:
+            msg = r.text or f"HTTP {r.status_code}"
+    except Exception:
+        msg = r.text or f"HTTP {r.status_code}"
+    hint = ""
+    if r.status_code == 404:
+        hint = " 请检查：1) Cursor API 基地址是否为 https://api.cursor.com；2) GitHub 仓库地址与分支/ref 是否正确且可访问；3) API Key 是否有效（Cursor Dashboard → Integrations）。"
+    raise RuntimeError(f"Error code: {r.status_code} - {msg}{hint}".strip())
+
+
 def launch_agent(prompt_text: str) -> str:
     if not settings.cursor_api_key or not settings.cursor_repository:
         raise RuntimeError("Cursor 模式下请配置 API Key 和 GitHub 仓库地址（Cursor Dashboard → Integrations）")
@@ -54,7 +74,7 @@ def launch_agent(prompt_text: str) -> str:
     }
     with _http_client(timeout=90) as client:
         r = client.post(url, json=payload, headers=_get_headers())
-        r.raise_for_status()
+        _raise_for_status_with_body(r, "launch_agent")
         data = r.json()
     return data["id"]
 
@@ -67,7 +87,7 @@ def get_agent_status(agent_id: str) -> dict:
     url = f"{_base_url()}/v0/agents/{agent_id}"
     with _http_client(timeout=_POLL_REQUEST_TIMEOUT) as client:
         r = client.get(url, headers=_get_headers())
-        r.raise_for_status()
+        _raise_for_status_with_body(r, "get_agent_status")
         return r.json()
 
 
@@ -75,7 +95,7 @@ def get_agent_conversation(agent_id: str) -> list:
     url = f"{_base_url()}/v0/agents/{agent_id}/conversation"
     with _http_client(timeout=_POLL_REQUEST_TIMEOUT) as client:
         r = client.get(url, headers=_get_headers())
-        r.raise_for_status()
+        _raise_for_status_with_body(r, "get_agent_conversation")
         data = r.json()
     return data.get("messages") or []
 

@@ -1,6 +1,7 @@
 """Streamlit Web UI：注册文档审核工具"""
 
 import sys
+import os
 from pathlib import Path
 
 # 保证项目根在 path 中（运行 streamlit run src/app.py 时需能 import config 与 src）
@@ -8,8 +9,14 @@ _root = Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
+# 尽早设置：避免 tiktoken 下载 cl100k_base 时走代理导致 ProxyError/SSLEOFError（须在任何可能触发 tiktoken 的 import 之前）
+_tiktoken_host = "openaipublic.blob.core.windows.net"
+for _np in ("NO_PROXY", "no_proxy"):
+    _v = os.environ.get(_np, "")
+    if _tiktoken_host not in _v:
+        os.environ[_np] = f"{_v},{_tiktoken_host}".lstrip(",")
+
 import json
-import os
 import time
 import tempfile
 from datetime import datetime
@@ -39,6 +46,7 @@ from src.core.document_loader import (
     is_archive,
     extract_archive,
     is_deprecated_path,
+    extract_section_outline_from_texts,
 )
 from src.core.db import (
     load_app_settings,
@@ -82,6 +90,7 @@ from src.core.db import (
     get_project_case,
     update_project_case,
     update_knowledge_docs_case_id,
+    get_knowledge_docs_by_case_id,
     get_review_extra_instructions,
     update_review_extra_instructions,
     get_review_system_prompt,
@@ -91,6 +100,7 @@ from src.core.db import (
     update_prompt_by_key,
     PROMPT_KEYS,
     REGISTRATION_TYPES,
+    REGISTRATION_TYPE_OPTIONS,
     REGISTRATION_COMPONENTS,
     OP_TYPE_TRAIN_BATCH,
     OP_TYPE_TRAIN,
@@ -246,11 +256,46 @@ def _match_project_case_for_review(
 
 def _provider_ready() -> bool:
     """当前 provider 是否就绪"""
-    if settings.is_ollama:
+    p = (settings.provider or "").strip().lower()
+    if p == "ollama":
         return True
-    if settings.is_cursor:
+    if p == "cursor":
         return bool(settings.cursor_api_key and settings.cursor_repository)
+    if p == "openai":
+        return bool(settings.openai_api_key)
+    if p == "deepseek":
+        return bool(settings.deepseek_api_key or settings.openai_api_key)
+    if p == "lingyi":
+        return bool(settings.lingyi_api_key or settings.openai_api_key)
+    if p == "gemini":
+        return bool(settings.gemini_api_key or settings.google_api_key)
+    if p == "tongyi":
+        return bool(settings.dashscope_api_key)
+    if p == "baidu":
+        return bool(settings.qianfan_ak and settings.qianfan_sk)
     return bool(settings.openai_api_key)
+
+
+def _require_provider() -> bool:
+    """检查 AI 服务是否就绪"""
+    if _provider_ready():
+        return True
+    p = (settings.provider or "").strip().lower()
+    if p == "ollama":
+        st.warning("⚠️ Ollama 服务未启动，请确保已安装并运行 Ollama（ollama serve）。")
+    elif p == "cursor":
+        st.warning("⚠️ Cursor 模式下请填写 API Key 和 GitHub 仓库地址（Cursor Dashboard → Integrations）。")
+    elif p == "gemini":
+        st.warning("⚠️ Gemini 模式下请在 .env 中配置 GEMINI_API_KEY 或 GOOGLE_API_KEY。")
+    elif p == "tongyi":
+        st.warning("⚠️ 通义模式下请配置 DASHSCOPE_API_KEY。")
+    elif p == "baidu":
+        st.warning("⚠️ 文心模式下请配置 QIANFAN_AK 与 QIANFAN_SK。")
+    elif p in ("deepseek", "lingyi"):
+        st.warning("⚠️ 请填写 API Key；DeepSeek / 零一为 OpenAI 兼容接口，可同时填写 Base URL。")
+    else:
+        st.warning("⚠️ 请先在左侧边栏填写 OpenAI API Key 或选择其他已配置的提供方。")
+    return False
 
 
 def init_agent():
@@ -260,19 +305,6 @@ def init_agent():
         st.session_state.agent = ReviewAgent(collection)
         st.session_state._col = collection
     return st.session_state.agent
-
-
-def _require_provider() -> bool:
-    """检查 AI 服务是否就绪"""
-    if _provider_ready():
-        return True
-    if settings.is_ollama:
-        st.warning("⚠️ Ollama 服务未启动，请确保已安装并运行 Ollama（ollama serve）。")
-    elif settings.is_cursor:
-        st.warning("⚠️ Cursor 模式下请填写 API Key 和 GitHub 仓库地址（Cursor Dashboard → Integrations）。")
-    else:
-        st.warning("⚠️ 请先在左侧边栏填写 OpenAI API Key。")
-    return False
 
 
 def render_sidebar():
@@ -295,13 +327,25 @@ def render_sidebar():
                 settings.cursor_embedding = db_conf.get("cursor_embedding") or settings.cursor_embedding
                 settings.llm_model = db_conf.get("llm_model") or settings.llm_model
                 settings.embedding_model = db_conf.get("embedding_model") or settings.embedding_model
+                settings.deepseek_api_key = db_conf.get("deepseek_api_key") or settings.deepseek_api_key
+                settings.deepseek_base_url = db_conf.get("deepseek_base_url") or settings.deepseek_base_url
+                settings.lingyi_api_key = db_conf.get("lingyi_api_key") or settings.lingyi_api_key
+                settings.lingyi_base_url = db_conf.get("lingyi_base_url") or settings.lingyi_base_url
+                settings.gemini_api_key = db_conf.get("gemini_api_key") or settings.gemini_api_key
+                settings.google_api_key = db_conf.get("gemini_api_key") or settings.google_api_key
+                settings.dashscope_api_key = db_conf.get("dashscope_api_key") or settings.dashscope_api_key
+                settings.qianfan_ak = db_conf.get("qianfan_ak") or settings.qianfan_ak
+                settings.qianfan_sk = db_conf.get("qianfan_sk") or settings.qianfan_sk
                 v = db_conf.get("cursor_verify_ssl")
                 vv = v if isinstance(v, bool) else (v != 0 and v != "0")
                 settings.cursor_verify_ssl = vv
+                settings.llm_verify_ssl = vv
                 from config.cursor_overrides import _cursor_overrides
                 _cursor_overrides["verify_ssl"] = vv
                 t = db_conf.get("cursor_trust_env")
                 tt = t if isinstance(t, bool) else (t != 0 and t != "0")
+                settings.cursor_trust_env = tt
+                settings.llm_trust_env = tt
                 _cursor_overrides["trust_env"] = tt
             st.session_state["db_settings_loaded"] = True
             st.session_state["current_provider"] = (settings.provider or "ollama").strip().lower()
@@ -309,26 +353,67 @@ def render_sidebar():
         # --- AI 服务配置 ---
         st.subheader("AI 服务")
 
-        provider_options = ["Ollama (本地免费)", "OpenAI (需 API Key)", "Cursor Agent (Cloud API)"]
-        if settings.is_ollama:
-            current_idx = 0
-        elif settings.is_cursor:
-            current_idx = 2
-        else:
-            current_idx = 1
+        # (显示名, provider 值)，按推荐使用优先级排序
+        _provider_list = [
+            ("DeepSeek (OpenAI 兼容)", "deepseek"),
+            ("OpenAI", "openai"),
+            ("零一万物 (OpenAI 兼容)", "lingyi"),
+            ("Google Gemini", "gemini"),
+            ("阿里通义千问", "tongyi"),
+            ("百度文心一言", "baidu"),
+            ("Ollama (本地免费)", "ollama"),
+            ("Cursor Agent (Cloud API)", "cursor"),
+        ]
+        provider_options = [x[0] for x in _provider_list]
+        # 用 current_provider 驱动默认选中，选完后立即写入，下次 rerun 即生效，避免需点两次
+        _cur = (st.session_state.get("current_provider") or settings.provider or "ollama").strip().lower()
+        current_idx = next((i for i, (_, v) in enumerate(_provider_list) if v == _cur), 0)
         provider_choice = st.selectbox(
             "服务提供方",
             provider_options,
-            index=current_idx,
-            help="Ollama: 本地免费\nOpenAI: 需 API Key\nCursor: 调用 Cursor Cloud Agents API，需 API Key + GitHub 仓库",
+            index=min(current_idx, len(provider_options) - 1),
+            help="Gemini/通义/文心 需安装对应依赖；密钥可写在 .env，侧栏保存会写入当前内存。",
         )
-        is_ollama = provider_choice.startswith("Ollama") and "Cursor" not in provider_choice
-        is_cursor = provider_choice.startswith("Cursor")
+        _provider = _provider_list[provider_options.index(provider_choice)][1]
+        is_ollama = _provider == "ollama"
+        is_cursor = _provider == "cursor"
+        is_openai_form = _provider in ("openai", "deepseek", "lingyi")  # 共用 Key + Base URL
 
-        # 当前选择立即同步到 settings，并写入 session_state 供生成审核点/审核等使用（避免依赖全局 settings 的更新时机）
-        _provider = "cursor" if is_cursor else ("ollama" if is_ollama else "openai")
         settings.provider = _provider
         st.session_state["current_provider"] = _provider
+
+        # 所有 AI 服务通用：不校验 SSL、不使用系统代理（代理/证书异常导致 SSLEOFError 时可勾选）
+        from config.cursor_overrides import _cursor_overrides, get_llm_verify_ssl, get_llm_trust_env
+        llm_no_ssl = st.checkbox(
+            "不校验 SSL（所有 AI 服务）",
+            value=not get_llm_verify_ssl(),
+            key="llm_no_ssl",
+            help="代理或证书异常导致 SSLEOFError 时可勾选；对 OpenAI/DeepSeek/零一/Cursor/Ollama 等均生效。",
+        )
+        _cursor_overrides["verify_ssl"] = not llm_no_ssl
+        llm_no_proxy = st.checkbox(
+            "不使用系统代理（所有 AI 服务）",
+            value=not get_llm_trust_env(),
+            key="llm_no_proxy",
+            help="直连 API、不走系统代理；代理导致 SSL EOF 时可勾选。",
+        )
+        _cursor_overrides["trust_env"] = not llm_no_proxy
+
+        # 提供方或通用配置变化时重置 agent 缓存，使下次请求（审核/生成审核点等）使用新配置
+        _cfg_key = (_provider, get_llm_verify_ssl(), get_llm_trust_env())
+        _last_cfg = st.session_state.get("_llm_config_key")
+        if _last_cfg is not None and _last_cfg != _cfg_key and "agent" in st.session_state:
+            try:
+                st.session_state.agent.reset_clients()
+            except Exception:
+                pass
+        st.session_state["_llm_config_key"] = _cfg_key
+
+        # 下拉刚切换时立即 rerun，使当前 run 的 index 与选中一致，避免需点两次才看到切换
+        if _cur != _provider:
+            _rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+            if callable(_rerun):
+                _rerun()
 
         if is_cursor:
             cursor_api_key = st.text_input(
@@ -353,19 +438,6 @@ def render_sidebar():
                 index=0 if (settings.cursor_embedding or "ollama").lower() == "ollama" else 1,
                 help="知识库向量化仍需要 Ollama 或 OpenAI",
             )
-            from config.cursor_overrides import _cursor_overrides, get_cursor_verify_ssl, get_cursor_trust_env
-            cursor_no_ssl = st.checkbox(
-                "不校验 SSL（代理/证书异常导致 EOF 时可勾选）",
-                value=not get_cursor_verify_ssl(),
-                key="cursor_no_ssl",
-            )
-            _cursor_overrides["verify_ssl"] = not cursor_no_ssl
-            cursor_no_proxy = st.checkbox(
-                "不使用系统代理（代理导致 SSL EOF 时可勾选，直连 Cursor API）",
-                value=not get_cursor_trust_env(),
-                key="cursor_no_proxy",
-            )
-            _cursor_overrides["trust_env"] = not cursor_no_proxy
             llm_model = settings.llm_model
             embed_model = settings.embedding_model
         elif is_ollama:
@@ -384,34 +456,68 @@ def render_sidebar():
                 value=settings.embedding_model,
                 help="推荐 nomic-embed-text、bge-m3 等",
             )
-        else:
+        elif is_openai_form:
+            _default_base = settings.openai_base_url
+            if _provider == "deepseek":
+                _default_base = settings.deepseek_base_url or "https://api.deepseek.com/v1"
+            elif _provider == "lingyi":
+                _default_base = settings.lingyi_base_url or "https://api.lingyiwanwu.com/v1"
+            # 按 provider 使用独立 key，避免切换提供方时 DeepSeek/零一/OpenAI 的 API Key 互相填充
+            _api_key_value = settings.deepseek_api_key if _provider == "deepseek" else (settings.lingyi_api_key if _provider == "lingyi" else settings.openai_api_key)
             api_key = st.text_input(
-                "OpenAI API Key",
-                value=settings.openai_api_key,
+                "API Key",
+                value=_api_key_value,
                 type="password",
-                help="也支持兼容 OpenAI 接口的国内服务",
+                key=f"sidebar_api_key_{_provider}",
+                help="DeepSeek / 零一万物 为 OpenAI 兼容接口",
             )
             base_url = st.text_input(
                 "API Base URL",
-                value=settings.openai_base_url,
-                help="如使用国内代理或兼容服务，修改为对应地址",
+                value=_default_base,
+                key=f"sidebar_base_url_{_provider}",
+                help="DeepSeek 填 https://api.deepseek.com/v1（404 时请确认无误）；零一默认 https://api.lingyiwanwu.com/v1",
             )
+            _model_help = "DeepSeek 填 deepseek-chat 或 deepseek-chat-v2 等（404 多为模型名或 Base URL 错误）；零一如 yi-large 等"
             llm_model = st.text_input(
                 "审核模型",
-                value=settings.llm_model,
-                help="如 gpt-4o, gpt-4o-mini, gpt-3.5-turbo 等",
+                value=settings.llm_model or ("deepseek-chat" if _provider == "deepseek" else "yi-large"),
+                key=f"sidebar_llm_model_{_provider}",
+                help=_model_help,
             )
+            _embed_help = "向量化仍用 Ollama 或 OpenAI；选 Cursor 时可在 Cursor 区块选择。"
+            if _provider == "deepseek":
+                _embed_help = "DeepSeek 不提供 embeddings 接口，向量化将使用 **Ollama**；请确保 Ollama 已启动并在此填写向量化模型（如 nomic-embed-text）。"
+            elif _provider == "lingyi":
+                _embed_help = "零一万物向量化将使用 **Ollama**；请确保 Ollama 已启动并在此填写向量化模型（如 nomic-embed-text）。"
             embed_model = st.text_input(
                 "向量化模型",
                 value=settings.embedding_model,
-                help="如 text-embedding-3-small 等",
+                key=f"sidebar_embed_model_{_provider}",
+                help=_embed_help,
             )
+        elif _provider == "gemini":
+            st.caption("密钥请配置环境变量 GEMINI_API_KEY 或 GOOGLE_API_KEY（.env）。")
+            llm_model = st.text_input("审核模型", value=settings.llm_model or "gemini-1.5-flash", help="如 gemini-1.5-flash、gemini-1.5-pro")
+            embed_model = st.text_input("向量化模型", value=settings.embedding_model, help="向量建议仍用 Ollama 或 OpenAI Embedding")
+        elif _provider == "tongyi":
+            st.caption("密钥请配置 DASHSCOPE_API_KEY（.env 或系统环境变量）。")
+            llm_model = st.text_input("审核模型", value=settings.llm_model or "qwen-plus", help="如 qwen-plus、qwen-max")
+            embed_model = st.text_input("向量化模型", value=settings.embedding_model, help="通义向量可用 text-embedding-v3，需单独接 Embedding API；当前可先 Ollama")
+        elif _provider == "baidu":
+            st.caption("密钥请配置 QIANFAN_AK、QIANFAN_SK（.env）。")
+            llm_model = st.text_input("审核模型", value=settings.llm_model or "ERNIE-Bot-4", help="千帆模型名")
+            embed_model = st.text_input("向量化模型", value=settings.embedding_model, help="向量可继续用 Ollama/OpenAI")
 
         if st.button("💾 保存配置"):
             from config.cursor_overrides import _cursor_overrides as _co
-            settings.provider = "cursor" if is_cursor else ("ollama" if is_ollama else "openai")
+            settings.provider = _provider
             settings.llm_model = llm_model
             settings.embedding_model = embed_model
+            # 通用 HTTP 选项：写入 settings 并持久化到 DB（仍用 cursor_* 列存）
+            _v = _co.get("verify_ssl") if _co.get("verify_ssl") is not None else get_llm_verify_ssl()
+            _t = _co.get("trust_env") if _co.get("trust_env") is not None else get_llm_trust_env()
+            settings.llm_verify_ssl = settings.cursor_verify_ssl = _v
+            settings.llm_trust_env = settings.cursor_trust_env = _t
             if is_cursor:
                 settings.cursor_api_key = cursor_api_key
                 settings.cursor_repository = cursor_repo
@@ -419,9 +525,20 @@ def render_sidebar():
                 settings.cursor_embedding = cursor_embed
             elif is_ollama:
                 settings.ollama_base_url = ollama_url
-            else:
-                settings.openai_api_key = api_key
-                settings.openai_base_url = base_url
+            elif is_openai_form:
+                if _provider == "deepseek":
+                    settings.deepseek_api_key = api_key
+                    settings.deepseek_base_url = base_url
+                    settings.openai_api_key = api_key
+                    settings.openai_base_url = base_url
+                elif _provider == "lingyi":
+                    settings.lingyi_api_key = api_key
+                    settings.lingyi_base_url = base_url
+                    settings.openai_api_key = api_key
+                    settings.openai_base_url = base_url
+                else:
+                    settings.openai_api_key = api_key
+                    settings.openai_base_url = base_url
             save_app_settings(
                 provider=settings.provider,
                 openai_api_key=settings.openai_api_key,
@@ -432,10 +549,18 @@ def render_sidebar():
                 cursor_repository=settings.cursor_repository,
                 cursor_ref=settings.cursor_ref,
                 cursor_embedding=settings.cursor_embedding,
-                cursor_verify_ssl=_co.get("verify_ssl") if _co.get("verify_ssl") is not None else settings.cursor_verify_ssl,
-                cursor_trust_env=_co.get("trust_env") if _co.get("trust_env") is not None else True,
+                cursor_verify_ssl=_v,
+                cursor_trust_env=_t,
                 llm_model=settings.llm_model,
                 embedding_model=settings.embedding_model,
+                deepseek_api_key=getattr(settings, "deepseek_api_key", "") or "",
+                deepseek_base_url=getattr(settings, "deepseek_base_url", "") or "",
+                lingyi_api_key=getattr(settings, "lingyi_api_key", "") or "",
+                lingyi_base_url=getattr(settings, "lingyi_base_url", "") or "",
+                gemini_api_key=getattr(settings, "gemini_api_key", "") or getattr(settings, "google_api_key", "") or "",
+                dashscope_api_key=getattr(settings, "dashscope_api_key", "") or "",
+                qianfan_ak=getattr(settings, "qianfan_ak", "") or "",
+                qianfan_sk=getattr(settings, "qianfan_sk", "") or "",
             )
             if "agent" in st.session_state:
                 st.session_state.agent.reset_clients()
@@ -860,17 +985,46 @@ def render_step1_page():
                                     help="项目案例是过往已成功注册的项目经验，训练后可供类似新项目审核时参考。")
             if sel_case == "➕ 新建案例":
                 st.caption("新建案例：描述这批文件所属的过往项目，训练到通用知识库；第三步审核时按产品名称与适用范围匹配启用（支持中英文匹配）。")
-                p_case_name = st.text_input("案例名称", placeholder="例如：某某血糖仪二类注册案例", key="train_case_name")
-                p_case_name_en = st.text_input("案例名称（英文）", placeholder="e.g. XXX Blood Glucose Meter Class II", key="train_case_name_en")
-                p_product = st.text_input("产品名称", placeholder="该过往项目的产品名称", key="train_case_product")
-                p_product_en = st.text_input("产品名称（英文）", placeholder="Product name in English", key="train_case_product_en")
-                p_doc_lang = st.selectbox("案例文档语言", DOC_LANG_OPTIONS, index=1, key="train_case_doc_lang", help="本批训练文档主要为中文、英文或中英文；与生成审核点、文档审核的文档语言选项保持一致")
-                p_country = st.selectbox("注册国家", countries, key="train_case_country")
-                p_country_en = st.text_input("注册国家（英文）", placeholder="e.g. China, USA", key="train_case_country_en")
-                p_type = st.selectbox("注册类别", REGISTRATION_TYPES, key="train_case_type")
-                p_comp = st.selectbox("注册组成", REGISTRATION_COMPONENTS, key="train_case_comp")
-                p_form = st.selectbox("项目形态", forms, key="train_case_form")
-                p_scope = st.text_area("产品适用范围（可选）", placeholder="该过往项目的适用范围；第三步审核时可据此匹配", height=80, key="train_case_scope")
+                # 复制自现有案例（快捷创建其他注册国家/语言版本）
+                case_options_copy = [_format_case_option(c) for c in cases]
+                copy_default_idx = 0
+                if st.session_state.get("train_copy_from_case_id"):
+                    try:
+                        cid = st.session_state["train_copy_from_case_id"]
+                        for i, c in enumerate(cases):
+                            if c.get("id") == cid:
+                                copy_default_idx = i + 1  # 0 为「不复制」
+                                break
+                        st.session_state.pop("train_copy_from_case_id", None)
+                    except Exception:
+                        pass
+                copy_from_sel = st.selectbox(
+                    "复制自现有案例（可选）",
+                    ["不复制"] + case_options_copy,
+                    index=min(copy_default_idx, len(case_options_copy)),
+                    key="train_copy_from_sel",
+                    help="选择后将预填案例信息，仅改注册国家、案例文档语言即可创建该案例的其他国家/语言版本；同一项目的案例会通过 project_key 关联。",
+                )
+                copy_case = None
+                if copy_from_sel and copy_from_sel != "不复制" and copy_from_sel in case_options_copy:
+                    copy_case = cases[case_options_copy.index(copy_from_sel)]
+                if copy_case:
+                    st.caption("已从现有案例预填，请修改「注册国家」「案例文档语言」等以区分为新版本。")
+                _def = lambda k, d: (copy_case.get(k) or d) if copy_case else d
+                _idx = lambda opts, val: opts.index(val) if val in opts else 0
+                p_case_name = st.text_input("案例名称", value=_def("case_name", ""), placeholder="例如：某某血糖仪二类注册案例", key="train_case_name")
+                p_case_name_en = st.text_input("案例名称（英文）", value=_def("case_name_en", ""), placeholder="e.g. XXX Blood Glucose Meter Class II", key="train_case_name_en")
+                p_product = st.text_input("产品名称", value=_def("product_name", ""), placeholder="该过往项目的产品名称", key="train_case_product")
+                p_product_en = st.text_input("产品名称（英文）", value=_def("product_name_en", ""), placeholder="Product name in English", key="train_case_product_en")
+                _doc_lang_val = _def("document_language", "zh")
+                _doc_lang_label = DOC_LANG_VALUE_TO_LABEL.get(_doc_lang_val, "中文版")
+                p_doc_lang = st.selectbox("案例文档语言", DOC_LANG_OPTIONS, index=_idx(DOC_LANG_OPTIONS, _doc_lang_label), key="train_case_doc_lang", help="本批训练文档主要为中文、英文或中英文；与生成审核点、文档审核的文档语言选项保持一致")
+                p_country = st.selectbox("注册国家", countries, index=_idx(countries, _def("registration_country", countries[0])), key="train_case_country")
+                p_country_en = st.text_input("注册国家（英文）", value=_def("registration_country_en", ""), placeholder="e.g. China, USA", key="train_case_country_en")
+                p_type = st.selectbox("注册类别", REGISTRATION_TYPES, index=_idx(REGISTRATION_TYPES, _def("registration_type", REGISTRATION_TYPES[0])), key="train_case_type")
+                p_comp = st.selectbox("注册组成", REGISTRATION_COMPONENTS, index=_idx(REGISTRATION_COMPONENTS, _def("registration_component", REGISTRATION_COMPONENTS[0])), key="train_case_comp")
+                p_form = st.selectbox("项目形态", forms, index=_idx(forms, _def("project_form", forms[0])), key="train_case_form")
+                p_scope = st.text_area("产品适用范围（可选）", value=_def("scope_of_application", ""), placeholder="该过往项目的适用范围；第三步审核时可据此匹配", height=80, key="train_case_scope")
             else:
                 try:
                     idx = case_options.index(sel_case)
@@ -894,7 +1048,22 @@ def render_step1_page():
                         _doc_lang_idx = DOC_LANG_OPTIONS.index(_doc_lang_label) if _doc_lang_label in DOC_LANG_OPTIONS else 0
                         e_doc_lang = st.selectbox("案例文档语言", DOC_LANG_OPTIONS, index=_doc_lang_idx, key="edit_case_doc_lang")
                         e_scope = st.text_area("产品适用范围", value=case.get("scope_of_application") or "", height=60, key="edit_case_scope")
+                        other_cases_upload = [c for c in cases if c.get("id") != case.get("id")]
+                        link_options_upload = ["不关联（独立）"] + [_format_case_option(c) for c in other_cases_upload]
+                        _link_idx_upload = 0
+                        if case.get("project_key"):
+                            for i, c in enumerate(other_cases_upload):
+                                if str(c.get("id")) == str(case.get("project_key")) or (c.get("project_key") and str(c.get("project_key")) == str(case.get("project_key"))):
+                                    _link_idx_upload = i + 1
+                                    break
+                        e_link_upload = st.selectbox("关联到同一项目", link_options_upload, index=min(_link_idx_upload, len(link_options_upload) - 1), key="edit_case_link_upload", help="与所选案例归为同一项目（多国家/多语言版本）；不关联则本案例独立。")
                         if st.button("保存案例", key="edit_case_save"):
+                            project_key_new = ""
+                            if e_link_upload and e_link_upload != "不关联（独立）" and e_link_upload in link_options_upload:
+                                idx_link = link_options_upload.index(e_link_upload)
+                                if idx_link > 0:
+                                    linked = other_cases_upload[idx_link - 1]
+                                    project_key_new = (linked.get("project_key") or "").strip() or str(linked.get("id", ""))
                             update_project_case(
                                 case["id"],
                                 case_name=e_case_name.strip() or None,
@@ -905,6 +1074,7 @@ def render_step1_page():
                                 registration_country_en=e_country_en.strip() or None,
                                 document_language=DOC_LANG_LABEL_TO_VALUE.get(e_doc_lang, ""),
                                 scope_of_application=e_scope.strip() or None,
+                                project_key=project_key_new,
                             )
                             st.success("已保存")
                             st.experimental_rerun()
@@ -914,6 +1084,13 @@ def render_step1_page():
                         st.caption(f"📁 **已入库文件**：共 **{len(_case_files)}** 个 — {_preview}")
                     else:
                         st.caption("📁 **已入库文件**：暂无")
+                    if st.button("📋 创建本案例的其他国家/语言版本", key="btn_variant_upload", help="切换到新建案例并预填本案例信息，仅改注册国家、文档语言即可创建新版本"):
+                        st.session_state["train_upload_case_sel"] = "➕ 新建案例"
+                        st.session_state["train_copy_from_case_id"] = case["id"]
+                        st.session_state["train_copy_from_sel"] = _format_case_option(case)
+                        _rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+                        if callable(_rerun):
+                            _rerun()
                     if st.button("🗑️ 删除此案例", key="del_case_upload"):
                         if _case_files:
                             st.warning("该案例下已有入库文件，不能删除。请先删除关联文件后再试。")
@@ -1104,6 +1281,16 @@ def render_step1_page():
                     dims = _cached_dimension_options()
                     forms_list = dims.get("project_forms", ["Web", "APP", "PC"]) or ["Web", "APP", "PC"]
                     _doc_lang = DOC_LANG_LABEL_TO_VALUE.get(st.session_state.get("train_case_doc_lang") or "中文版", "zh")
+                    copy_from_sel = st.session_state.get("train_copy_from_sel", "不复制")
+                    copy_case = None
+                    if copy_from_sel and copy_from_sel != "不复制":
+                        cases_list = _cached_list_project_cases(collection)
+                        opts = [_format_case_option(c) for c in cases_list]
+                        if copy_from_sel in opts:
+                            copy_case = cases_list[opts.index(copy_from_sel)]
+                    project_key = ""
+                    if copy_case:
+                        project_key = (copy_case.get("project_key") or "").strip() or str(copy_case.get("id", ""))
                     train_case_id = create_project_case(
                         collection,
                         case_name,
@@ -1117,6 +1304,7 @@ def render_step1_page():
                         product_name_en=(st.session_state.get("train_case_product_en") or "").strip(),
                         registration_country_en=(st.session_state.get("train_case_country_en") or "").strip(),
                         document_language=_doc_lang,
+                        project_key=project_key,
                     )
                     st.success(f"已创建案例「{case_name}」，本批文件将训练到通用知识库并关联此案例。")
                 else:
@@ -1343,17 +1531,45 @@ def render_step1_page():
                                         help="项目案例为过往经验，训练到通用知识库；第三步审核时按产品名称与适用范围匹配。")
             if sel_case_dir == "➕ 新建案例":
                 st.caption("新建案例：描述本目录文件所属的过往项目（支持中/英文）。")
-                p_case_name_dir = st.text_input("案例名称", placeholder="例如：某某血糖仪二类注册案例", key="train_dir_case_name")
-                p_case_name_en_dir = st.text_input("案例名称（英文）", placeholder="e.g. XXX Blood Glucose Meter Class II", key="train_dir_case_name_en")
-                p_product_dir = st.text_input("产品名称", placeholder="该过往项目的产品名称", key="train_dir_case_product")
-                p_product_en_dir = st.text_input("产品名称（英文）", placeholder="Product name in English", key="train_dir_case_product_en")
-                p_doc_lang_dir = st.selectbox("案例文档语言", DOC_LANG_OPTIONS, index=1, key="train_dir_case_doc_lang", help="本目录下文档主要为中文、英文或中英文；与全系统文档语言选项保持一致")
-                p_country_dir = st.selectbox("注册国家", countries_dir, key="train_dir_case_country")
-                p_country_en_dir = st.text_input("注册国家（英文）", placeholder="e.g. China, USA", key="train_dir_case_country_en")
-                p_type_dir = st.selectbox("注册类别", REGISTRATION_TYPES, key="train_dir_case_type")
-                p_comp_dir = st.selectbox("注册组成", REGISTRATION_COMPONENTS, key="train_dir_case_comp")
-                p_form_dir = st.selectbox("项目形态", forms_dir, key="train_dir_case_form")
-                p_scope_dir = st.text_area("产品适用范围（可选）", placeholder="该过往项目的适用范围", height=60, key="train_dir_case_scope")
+                case_options_copy_dir = [_format_case_option(c) for c in cases_dir]
+                copy_default_idx_dir = 0
+                if st.session_state.get("train_dir_copy_from_case_id"):
+                    try:
+                        cid = st.session_state["train_dir_copy_from_case_id"]
+                        for i, c in enumerate(cases_dir):
+                            if c.get("id") == cid:
+                                copy_default_idx_dir = i + 1
+                                break
+                        st.session_state.pop("train_dir_copy_from_case_id", None)
+                    except Exception:
+                        pass
+                copy_from_sel_dir = st.selectbox(
+                    "复制自现有案例（可选）",
+                    ["不复制"] + case_options_copy_dir,
+                    index=min(copy_default_idx_dir, len(case_options_copy_dir)),
+                    key="train_dir_copy_from_sel",
+                    help="选择后预填案例信息，可仅改注册国家、文档语言以创建其他国家/语言版本。",
+                )
+                copy_case_dir = None
+                if copy_from_sel_dir and copy_from_sel_dir != "不复制" and copy_from_sel_dir in case_options_copy_dir:
+                    copy_case_dir = cases_dir[case_options_copy_dir.index(copy_from_sel_dir)]
+                if copy_case_dir:
+                    st.caption("已从现有案例预填，请修改「注册国家」「案例文档语言」等以区分为新版本。")
+                _def_dir = lambda k, d: (copy_case_dir.get(k) or d) if copy_case_dir else d
+                _idx_dir = lambda opts, val: opts.index(val) if val in opts else 0
+                p_case_name_dir = st.text_input("案例名称", value=_def_dir("case_name", ""), placeholder="例如：某某血糖仪二类注册案例", key="train_dir_case_name")
+                p_case_name_en_dir = st.text_input("案例名称（英文）", value=_def_dir("case_name_en", ""), placeholder="e.g. XXX Blood Glucose Meter Class II", key="train_dir_case_name_en")
+                p_product_dir = st.text_input("产品名称", value=_def_dir("product_name", ""), placeholder="该过往项目的产品名称", key="train_dir_case_product")
+                p_product_en_dir = st.text_input("产品名称（英文）", value=_def_dir("product_name_en", ""), placeholder="Product name in English", key="train_dir_case_product_en")
+                _doc_lang_val_dir = _def_dir("document_language", "zh")
+                _doc_lang_label_dir = DOC_LANG_VALUE_TO_LABEL.get(_doc_lang_val_dir, "中文版")
+                p_doc_lang_dir = st.selectbox("案例文档语言", DOC_LANG_OPTIONS, index=_idx_dir(DOC_LANG_OPTIONS, _doc_lang_label_dir), key="train_dir_case_doc_lang", help="本目录下文档主要为中文、英文或中英文；与全系统文档语言选项保持一致")
+                p_country_dir = st.selectbox("注册国家", countries_dir, index=_idx_dir(countries_dir, _def_dir("registration_country", countries_dir[0] if countries_dir else "")), key="train_dir_case_country")
+                p_country_en_dir = st.text_input("注册国家（英文）", value=_def_dir("registration_country_en", ""), placeholder="e.g. China, USA", key="train_dir_case_country_en")
+                p_type_dir = st.selectbox("注册类别", REGISTRATION_TYPES, index=_idx_dir(REGISTRATION_TYPES, _def_dir("registration_type", REGISTRATION_TYPES[0])), key="train_dir_case_type")
+                p_comp_dir = st.selectbox("注册组成", REGISTRATION_COMPONENTS, index=_idx_dir(REGISTRATION_COMPONENTS, _def_dir("registration_component", REGISTRATION_COMPONENTS[0])), key="train_dir_case_comp")
+                p_form_dir = st.selectbox("项目形态", forms_dir, index=_idx_dir(forms_dir, _def_dir("project_form", forms_dir[0] if forms_dir else "")), key="train_dir_case_form")
+                p_scope_dir = st.text_area("产品适用范围（可选）", value=_def_dir("scope_of_application", ""), placeholder="该过往项目的适用范围", height=60, key="train_dir_case_scope")
             else:
                 try:
                     idx_dir = case_options_dir.index(sel_case_dir)
@@ -1364,12 +1580,61 @@ def render_step1_page():
                         f"（产品名称：{case_dir.get('product_name') or '—'}，"
                         f"注册国家：{case_dir.get('registration_country')}）"
                     )
+                    with st.expander("✏️ 编辑此案例 & 关联项目", expanded=False):
+                        e_case_name_d = st.text_input("案例名称", value=case_dir.get("case_name") or "", key="edit_dir_case_name")
+                        e_case_name_en_d = st.text_input("案例名称（英文）", value=case_dir.get("case_name_en") or "", key="edit_dir_case_name_en")
+                        e_product_d = st.text_input("产品名称", value=case_dir.get("product_name") or "", key="edit_dir_case_product")
+                        e_product_en_d = st.text_input("产品名称（英文）", value=case_dir.get("product_name_en") or "", key="edit_dir_case_product_en")
+                        e_country_d = st.text_input("注册国家", value=case_dir.get("registration_country") or "", key="edit_dir_case_country")
+                        e_country_en_d = st.text_input("注册国家（英文）", value=case_dir.get("registration_country_en") or "", key="edit_dir_case_country_en")
+                        _doc_lang_d = case_dir.get("document_language") or ""
+                        _doc_lang_label_d = DOC_LANG_VALUE_TO_LABEL.get(_doc_lang_d, "不指定")
+                        _doc_lang_idx_d = DOC_LANG_OPTIONS.index(_doc_lang_label_d) if _doc_lang_label_d in DOC_LANG_OPTIONS else 0
+                        e_doc_lang_d = st.selectbox("案例文档语言", DOC_LANG_OPTIONS, index=_doc_lang_idx_d, key="edit_dir_case_doc_lang")
+                        e_scope_d = st.text_area("产品适用范围", value=case_dir.get("scope_of_application") or "", height=60, key="edit_dir_case_scope")
+                        other_cases_dir = [c for c in cases_dir if c.get("id") != case_dir.get("id")]
+                        link_options_dir = ["不关联（独立）"] + [_format_case_option(c) for c in other_cases_dir]
+                        _link_idx_dir = 0
+                        if case_dir.get("project_key"):
+                            for i, c in enumerate(other_cases_dir):
+                                if str(c.get("id")) == str(case_dir.get("project_key")) or (c.get("project_key") and str(c.get("project_key")) == str(case_dir.get("project_key"))):
+                                    _link_idx_dir = i + 1
+                                    break
+                        e_link_dir = st.selectbox("关联到同一项目", link_options_dir, index=min(_link_idx_dir, len(link_options_dir) - 1), key="edit_dir_case_link", help="与所选案例归为同一项目（多国家/多语言版本）。")
+                        if st.button("保存案例", key="edit_dir_case_save"):
+                            project_key_d = ""
+                            if e_link_dir and e_link_dir != "不关联（独立）" and e_link_dir in link_options_dir:
+                                idx_ld = link_options_dir.index(e_link_dir)
+                                if idx_ld > 0:
+                                    linked_d = other_cases_dir[idx_ld - 1]
+                                    project_key_d = (linked_d.get("project_key") or "").strip() or str(linked_d.get("id", ""))
+                            update_project_case(
+                                case_dir["id"],
+                                case_name=e_case_name_d.strip() or None,
+                                case_name_en=e_case_name_en_d.strip() or None,
+                                product_name=e_product_d.strip() or None,
+                                product_name_en=e_product_en_d.strip() or None,
+                                registration_country=e_country_d.strip() or None,
+                                registration_country_en=e_country_en_d.strip() or None,
+                                document_language=DOC_LANG_LABEL_TO_VALUE.get(e_doc_lang_d, ""),
+                                scope_of_application=e_scope_d.strip() or None,
+                                project_key=project_key_d,
+                            )
+                            st.success("已保存")
+                            st.experimental_rerun()
                     _case_files_dir = get_project_case_file_names(collection_dir, case_dir["id"])
                     if _case_files_dir:
                         _preview_dir = ", ".join(_case_files_dir[:5]) + ("..." if len(_case_files_dir) > 5 else "")
                         st.caption(f"📁 **已入库文件**：共 **{len(_case_files_dir)}** 个 — {_preview_dir}")
                     else:
                         st.caption("📁 **已入库文件**：暂无")
+                    if st.button("📋 创建本案例的其他国家/语言版本", key="btn_variant_dir", help="切换到新建案例并预填本案例信息，仅改注册国家、文档语言即可创建新版本"):
+                        st.session_state["train_dir_case_sel"] = "➕ 新建案例"
+                        st.session_state["train_dir_copy_from_case_id"] = case_dir["id"]
+                        st.session_state["train_dir_copy_from_sel"] = _format_case_option(case_dir)
+                        _rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+                        if callable(_rerun):
+                            _rerun()
                     if st.button("🗑️ 删除此案例", key="del_case_dir"):
                         if _case_files_dir:
                             st.warning("该案例下已有入库文件，不能删除。请先删除关联文件后再试。")
@@ -1402,6 +1667,16 @@ def render_step1_page():
                     forms_list_dir = dims_dir.get("project_forms", ["Web", "APP", "PC"]) or ["Web", "APP", "PC"]
                     collection_dir = st.session_state.get("collection_name", "regulations")
                     _doc_lang_dir = DOC_LANG_LABEL_TO_VALUE.get(st.session_state.get("train_dir_case_doc_lang") or "中文版", "zh")
+                    copy_from_sel_dir = st.session_state.get("train_dir_copy_from_sel", "不复制")
+                    copy_case_dir = None
+                    if copy_from_sel_dir and copy_from_sel_dir != "不复制":
+                        cases_list_dir = _cached_list_project_cases(collection_dir)
+                        opts_dir = [_format_case_option(c) for c in cases_list_dir]
+                        if copy_from_sel_dir in opts_dir:
+                            copy_case_dir = cases_list_dir[opts_dir.index(copy_from_sel_dir)]
+                    project_key_dir = ""
+                    if copy_case_dir:
+                        project_key_dir = (copy_case_dir.get("project_key") or "").strip() or str(copy_case_dir.get("id", ""))
                     train_case_id_dir = create_project_case(
                         collection_dir,
                         case_name_dir,
@@ -1415,6 +1690,7 @@ def render_step1_page():
                         product_name_en=(st.session_state.get("train_dir_case_product_en") or "").strip(),
                         registration_country_en=(st.session_state.get("train_dir_case_country_en") or "").strip(),
                         document_language=_doc_lang_dir,
+                        project_key=project_key_dir,
                     )
                     st.success(f"已创建案例「{case_name_dir}」，本目录文件将训练到通用知识库并关联此案例。")
                 else:
@@ -1537,6 +1813,12 @@ def render_step1_page():
             key="gen_checklist_countries",
             help="\u9009\u62e9\u6ce8\u518c\u56fd\u5bb6\u540e\uff0c\u751f\u6210\u5ba1\u6838\u70b9\u65f6\u4f1a\u81ea\u52a8\u6309\u300c\u7ef4\u5ea6\u9009\u9879\u914d\u7f6e\u300d\u4e2d\u7684\u56fd\u5bb6\u2192\u6cd5\u89c4\u5173\u952e\u8bcd\u6620\u5c04\u6269\u5c55\u68c0\u7d22\u77e5\u8bc6\u5e93\uff0c\u4e0d\u533a\u5206\u5927\u5c0f\u5199\u3002",
         )
+        gen_reg_type = st.selectbox(
+            "适用注册类别（可选）",
+            ["不指定"] + REGISTRATION_TYPES,
+            key="gen_checklist_reg_type",
+            help="选择后生成审核点时会注入审核尺度提示（严格程度 Ⅲ>Ⅱb>Ⅱa>Ⅱ>Ι），便于清单更贴合二类/三类项目。",
+        )
         # 显示知识库规模与预估审核点数量
         if reg_count > 0:
             from src.core.checklist_generator import estimate_checklist_scale
@@ -1598,6 +1880,7 @@ def render_step1_page():
                             document_language=_gen_doc_lang_val or None,
                             kb_stats=_kb_stats,
                             registration_countries=gen_sel_countries or None,
+                            registration_type=gen_reg_type if (gen_reg_type and gen_reg_type != "不指定") else None,
                             progress_callback=_gen_progress,  # 分批进度
                         )
                     gen_progress_bar.empty()
@@ -1981,6 +2264,8 @@ def _render_projects_tab(agent, collection: str):
             p_name_en = st.text_input("项目名称（英文）", placeholder="Project name in English", key="np_name_en")
             p_product = st.text_input("产品名称（可选）", placeholder="与项目名称一并加入审核点、一致性核对", key="np_product")
             p_product_en = st.text_input("产品名称（英文）", placeholder="Product name in English", key="np_product_en")
+            p_model = st.text_input("型号（可选，Model）", placeholder="中英文均可；字段名称不区分大小写，取值区分大小写、精确匹配（含空格）", key="np_model")
+            p_model_en = st.text_input("型号（英文，可选）", placeholder="Model in English", key="np_model_en")
             p_country = st.selectbox("注册国家", countries, key="np_country")
             p_country_en = st.text_input("注册国家（英文）", placeholder="e.g. China, USA", key="np_country_en")
             p_type = st.selectbox("注册类别", REGISTRATION_TYPES, key="np_type")
@@ -1996,6 +2281,8 @@ def _render_projects_tab(agent, collection: str):
                         name_en=(p_name_en or "").strip(),
                         product_name_en=(p_product_en or "").strip(),
                         registration_country_en=(p_country_en or "").strip(),
+                        model=(p_model or "").strip(),
+                        model_en=(p_model_en or "").strip(),
                     )
                     st.success(f"已创建项目「{p_name}」，ID: {pid}")
                     st.experimental_rerun()
@@ -2019,6 +2306,8 @@ def _render_projects_tab(agent, collection: str):
         c4.metric("项目形态", proj.get("project_form", ""))
         if proj.get("product_name") or proj.get("product_name_en"):
             st.caption(f"产品名称：{proj.get('product_name') or '—'} / {proj.get('product_name_en') or '—'}（已加入审核点/一致性核对）")
+        if proj.get("model") or proj.get("model_en"):
+            st.caption(f"型号（Model）：{proj.get('model') or '—'} / {proj.get('model_en') or '—'}（字段名称不区分大小写，取值区分大小写、精确匹配含空格）")
 
         with st.expander("✏️ 编辑项目（支持中/英文）", expanded=False):
             with st.form(f"edit_proj_{pid}"):
@@ -2026,6 +2315,8 @@ def _render_projects_tab(agent, collection: str):
                 e_name_en = st.text_input("项目名称（英文）", value=proj.get("name_en") or "", placeholder="Project name in English", key=f"ep_name_en_{pid}")
                 e_product = st.text_input("产品名称（可选）", value=proj.get("product_name") or "", placeholder="与项目名称一并加入审核点、一致性核对", key=f"ep_product_{pid}")
                 e_product_en = st.text_input("产品名称（英文）", value=proj.get("product_name_en") or "", placeholder="Product name in English", key=f"ep_product_en_{pid}")
+                e_model = st.text_input("型号（可选，Model）", value=proj.get("model") or "", placeholder="字段名称不区分大小写，取值区分大小写、精确匹配（含空格）", key=f"ep_model_{pid}")
+                e_model_en = st.text_input("型号（英文，可选）", value=proj.get("model_en") or "", placeholder="Model in English", key=f"ep_model_en_{pid}")
                 e_country = st.selectbox("注册国家", countries, index=countries.index(proj["registration_country"]) if proj.get("registration_country") in countries else 0, key=f"ep_country_{pid}")
                 e_country_en = st.text_input("注册国家（英文）", value=proj.get("registration_country_en") or "", placeholder="e.g. China", key=f"ep_country_en_{pid}")
                 e_type = st.selectbox("注册类别", REGISTRATION_TYPES, index=REGISTRATION_TYPES.index(proj["registration_type"]) if proj.get("registration_type") in REGISTRATION_TYPES else 0, key=f"ep_type_{pid}")
@@ -2045,6 +2336,8 @@ def _render_projects_tab(agent, collection: str):
                         name_en=e_name_en.strip() if e_name_en else "",
                         product_name_en=e_product_en.strip() if e_product_en else "",
                         registration_country_en=e_country_en.strip() if e_country_en else "",
+                        model=e_model.strip() if e_model else "",
+                        model_en=e_model_en.strip() if e_model_en else "",
                     )
                     st.success("已更新")
                     st.experimental_rerun()
@@ -2468,7 +2761,7 @@ def render_step3_page():
                     _country = proj.get("registration_country")
                     _type = proj.get("registration_type")
                     sel_countries = st.multiselect("注册国家", countries, default=[_country] if _country in countries else [], key="rev_countries")
-                    sel_types = st.multiselect("注册类别", REGISTRATION_TYPES, default=[_type] if _type in REGISTRATION_TYPES else [], key="rev_types")
+                    sel_types = st.multiselect("适用注册类别", REGISTRATION_TYPES, default=[_type] if _type in REGISTRATION_TYPES else [], key="rev_types", help="与项目注册类别一致；按项目审核时将按此自动匹配审核点（仅使用适用该类别的审核点）。")
                 with c2:
                     _comp = proj.get("registration_component")
                     _form = proj.get("project_form")
@@ -2481,6 +2774,8 @@ def render_step3_page():
                     "project_form": sel_forms or [_form or ""],
                     "_project_name": selected_name,
                     "_product_name": proj.get("product_name") or "",
+                    "_model": proj.get("model") or "",
+                    "_model_en": proj.get("model_en") or "",
                 }
     # 自动匹配过往项目案例（与「按项目审核」独立；用缓存避免切换选项时卡顿）
     cases = _cached_list_project_cases(collection)
@@ -2683,6 +2978,21 @@ def render_step3_page():
                     scope = (matched_case.get("scope_of_application") or "").strip()
                     if scope:
                         case_ctx += f"产品适用范围：{scope}\n"
+                    # 文档内容完整性：从历史案例库提取章节结构，供审核时对比待审文档是否缺章
+                    try:
+                        case_chunks = get_knowledge_docs_by_case_id(collection, matched_case["id"], limit=500)
+                        if case_chunks:
+                            outline = extract_section_outline_from_texts([c.get("content") or "" for c in case_chunks])
+                            if outline.strip():
+                                case_ctx += "\n【历史案例文档章节参考】\n以下为案例库中该案例文档的章节结构，请据此检查待审文档是否具备应有章节；缺失的章节须作为「文档内容完整性」审核点列出，并指明应补充的章节名称或位置。\n\n" + outline.strip() + "\n"
+                                # P-4.6（不改顺序）：章节参考段落后强化逐条对照要求
+                                case_ctx += (
+                                    "\n**完整性审核执行要求**：请按上表章节**逐条**在待审文档中查找对应或等价章节；"
+                                    "每发现一处缺失或标题/层级明显不一致，单列一条审核点，不得合并为多处以「若干章节缺失」一笔带过。"
+                                    "location 须写清缺失章节名称或待审文档中应出现的位置。\n"
+                                )
+                    except Exception:
+                        pass
                     case_ctx += "\n请参考上述案例经验审核当前文档，如有类似问题请重点关注。"
                     review_context["case_context_text"] = case_ctx
                 else:
@@ -2693,6 +3003,9 @@ def render_step3_page():
             if review_context is None:
                 review_context = {}
             review_context["document_language"] = DOC_LANG_LABEL_TO_VALUE.get(_doc_lang_sel, "")
+            # 按项目审核时自动按项目适用注册类别匹配审核点；通用审核不区分类别、使用全部审核点
+            if project_id:
+                review_context["_filter_by_registration_type"] = True
 
             total_files = len(items)
             st.session_state.review_project_id = project_id
@@ -2720,11 +3033,13 @@ def render_step3_page():
                     multi_doc_fn = getattr(agent, "review_multi_document_consistency", None)
                     if callable(multi_doc_fn):
                         try:
+                            _ctx = dict(review_context) if review_context else {}
+                            _ctx["current_provider"] = st.session_state.get("current_provider") or settings.provider
                             with st.spinner("正在调用多文档一致性审核接口（读取文件并请求 AI）…"):
                                 consistency_report = multi_doc_fn(
                                     [(path, display_name) for (path, display_name, _) in items],
                                     project_id=project_id,
-                                    review_context=review_context,
+                                    review_context=_ctx,
                                 )
                             consistency_report["original_filename"] = "多文档一致性与模板风格审核"
                             consistency_report["related_doc_names"] = [display_name for (_, display_name, _) in items]
@@ -2742,7 +3057,6 @@ def render_step3_page():
                                 st.warning(f"多文档一致性报告已生成，但写入历史审核报告失败，请稍后在「历史审核报告」中确认是否可见：{save_err}")
                             review_status.success("多文档一致性与模板风格审核完成。")
                         except Exception as ex:
-                            import traceback
                             multi_doc_error_shown = True
                             review_status.error(f"多文档一致性与模板风格审核失败：{ex}")
                             st.caption("若为接口/网络错误，请检查模型配置与 API；若为解析错误，请查看下方详情。")
@@ -2848,6 +3162,24 @@ def render_step3_page():
                 )
                 if all_reports:
                     st.session_state.review_reports = all_reports
+                    try:
+                        _batch_meta = _build_review_meta_dict()
+                        _partial_batch = {
+                            "file_name": "批量审核（部分完成）",
+                            "original_filename": "批量审核（部分完成）",
+                            "batch": True,
+                            "reports": list(all_reports),
+                            "total_points": sum(r.get("total_points", 0) for r in all_reports),
+                            "high_count": sum(r.get("high_count", 0) for r in all_reports),
+                            "medium_count": sum(r.get("medium_count", 0) for r in all_reports),
+                            "low_count": sum(r.get("low_count", 0) for r in all_reports),
+                            "info_count": sum(r.get("info_count", 0) for r in all_reports),
+                            "summary": f"本批次中断，已完成 {len(all_reports)}/{total_files} 份报告。",
+                            "_review_meta": _batch_meta,
+                        }
+                        save_audit_report(agent.collection_name, _partial_batch, model_info=get_current_model_info() or "")
+                    except Exception as _save_err:
+                        st.caption(f"已完成的报告写入历史失败：{_save_err}")
             else:
                 review_bar.progress(100)
                 total_time = time.time() - t_start
@@ -2870,12 +3202,14 @@ def render_step3_page():
                     multi_doc_fn = getattr(agent, "review_multi_document_consistency", None)
                     if callable(multi_doc_fn):
                         try:
+                            _ctx = dict(review_context) if review_context else {}
+                            _ctx["current_provider"] = st.session_state.get("current_provider") or settings.provider
                             review_status.info("正在进行多文档一致性与模板风格审核…")
                             with st.spinner("正在调用多文档一致性审核接口（请求 AI）…"):
                                 consistency_report = multi_doc_fn(
                                     [(path, display_name) for (path, display_name, _) in items],
                                     project_id=project_id,
-                                    review_context=review_context,
+                                    review_context=_ctx,
                                 )
                             consistency_report["original_filename"] = "多文档一致性与模板风格审核"
                             consistency_report["related_doc_names"] = [display_name for (_, display_name, _) in items]
@@ -2915,9 +3249,47 @@ def render_step3_page():
                         except Exception as ex:
                             log_lines.append(f"- :x: **多文档一致性与模板风格审核** 失败：{ex}")
                             log_display.markdown("\n".join(log_lines))
+                            if all_reports:
+                                try:
+                                    _batch_meta = _build_review_meta_dict()
+                                    _batch_no_consistency = {
+                                        "file_name": "批量审核（多文档一致性未完成）",
+                                        "original_filename": "批量审核（多文档一致性未完成）",
+                                        "batch": True,
+                                        "reports": list(all_reports),
+                                        "total_points": sum(r.get("total_points", 0) for r in all_reports),
+                                        "high_count": sum(r.get("high_count", 0) for r in all_reports),
+                                        "medium_count": sum(r.get("medium_count", 0) for r in all_reports),
+                                        "low_count": sum(r.get("low_count", 0) for r in all_reports),
+                                        "info_count": sum(r.get("info_count", 0) for r in all_reports),
+                                        "summary": f"本批次共 {len(all_reports)} 份单文档报告；多文档一致性审核未完成。",
+                                        "_review_meta": _batch_meta,
+                                    }
+                                    save_audit_report(agent.collection_name, _batch_no_consistency, model_info=get_current_model_info() or "")
+                                except Exception as _save_err:
+                                    st.warning(f"本批报告写入历史失败：{_save_err}")
                     else:
                         log_lines.append("- :x: **多文档一致性与模板风格审核** 当前版本不支持，已跳过。")
                         log_display.markdown("\n".join(log_lines))
+                        if all_reports:
+                            try:
+                                _batch_meta = _build_review_meta_dict()
+                                _batch_skip_multi = {
+                                    "file_name": "批量审核（含多文档一致性）",
+                                    "original_filename": "批量审核（含多文档一致性）",
+                                    "batch": True,
+                                    "reports": list(all_reports),
+                                    "total_points": sum(r.get("total_points", 0) for r in all_reports),
+                                    "high_count": sum(r.get("high_count", 0) for r in all_reports),
+                                    "medium_count": sum(r.get("medium_count", 0) for r in all_reports),
+                                    "low_count": sum(r.get("low_count", 0) for r in all_reports),
+                                    "info_count": sum(r.get("info_count", 0) for r in all_reports),
+                                    "summary": f"本批次共 {len(all_reports)} 份报告（多文档一致性未执行）。",
+                                    "_review_meta": _batch_meta,
+                                }
+                                save_audit_report(agent.collection_name, _batch_skip_multi, model_info=get_current_model_info() or "")
+                            except Exception as _save_err:
+                                st.warning(f"本批报告写入历史失败：{_save_err}")
 
                 if all_reports:
                     st.session_state.review_reports = all_reports
@@ -3175,7 +3547,7 @@ def render_step3_page():
 
     try:
         collection = st.session_state.get("collection_name", "regulations")
-        history = get_audit_reports(collection=collection, limit=50)
+        history = get_audit_reports(collection=collection, limit=100)
         if history:
             for rec in history:
                 ts = rec.get("created_at", "")
@@ -3233,6 +3605,8 @@ def _build_review_meta_dict() -> dict:
     meta: dict = {"audit_type": "项目审核" if is_project else "通用审核"}
     meta["project_name"] = ctx.get("_project_name", "") if is_project else ""
     meta["product_name"] = ctx.get("_product_name", "") if is_project else ""
+    meta["model"] = ctx.get("_model") or ctx.get("model", "") if is_project else ""
+    meta["model_en"] = ctx.get("_model_en") or ctx.get("model_en", "") if is_project else ""
     countries = ctx.get("registration_country") or []
     meta["registration_country"] = (
         "、".join(c for c in countries if c) if isinstance(countries, list) else str(countries)
@@ -3926,6 +4300,8 @@ def _render_reports_table_layout(
             info_parts.append(f"**项目名称：** {meta['project_name']}")
         if meta.get("product_name"):
             info_parts.append(f"**产品名称：** {meta['product_name']}")
+        if meta.get("model") or meta.get("model_en"):
+            info_parts.append(f"**型号（Model）：** {(meta.get('model') or '') or '—'} / {(meta.get('model_en') or '') or '—'}")
         if meta.get("registration_country"):
             info_parts.append(f"**注册国家：** {meta['registration_country']}")
         if info_parts:

@@ -2,6 +2,7 @@
    同时将文档块持久化到 MySQL，重启服务不丢失记录。
 """
 
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -24,22 +25,74 @@ from .db import (
 )
 
 
+def _add_batch_with_retry(vectorstore: Chroma, batch: List[Document]) -> None:
+    """单批向量化并入库，遇连接被关闭等错误时重试（如 WinError 10054 / httpcore.ReadError）。"""
+    max_retries = max(1, getattr(settings, "embedding_max_retries", 3))
+    delay = max(0.5, getattr(settings, "embedding_retry_delay_sec", 2.0))
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            vectorstore.add_documents(batch)
+            return
+        except (ConnectionError, OSError) as e:
+            last_err = e
+        except Exception as e:
+            mod = getattr(type(e), "__module__", "") or ""
+            retryable = (
+                "10054" in str(e)
+                or "ReadError" in type(e).__name__
+                or "ConnectError" in type(e).__name__
+                or "RemoteProtocolError" in type(e).__name__
+                or mod.startswith("httpcore")
+                or mod.startswith("httpx")
+            )
+            if retryable:
+                last_err = e
+            else:
+                raise
+        if attempt < max_retries - 1:
+            time.sleep(delay * (attempt + 1))
+    if last_err is not None:
+        raise last_err
+
+
 def _create_embeddings():
-    use_ollama = settings.is_ollama or (settings.is_cursor and (settings.cursor_embedding or "").lower() == "ollama")
+    # DeepSeek/零一 不提供 /v1/embeddings，若用其 base_url 会 404；统一用 Ollama 做向量化
+    # 优先用 session 中的当前 provider（Streamlit 侧栏选择），否则用 settings.provider
+    try:
+        import streamlit as _st
+        p = (_st.session_state.get("current_provider") or settings.provider or "").strip().lower()
+    except Exception:
+        p = (settings.provider or "").strip().lower()
+    use_ollama = (
+        settings.is_ollama
+        or (settings.is_cursor and (settings.cursor_embedding or "").lower() == "ollama")
+        or p in ("deepseek", "lingyi")
+    )
+    # 防御：若即将用 OpenAIEmbeddings 且 base_url 为 DeepSeek（会 404），则改用 Ollama；排除 Cursor 以不影响其「向量化=openai」的用法
+    if not use_ollama and ("deepseek.com" in (settings.openai_base_url or "")) and p != "cursor":
+        use_ollama = True
     if use_ollama:
         from langchain_ollama import OllamaEmbeddings
+        from config.cursor_overrides import get_llm_verify_ssl, get_llm_trust_env
+        client_kwargs = {"verify": get_llm_verify_ssl(), "trust_env": get_llm_trust_env()}
         return OllamaEmbeddings(
             model=settings.embedding_model,
             base_url=settings.ollama_base_url,
+            client_kwargs=client_kwargs,
         )
     else:
         from langchain_openai import OpenAIEmbeddings
+        from config.cursor_overrides import get_llm_verify_ssl, get_llm_trust_env
+        import httpx
         if not settings.openai_api_key:
             raise RuntimeError("请配置 OpenAI API Key（用于向量化或 OpenAI 模式）")
+        http_client = httpx.Client(verify=get_llm_verify_ssl(), trust_env=get_llm_trust_env())
         return OpenAIEmbeddings(
             model=settings.embedding_model,
             openai_api_key=settings.openai_api_key,
             openai_api_base=settings.openai_base_url,
+            http_client=http_client,
         )
 
 
@@ -102,9 +155,13 @@ class KnowledgeBase:
                 doc.metadata["category"] = category
                 if category == "project_case" and case_id is not None:
                     doc.metadata["case_id"] = case_id
-        for i in range(0, len(documents), batch_size):
-            batch = documents[i:i + batch_size]
-            self.vectorstore.add_documents(batch)
+        total = len(documents)
+        threshold = getattr(settings, "embedding_large_file_threshold", 60)
+        max_batch = getattr(settings, "embedding_large_file_batch_size", 12)
+        effective_batch_size = min(batch_size, max_batch) if total > threshold else batch_size
+        for i in range(0, total, effective_batch_size):
+            batch = documents[i:i + effective_batch_size]
+            _add_batch_with_retry(self.vectorstore, batch)
         if self.project_id:
             save_project_knowledge_docs(self.project_id, self.base_collection, file_name, documents)
         elif self.is_checkpoint:
@@ -134,9 +191,12 @@ class KnowledgeBase:
                     doc.metadata["case_id"] = case_id
         total = len(documents)
         done = 0
-        for i in range(0, total, batch_size):
-            batch = documents[i:i + batch_size]
-            self.vectorstore.add_documents(batch)
+        threshold = getattr(settings, "embedding_large_file_threshold", 60)
+        max_batch = getattr(settings, "embedding_large_file_batch_size", 12)
+        effective_batch_size = min(batch_size, max_batch) if total > threshold else batch_size
+        for i in range(0, total, effective_batch_size):
+            batch = documents[i:i + effective_batch_size]
+            _add_batch_with_retry(self.vectorstore, batch)
             done += len(batch)
             if callback:
                 callback(done, total)

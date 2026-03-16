@@ -220,6 +220,14 @@ def init_db() -> None:
             _add_column_if_missing(cur, "knowledge_docs", "case_id", "BIGINT DEFAULT NULL COMMENT '关联 project_cases.id，仅 category=project_case 时有值'")
             _add_column_if_missing(cur, "app_settings", "cursor_verify_ssl", "TINYINT(1) DEFAULT 1")
             _add_column_if_missing(cur, "app_settings", "cursor_trust_env", "TINYINT(1) DEFAULT 1")
+            _add_column_if_missing(cur, "app_settings", "deepseek_api_key", "VARCHAR(1024) DEFAULT ''")
+            _add_column_if_missing(cur, "app_settings", "deepseek_base_url", "VARCHAR(512) DEFAULT ''")
+            _add_column_if_missing(cur, "app_settings", "lingyi_api_key", "VARCHAR(1024) DEFAULT ''")
+            _add_column_if_missing(cur, "app_settings", "lingyi_base_url", "VARCHAR(512) DEFAULT ''")
+            _add_column_if_missing(cur, "app_settings", "gemini_api_key", "VARCHAR(1024) DEFAULT ''")
+            _add_column_if_missing(cur, "app_settings", "dashscope_api_key", "VARCHAR(1024) DEFAULT ''")
+            _add_column_if_missing(cur, "app_settings", "qianfan_ak", "VARCHAR(512) DEFAULT ''")
+            _add_column_if_missing(cur, "app_settings", "qianfan_sk", "VARCHAR(512) DEFAULT ''")
             _add_column_if_missing(cur, "projects", "basic_info_text", "TEXT COMMENT '从项目资料中提取的基本信息，审核时与待审文档一致性核对'")
             _add_column_if_missing(cur, "projects", "system_functionality_text", "TEXT COMMENT '从安装包或URL识别的系统功能描述，审核时与待审文档一致性核对'")
             _add_column_if_missing(cur, "projects", "system_functionality_source", "VARCHAR(64) DEFAULT '' COMMENT 'package|url|空'")
@@ -227,6 +235,8 @@ def init_db() -> None:
             _add_column_if_missing(cur, "projects", "product_name", "VARCHAR(512) DEFAULT '' COMMENT '产品名称，与项目名称一并加入审核点/一致性核对'")
             _add_column_if_missing(cur, "projects", "name_en", "VARCHAR(256) DEFAULT '' COMMENT '项目名称英文'")
             _add_column_if_missing(cur, "projects", "product_name_en", "VARCHAR(512) DEFAULT '' COMMENT '产品名称英文'")
+            _add_column_if_missing(cur, "projects", "model", "VARCHAR(512) DEFAULT '' COMMENT '型号'")
+            _add_column_if_missing(cur, "projects", "model_en", "VARCHAR(512) DEFAULT '' COMMENT '型号英文 Model'")
             _add_column_if_missing(cur, "projects", "registration_country_en", "VARCHAR(128) DEFAULT '' COMMENT '注册国家英文'")
             _add_column_if_missing(cur, "app_settings", "review_extra_instructions", "LONGTEXT COMMENT '自定义审核要求/提示词，会追加到审核上下文中'")
             _add_column_if_missing(cur, "app_settings", "review_system_prompt", "LONGTEXT COMMENT '审核系统提示词，为空则使用内置默认'")
@@ -409,6 +419,14 @@ def save_app_settings(
     cursor_trust_env: bool = True,
     llm_model: str = "",
     embedding_model: str = "",
+    deepseek_api_key: str = "",
+    deepseek_base_url: str = "",
+    lingyi_api_key: str = "",
+    lingyi_base_url: str = "",
+    gemini_api_key: str = "",
+    dashscope_api_key: str = "",
+    qianfan_ak: str = "",
+    qianfan_sk: str = "",
 ) -> None:
     init_db()
     conn = _get_conn()
@@ -420,9 +438,12 @@ def save_app_settings(
                 INSERT INTO app_settings (
                     id, provider, openai_api_key, openai_base_url, ollama_base_url,
                     cursor_api_key, cursor_api_base, cursor_repository, cursor_ref, cursor_embedding,
-                    cursor_verify_ssl, cursor_trust_env, llm_model, embedding_model
+                    cursor_verify_ssl, cursor_trust_env, llm_model, embedding_model,
+                    deepseek_api_key, deepseek_base_url, lingyi_api_key, lingyi_base_url,
+                    gemini_api_key, dashscope_api_key, qianfan_ak, qianfan_sk
                 ) VALUES (
-                    1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s
                 ) ON DUPLICATE KEY UPDATE
                     provider = VALUES(provider),
                     openai_api_key = VALUES(openai_api_key),
@@ -437,11 +458,21 @@ def save_app_settings(
                     cursor_trust_env = VALUES(cursor_trust_env),
                     llm_model = VALUES(llm_model),
                     embedding_model = VALUES(embedding_model),
+                    deepseek_api_key = VALUES(deepseek_api_key),
+                    deepseek_base_url = VALUES(deepseek_base_url),
+                    lingyi_api_key = VALUES(lingyi_api_key),
+                    lingyi_base_url = VALUES(lingyi_base_url),
+                    gemini_api_key = VALUES(gemini_api_key),
+                    dashscope_api_key = VALUES(dashscope_api_key),
+                    qianfan_ak = VALUES(qianfan_ak),
+                    qianfan_sk = VALUES(qianfan_sk),
                     updated_at = CURRENT_TIMESTAMP
             """, (
                 provider, openai_api_key, openai_base_url, ollama_base_url,
                 cursor_api_key, cursor_api_base, cursor_repository, cursor_ref, cursor_embedding,
                 verify_ssl_int, trust_env_int, llm_model, embedding_model,
+                deepseek_api_key or "", deepseek_base_url or "", lingyi_api_key or "", lingyi_base_url or "",
+                gemini_api_key or "", dashscope_api_key or "", qianfan_ak or "", qianfan_sk or "",
             ))
         conn.commit()
     finally:
@@ -493,6 +524,7 @@ OP_TYPE_TRAIN_PROJECT_ERROR = "train_project_error"  # 单文件失败或整批�
 
 def get_current_model_info() -> str:
     from config import settings
+    from src.core.llm_factory import provider_display_name
     p = (settings.provider or "").lower()
     llm = settings.llm_model or ""
     emb = settings.embedding_model or ""
@@ -500,7 +532,7 @@ def get_current_model_info() -> str:
         return f"Ollama / LLM:{llm} / Embed:{emb}"
     if p == "cursor":
         return f"Cursor Agent / Embed:{emb}"
-    return f"OpenAI / LLM:{llm} / Embed:{emb}"
+    return f"{provider_display_name(p)} / LLM:{llm} / Embed:{emb}"
 
 
 def get_operation_logs(
@@ -1110,8 +1142,10 @@ def get_corrections_for_collection(collection: str, limit: int = 200) -> list:
         conn.close()
 
 
-# 注册类别、注册组成：固定选项（不同国家可细分Ⅱa、Ⅱb 等，此处为统一列表）
+# 适用注册类别：全系统下拉统一使用此列表（生成审核点、按项目审核、项目/案例属性等）
 REGISTRATION_TYPES = ["医疗器械一类", "医疗器械二类", "医疗器械二类Ⅱa", "医疗器械二类Ⅱb", "医疗器械三类"]
+# 别名，便于语义区分「适用注册类别」与「项目注册类别」时使用同一列表
+REGISTRATION_TYPE_OPTIONS = REGISTRATION_TYPES
 REGISTRATION_COMPONENTS = ["有源医疗器械", "软件组件", "独立软件"]
 
 
@@ -1226,15 +1260,17 @@ def create_project(
     name_en: str = "",
     product_name_en: str = "",
     registration_country_en: str = "",
+    model: str = "",
+    model_en: str = "",
 ) -> int:
     init_db()
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO projects (collection, name, registration_country, registration_type, registration_component, project_form, scope_of_application, product_name, name_en, product_name_en, registration_country_en)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (collection, name, registration_country, registration_type, registration_component, project_form, scope_of_application or "", product_name or "", name_en or "", product_name_en or "", registration_country_en or ""))
+                INSERT INTO projects (collection, name, registration_country, registration_type, registration_component, project_form, scope_of_application, product_name, name_en, product_name_en, registration_country_en, model, model_en)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (collection, name, registration_country, registration_type, registration_component, project_form, scope_of_application or "", product_name or "", name_en or "", product_name_en or "", registration_country_en or "", model or "", model_en or ""))
             pid = cur.lastrowid
         conn.commit()
         return pid
@@ -1254,6 +1290,8 @@ def update_project(
     name_en: str = None,
     product_name_en: str = None,
     registration_country_en: str = None,
+    model: str = None,
+    model_en: str = None,
 ) -> None:
     init_db()
     conn = _get_conn()
@@ -1272,6 +1310,8 @@ def update_project(
                 ("name_en", name_en),
                 ("product_name_en", product_name_en),
                 ("registration_country_en", registration_country_en),
+                ("model", model),
+                ("model_en", model_en),
             ]:
                 if v is not None:
                     updates.append(f"{k} = %s")
@@ -1654,6 +1694,29 @@ def get_project_case_file_names(collection: str, case_id: int) -> list:
             return [r["file_name"] for r in cur.fetchall()]
     finally:
         conn.close()
+
+
+def get_knowledge_docs_by_case_id(
+    collection: str,
+    case_id: int,
+    limit: int = 500,
+) -> list:
+    """返回指定项目案例在知识库中的全部块内容，用于提取案例文档章节结构。按 file_name、chunk_index 排序。"""
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT content, file_name, chunk_index FROM knowledge_docs
+                   WHERE collection = %s AND (category = %s OR category IS NULL OR category = '') AND case_id = %s
+                   ORDER BY file_name, chunk_index
+                   LIMIT %s""",
+                (collection, "project_case", case_id, limit),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
 
 
 def delete_project_case(case_id: int) -> bool:

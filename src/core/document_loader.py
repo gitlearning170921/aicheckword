@@ -45,6 +45,44 @@ def is_deprecated_path(path_or_name) -> bool:
     s = str(path_or_name) if path_or_name is not None else ""
     return DEPRECATED_MARKER in s
 
+
+def extract_section_outline_from_texts(texts: List[str], max_sections: int = 80) -> str:
+    """从多段文档内容中提取章节标题，形成「应有章节」参考列表，用于文档内容完整性审核。
+    识别常见格式：第X章、1. 1.1、一、二、# 标题 等。去重并按出现顺序保留。"""
+    import re
+    seen = set()
+    sections = []
+    # 常见章节模式（一行视为一个候选标题）
+    patterns = [
+        re.compile(r"^第[一二三四五六七八九十百零\d]+章\s*.+$", re.MULTILINE),
+        re.compile(r"^\d+(\.\d+)*[\.\s、]\s*.+$", re.MULTILINE),  # 1. 1.1 1.1.1
+        re.compile(r"^[一二三四五六七八九十]+[、．.]\s*.+$", re.MULTILINE),
+        re.compile(r"^#+\s*.+$", re.MULTILINE),  # Markdown
+        re.compile(r"^[（(]\s*[一二三四五六七八九十\d]+\s*[)）]\s*.+$", re.MULTILINE),
+    ]
+    for text in (texts or []):
+        if not (text and isinstance(text, str)):
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if len(line) < 2 or len(line) > 200:
+                continue
+            for pat in patterns:
+                if pat.match(line):
+                    key = re.sub(r"\s+", " ", line).strip()
+                    if key and key not in seen:
+                        seen.add(key)
+                        sections.append(line if len(line) <= 100 else line[:97] + "...")
+                    break
+            if len(sections) >= max_sections:
+                break
+        if len(sections) >= max_sections:
+            break
+    if not sections:
+        return ""
+    return "\n".join(sections)
+
+
 # PDF：仅支持文本型；含图片/扫描版无法提取文字。限制最大页数避免大文件卡死
 MAX_PDF_PAGES = 500
 MIN_PDF_TEXT_LEN = 20  # 提取文字少于此长度视为“图片版/扫描版”
@@ -130,6 +168,34 @@ def _find_wps() -> Optional[str]:
                 wps_exe = sub / "wps.exe"
                 if wps_exe.exists():
                     return str(wps_exe.resolve())
+        return None
+
+
+def _convert_doc_to_docx_with_pandoc(doc_path: Path) -> Optional[Path]:
+    """使用 pandoc 将 .doc 转为 .docx（需系统已安装 pandoc 且支持 doc 格式）。"""
+    doc_path = doc_path.resolve()
+    if not doc_path.exists():
+        return None
+    pandoc_exe = shutil.which("pandoc")
+    if not pandoc_exe:
+        return None
+    fd, out_file = tempfile.mkstemp(suffix=".docx", prefix="aicheckword_pandoc_")
+    os.close(fd)
+    try:
+        result = subprocess.run(
+            [pandoc_exe, "-f", "doc", "-t", "docx", "-o", out_file, str(doc_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and Path(out_file).exists() and Path(out_file).stat().st_size > 0:
+            return Path(out_file)
+    except Exception:
+        pass
+    try:
+        Path(out_file).unlink(missing_ok=True)
+    except Exception:
+        pass
     return None
 
 
@@ -346,13 +412,14 @@ def load_single_file(file_path) -> List[Document]:
                 else:
                     raise RuntimeError(f"Word 加载失败: {e!s}") from e
         else:
-            # .doc 旧版格式：Windows 下优先 WPS，失败则先试 LibreOffice 再 Unstructured，避免 Unstructured 调起 Word 导致第二批报 Office 错误
-            err_unstruct = None
+            # .doc 旧版格式：先统一尝试转为 .docx 再训练（WPS 仅 Windows；LibreOffice / Pandoc 全平台），避免 Unstructured 不稳定
             docx_path = None
             if os.name == "nt":
                 docx_path = _convert_doc_to_docx_with_wps(path)
-            if not (docx_path and docx_path.exists()) and os.name == "nt":
+            if not (docx_path and docx_path.exists()):
                 docx_path = _convert_doc_to_docx_with_libreoffice(path)
+            if not (docx_path and docx_path.exists()):
+                docx_path = _convert_doc_to_docx_with_pandoc(path)
             if docx_path and docx_path.exists():
                 try:
                     loader = Docx2txtLoader(str(docx_path))
@@ -368,38 +435,20 @@ def load_single_file(file_path) -> List[Document]:
                     except Exception:
                         pass
             else:
+                # 转换均失败时再试 Unstructured；若仍失败则报错并提示安装 LibreOffice
+                err_unstruct = None
                 try:
                     docs = _load_word_with_unstructured(path, suffix)
                 except Exception as e:
                     err_unstruct = e
                     docs = None
-                is_empty = docs and all((d.page_content or "").strip() in ("", "(空)") for d in docs)
-                if docs is None or is_empty:
-                    docx_path = _convert_doc_to_docx_with_libreoffice(path)
-                    if docx_path and docx_path.exists():
-                        try:
-                            loader = Docx2txtLoader(str(docx_path))
-                            docs = loader.load()
-                            for d in docs:
-                                d.metadata.setdefault("source_file", path.name)
-                                d.metadata.setdefault("file_type", ".doc")
-                            if not docs:
-                                docs = [Document(page_content="(空)", metadata={"source_file": path.name, "file_type": ".doc"})]
-                        finally:
-                            try:
-                                Path(docx_path).unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                    else:
-                        hint = (
-                            "请安装 WPS Office（Windows 下优先调用，需安装 pywin32：pip install pywin32）或 LibreOffice，"
-                            "或将 .doc 用 Word/WPS 另存为 .docx 后上传。"
-                        )
-                        msg = (
-                            str(err_unstruct) if err_unstruct
-                            else "Unstructured 未解析出内容且 WPS/LibreOffice 转换未执行或未生成文件"
-                        )
-                        raise RuntimeError("旧版 .doc 加载失败: %s。%s" % (msg, hint)) from err_unstruct
+                if docs is None or (docs and all((d.page_content or "").strip() in ("", "(空)") for d in docs)):
+                    hint = (
+                        "请安装 LibreOffice（推荐）或 WPS Office（仅 Windows，需 pywin32），或安装 pandoc；"
+                        "或将 .doc 用 Word/WPS 另存为 .docx 后上传。"
+                    )
+                    msg = str(err_unstruct) if err_unstruct else "未解析出内容"
+                    raise RuntimeError("旧版 .doc 无法转为 .docx 且解析失败: %s。%s" % (msg, hint)) from err_unstruct
         for doc in docs:
             doc.metadata.setdefault("source_file", path.name)
             doc.metadata.setdefault("file_type", suffix)
