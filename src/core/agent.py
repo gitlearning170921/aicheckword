@@ -41,6 +41,13 @@ class ReviewAgent:
             base_collection=collection_name,
             is_checkpoint=True,
         )
+        # 误报/人工纠正单独入库（knowledge_docs + 独立 Chroma），与第二步「审核点清单」向量库区分
+        self.audit_feedback_collection = f"{collection_name}_audit_feedback"
+        self.checkpoint_feedback_kb = KnowledgeBase(
+            self.audit_feedback_collection,
+            base_collection=collection_name,
+            is_checkpoint=False,
+        )
 
         self._reviewer: Optional[DocumentReviewer] = None
         self._checklist_gen: Optional[ChecklistGenerator] = None
@@ -50,7 +57,11 @@ class ReviewAgent:
     def reviewer(self) -> DocumentReviewer:
         """审核器使用审核点知识库（第二步训练的结果）"""
         if self._reviewer is None:
-            self._reviewer = DocumentReviewer(knowledge_base=self.checkpoint_kb)
+            self._reviewer = DocumentReviewer(
+                knowledge_base=self.checkpoint_kb,
+                feedback_knowledge_base=self.checkpoint_feedback_kb,
+                collection_name=self.collection_name,
+            )
         return self._reviewer
 
     @property
@@ -63,6 +74,7 @@ class ReviewAgent:
     def reset_clients(self):
         self.kb.reset_clients()
         self.checkpoint_kb.reset_clients()
+        self.checkpoint_feedback_kb.reset_clients()
         for pkb in self._project_kbs.values():
             pkb.reset_clients()
         self._project_kbs.clear()
@@ -433,6 +445,7 @@ class ReviewAgent:
         """统计一律以数据库为准（knowledge_docs / checkpoint_docs）"""
         reg_stats = get_knowledge_stats(self.collection_name)
         cp_stats = get_checkpoint_stats(self.collection_name)
+        fb_stats = get_knowledge_stats(self.audit_feedback_collection)
         return {
             "agent_name": "注册文档审核Agent",
             "collection_name": self.collection_name,
@@ -443,6 +456,10 @@ class ReviewAgent:
             "checkpoints_kb": {
                 "collection_name": self.checkpoint_collection,
                 "document_count": cp_stats.get("total_chunks", 0),
+            },
+            "audit_feedback_kb": {
+                "collection_name": self.audit_feedback_collection,
+                "document_count": fb_stats.get("total_chunks", 0),
             },
             "capabilities": [
                 "第一步：法规/程序/案例训练 + 生成审核点",
@@ -458,6 +475,8 @@ class ReviewAgent:
             self.kb.clear()
         if which in ("checkpoints", "all"):
             self.checkpoint_kb.clear()
+        if which == "all":
+            self.checkpoint_feedback_kb.clear()
         return {"status": "success", "message": f"已清空：{which}"}
 
     def export_report(self, report: dict, output_path: str) -> str:

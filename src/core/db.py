@@ -246,6 +246,8 @@ def init_db() -> None:
             _add_column_if_missing(cur, "audit_checklists", "document_language", "VARCHAR(32) DEFAULT '' COMMENT '审核点适用文档语言：zh/en/both，空表示不限定'")
             _add_column_if_missing(cur, "app_settings", "project_basic_info_prompt", "LONGTEXT COMMENT '项目基本信息提取提示词，为空则使用内置默认'")
             _add_column_if_missing(cur, "app_settings", "review_summary_prompt", "LONGTEXT COMMENT '审核总结提示词，为空则使用内置默认'")
+            _add_column_if_missing(cur, "app_settings", "translation_target_lang", "VARCHAR(8) DEFAULT 'en' COMMENT '文档翻译目标语言：en/de/zh'")
+            _add_column_if_missing(cur, "app_settings", "translation_company_config", "LONGTEXT COMMENT 'JSON: 公司信息翻译配置 company_name/address/contact/phone 等'")
             _add_column_if_missing(cur, "dimension_options", "country_extra_keywords", "LONGTEXT COMMENT 'JSON: 国家(以页面选择为准)->法规关键词，用于知识库检索与扩大审核面，如 {\"欧盟\":[\"MDR\"]}'")
             _init_dimension_options(cur)
         conn.commit()
@@ -374,6 +376,45 @@ def get_prompt_by_key(key: str) -> Optional[str]:
         return None
     val = (row.get(key) or "").strip()
     return val if val else None
+
+
+def get_translation_config() -> dict:
+    """获取文档翻译配置：target_lang (en/de/zh)、company_config (dict)。"""
+    row = load_app_settings()
+    if not row:
+        return {"target_lang": "en", "company_config": {}}
+    target = (row.get("translation_target_lang") or "en").strip() or "en"
+    if target not in ("en", "de", "zh"):
+        target = "en"
+    raw = (row.get("translation_company_config") or "").strip()
+    company_config = {}
+    if raw:
+        try:
+            company_config = json.loads(raw)
+            if not isinstance(company_config, dict):
+                company_config = {}
+        except Exception:
+            company_config = {}
+    return {"target_lang": target, "company_config": company_config}
+
+
+def save_translation_config(target_lang: str = "en", company_config: Optional[dict] = None) -> None:
+    """保存文档翻译配置（仅 UPDATE，依赖 app_settings 已由其他流程创建）。"""
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            lang = (target_lang or "en").strip() or "en"
+            if lang not in ("en", "de", "zh"):
+                lang = "en"
+            cfg_json = json.dumps(company_config or {}, ensure_ascii=False)
+            cur.execute(
+                "UPDATE app_settings SET translation_target_lang = %s, translation_company_config = %s, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+                (lang, cfg_json),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def update_prompt_by_key(key: str, content: Optional[str]) -> None:
@@ -520,6 +561,8 @@ OP_TYPE_GENERATE_CHECKLIST = "generate_checklist"
 OP_TYPE_TRAIN_CHECKLIST = "train_checklist"
 OP_TYPE_TRAIN_PROJECT = "train_project"
 OP_TYPE_TRAIN_PROJECT_ERROR = "train_project_error"  # 单文件失败或整批中断
+OP_TYPE_TRANSLATION = "translation"
+OP_TYPE_TRANSLATION_ERROR = "translation_error"
 
 
 def get_current_model_info() -> str:
@@ -594,8 +637,8 @@ def get_operation_summary() -> Dict[str, Any]:
             total_review_batches = cur.fetchone()["c"]
             cur.execute("""
                 SELECT COUNT(*) AS c FROM operation_logs
-                WHERE op_type IN (%s, %s) AND DATE(created_at) = CURDATE()
-            """, (OP_TYPE_TRAIN_BATCH, OP_TYPE_REVIEW_BATCH))
+                WHERE op_type IN (%s, %s, %s, %s) AND DATE(created_at) = CURDATE()
+            """, (OP_TYPE_TRAIN_BATCH, OP_TYPE_REVIEW_BATCH, OP_TYPE_TRANSLATION, OP_TYPE_TRANSLATION_ERROR))
             today_ops = cur.fetchone()["c"]
         return {
             "total_train_batches": total_train_batches,
@@ -1143,7 +1186,7 @@ def get_corrections_for_collection(collection: str, limit: int = 200) -> list:
 
 
 # 适用注册类别：全系统下拉统一使用此列表（生成审核点、按项目审核、项目/案例属性等）
-REGISTRATION_TYPES = ["医疗器械一类", "医疗器械二类", "医疗器械二类Ⅱa", "医疗器械二类Ⅱb", "医疗器械三类"]
+REGISTRATION_TYPES = ["医疗器械一类Ι", "医疗器械二类Ⅱ", "医疗器械二类Ⅱa", "医疗器械二类Ⅱb", "医疗器械三类Ⅲ"]
 # 别名，便于语义区分「适用注册类别」与「项目注册类别」时使用同一列表
 REGISTRATION_TYPE_OPTIONS = REGISTRATION_TYPES
 REGISTRATION_COMPONENTS = ["有源医疗器械", "软件组件", "独立软件"]

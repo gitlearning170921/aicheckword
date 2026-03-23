@@ -2,11 +2,19 @@
 # 详见 https://docs.streamlit.io/develop/concepts/configuration
 
 [server]
+# 默认不设置 address，本机请用 http://localhost:8501 打开（勿用 http://0.0.0.0:8501，浏览器无法访问）。
+# 需局域网/其他电脑访问时，请用根目录 start-lan.bat 启动（会监听 0.0.0.0）。
 # 单次上传文件总大小上限（MB），避免一次加载过大文件导致 OOM
 maxUploadSize = 200
 # 最大请求体大小（MB）
 maxMessageSize = 200
+# 断连后会话保留时间（秒），便于多设备切换时重连
+# disconnectedSessionTTL = 120
 
 [browser]
 # 不自动打开浏览器（在 Cursor 内运行时无需）
 gatherUsageStats = false
+
+[runner]
+# 立即响应 rerun 请求，多会话时更流畅（每个浏览器/设备独立会话，可同时操作）
+fastReruns = true

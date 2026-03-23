@@ -166,7 +166,7 @@
 | collection | VARCHAR(128) | 所属知识库 | 1 项 |
 | name | VARCHAR(256) | 项目名称 | 1 项 |
 | registration_country | VARCHAR(128) | 注册国家 | 来自 dimension_options.registration_countries |
-| registration_type | VARCHAR(128) | 注册类别 | 固定 5 种：医疗器械一类/二类/二类Ⅱa/二类Ⅱb/三类 |
+| registration_type | VARCHAR(128) | 注册类别 | 固定 5 种：医疗器械一类Ι/二类Ⅱ/二类Ⅱa/二类Ⅱb/三类Ⅲ |
 | registration_component | VARCHAR(128) | 注册组成 | 固定 3 种：有源医疗器械、软件组件、独立软件 |
 | project_form | VARCHAR(128) | 项目形态 | 来自 dimension_options.project_forms |
 | **basic_info_text** | **TEXT** | **从项目资料中提取的基本信息（项目名称、产品名称、型号等），训练后若知识库中无此条则写入此处，审核时与待审文档一致性核对** | 系统根据项目知识库内容自动提取写入 |

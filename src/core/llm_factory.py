@@ -21,9 +21,11 @@ def _ensure_tiktoken_no_proxy():
             os.environ[key] = f"{cur},{host}".lstrip(",")
 
 
-def _openai_http_client() -> httpx.Client:
+def _openai_http_client(*, timeout: Optional[httpx.Timeout] = None) -> httpx.Client:
     """供 ChatOpenAI 使用的 httpx 客户端，应用「不校验 SSL」「不使用系统代理」通用配置。"""
-    return httpx.Client(verify=get_llm_verify_ssl(), trust_env=get_llm_trust_env())
+    # 长审核/大上下文时默认超时过短易被误判为 Connection error；DeepSeek 等在工厂内单独加长
+    t = timeout or httpx.Timeout(600.0, connect=45.0)
+    return httpx.Client(verify=get_llm_verify_ssl(), trust_env=get_llm_trust_env(), timeout=t)
 
 
 def create_chat_llm(temperature: float = 0.1):
@@ -54,12 +56,16 @@ def create_chat_llm(temperature: float = 0.1):
         base_url = _openai_compatible_base_url(p)
         if not api_key:
             raise RuntimeError(f"{p} 模式下请先配置 API Key（.env 或侧栏）")
+        # DeepSeek 等大上下文审核耗时更长；过短易在客户端表现为连接/读超时类错误
+        req_timeout = 600.0 if p == "deepseek" else 180.0
         return ChatOpenAI(
             model=settings.llm_model,
             api_key=api_key,
             base_url=base_url,
             temperature=temperature,
-            http_client=_openai_http_client(),
+            http_client=_openai_http_client(timeout=httpx.Timeout(req_timeout, connect=45.0)),
+            request_timeout=req_timeout,
+            max_retries=6 if p == "deepseek" else 5,
         )
 
     # Google Gemini
@@ -119,7 +125,9 @@ def create_chat_llm(temperature: float = 0.1):
         api_key=settings.openai_api_key,
         base_url=settings.openai_base_url,
         temperature=temperature,
-        http_client=_openai_http_client(),
+        http_client=_openai_http_client(timeout=httpx.Timeout(180.0, connect=45.0)),
+        request_timeout=180,
+        max_retries=5,
     )
 
 

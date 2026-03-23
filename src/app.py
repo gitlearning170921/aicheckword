@@ -17,6 +17,8 @@ for _np in ("NO_PROXY", "no_proxy"):
         os.environ[_np] = f"{_v},{_tiktoken_host}".lstrip(",")
 
 import json
+import copy
+import html
 import time
 import tempfile
 from datetime import datetime
@@ -98,6 +100,8 @@ from src.core.db import (
     update_review_prompts,
     get_prompt_by_key,
     update_prompt_by_key,
+    get_translation_config,
+    save_translation_config,
     PROMPT_KEYS,
     REGISTRATION_TYPES,
     REGISTRATION_TYPE_OPTIONS,
@@ -112,6 +116,8 @@ from src.core.db import (
     OP_TYPE_TRAIN_CHECKLIST,
     OP_TYPE_TRAIN_PROJECT,
     OP_TYPE_TRAIN_PROJECT_ERROR,
+    OP_TYPE_TRANSLATION,
+    OP_TYPE_TRANSLATION_ERROR,
 )
 from src.core.report_export import report_to_html, report_to_docx, report_to_pdf, report_to_excel, report_to_docx_with_comments, report_todo_to_csv, report_todo_to_pdf, report_todo_to_docx, report_todo_to_excel
 
@@ -158,6 +164,12 @@ def _cached_knowledge_stats(collection: str):
 @_make_ttl_cache(ttl_sec=5)
 def _cached_checkpoint_stats(collection: str):
     return get_checkpoint_stats(collection)
+
+
+@_make_ttl_cache(ttl_sec=8)
+def _cached_audit_feedback_stats(collection: str):
+    """误报/纠正独立库 `{collection}_audit_feedback` 块数（与第二步清单库区分）。"""
+    return get_knowledge_stats(f"{collection}_audit_feedback")
 
 
 @_make_ttl_cache(ttl_sec=5)
@@ -592,17 +604,24 @@ def render_sidebar():
         try:
             reg_stats = _cached_knowledge_stats(collection)
             cp_stats = _cached_checkpoint_stats(collection)
+            fb_stats = _cached_audit_feedback_stats(collection)
             by_cat = _cached_knowledge_stats_by_category(collection)
         except Exception:
             reg_stats = {}
             cp_stats = {}
+            fb_stats = {}
             by_cat = {}
 
         st.caption("法规知识库（第一步）— 以数据库为准")
         st.metric("法规向量块数", reg_stats.get("total_chunks", 0))
 
         st.caption("审核点知识库（第二步）— 以数据库为准")
-        st.metric("审核点向量块数", cp_stats.get("total_chunks", 0))
+        st.metric("清单向量块（第二步训练）", cp_stats.get("total_chunks", 0))
+        st.metric("误报/纠正反馈块（独立库）", fb_stats.get("total_chunks", 0))
+        st.caption(
+            f"反馈数据集合：`{collection}_audit_feedback`，与清单向量 `{collection}_checkpoints` 分离；"
+            "清空「全部」时删除反馈库；仅清空「审核点知识库」时**保留**反馈。"
+        )
 
         try:
             st.caption("训练统计（按类型，以数据库为准）")
@@ -617,6 +636,7 @@ def render_sidebar():
         if st.button("🔄 刷新统计", help="立即刷新上方统计与操作记录缓存"):
             _cached_knowledge_stats.clear()
             _cached_checkpoint_stats.clear()
+            _cached_audit_feedback_stats.clear()
             _cached_knowledge_stats_by_category.clear()
             _cached_operation_logs.clear()
             st.experimental_rerun()
@@ -628,6 +648,7 @@ def render_sidebar():
             agent.clear_knowledge(which_map[clear_target])
             _cached_knowledge_stats.clear()
             _cached_checkpoint_stats.clear()
+            _cached_audit_feedback_stats.clear()
             _cached_knowledge_stats_by_category.clear()
             st.success(f"已清空：{clear_target}")
             st.experimental_rerun()
@@ -745,6 +766,67 @@ def _format_time(seconds):
     else:
         m, s = divmod(int(seconds), 60)
         return f"{m}m{s}s"
+
+
+def _format_review_exception(e: BaseException) -> str:
+    """将审核相关异常转为可展示说明（部分异常 str(e) 与 repr(e) 均为空，界面会显示空白）。"""
+    msg = (str(e) or "").strip()
+    name = type(e).__name__
+    _no_detail = f"{name}（未返回具体说明，常见于超时、连接中断或网关无响应；请检查网络、API Key、模型服务与 Cursor/代理配置）"
+    if msg:
+        headline = msg if msg.startswith(name) else f"{name}: {msg}"
+    else:
+        try:
+            r = (repr(e) or "").strip()
+            if r and r not in (f"{name}()", "''", '""', "None"):
+                headline = f"{name}: {r}"
+            else:
+                headline = _no_detail
+        except Exception:
+            headline = _no_detail
+    tb = traceback.format_exc()
+    lines = [ln for ln in tb.strip().splitlines() if ln.strip()]
+    if len(lines) > 2:
+        tail = "\n".join(lines[-14:])
+        return f"{headline}\n\n—— 异常追踪（末尾）——\n{tail}"
+    return headline
+
+
+def _is_transient_llm_error(e: BaseException) -> bool:
+    """识别可自动重试的瞬时网络/网关错误。"""
+    text = f"{type(e).__name__}: {e}".lower()
+    keywords = (
+        "apiconnectionerror",
+        "readtimeout",
+        "connecttimeout",
+        "connection reset",
+        "connection aborted",
+        "temporarily unavailable",
+        "remoteprotocolerror",
+        "winerror 10054",
+        "ssl eof",
+        "timed out",
+        "timeout",
+        "502",
+        "503",
+        "504",
+    )
+    return any(k in text for k in keywords)
+
+
+def _call_with_transient_retry(fn, *, attempts: int = 3, base_sleep: float = 1.2):
+    """调用 fn；若为瞬时错误则做指数退避重试。"""
+    last_err = None
+    for i in range(max(1, attempts)):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            if i >= attempts - 1 or not _is_transient_llm_error(e):
+                raise
+            time.sleep(base_sleep * (2 ** i))
+    if last_err is not None:
+        raise last_err
 
 
 def _render_loading_overlay():
@@ -980,6 +1062,11 @@ def render_step1_page():
             countries = dims.get("registration_countries", ["中国", "美国", "欧盟"]) or ["中国", "美国", "欧盟"]
             forms = dims.get("project_forms", ["Web", "APP", "PC"]) or ["Web", "APP", "PC"]
             cases = _cached_list_project_cases(collection)
+            # 「其他国家/语言版本」须在 selectbox 渲染前写入 session_state，否则仅按钮内赋值 + rerun 可能不切换选项
+            _pending_var_u = st.session_state.pop("_pending_variant_upload_case_id", None)
+            if _pending_var_u is not None:
+                st.session_state["train_upload_case_sel"] = "➕ 新建案例"
+                st.session_state["train_copy_from_case_id"] = _pending_var_u
             case_options = ["➕ 新建案例"] + [_format_case_option(c) for c in cases]
             sel_case = st.selectbox("选择过往项目案例", case_options, key="train_upload_case_sel",
                                     help="项目案例是过往已成功注册的项目经验，训练后可供类似新项目审核时参考。")
@@ -1027,6 +1114,7 @@ def render_step1_page():
                 p_scope = st.text_area("产品适用范围（可选）", value=_def("scope_of_application", ""), placeholder="该过往项目的适用范围；第三步审核时可据此匹配", height=80, key="train_case_scope")
             else:
                 try:
+                    _idx = lambda opts, val: opts.index(val) if val in opts else 0
                     idx = case_options.index(sel_case)
                     case = cases[idx - 1]
                     _lang_label = DOC_LANG_VALUE_TO_LABEL.get(case.get("document_language") or "", "不指定")
@@ -1036,18 +1124,30 @@ def render_step1_page():
                         f"注册国家：{case.get('registration_country')}，"
                         f"注册类别：{case.get('registration_type')}）"
                     )
+                    _cid = case.get("id")
                     with st.expander("✏️ 编辑此案例（中/英文）", expanded=False):
-                        e_case_name = st.text_input("案例名称", value=case.get("case_name") or "", key="edit_case_name")
-                        e_case_name_en = st.text_input("案例名称（英文）", value=case.get("case_name_en") or "", key="edit_case_name_en")
-                        e_product = st.text_input("产品名称", value=case.get("product_name") or "", key="edit_case_product")
-                        e_product_en = st.text_input("产品名称（英文）", value=case.get("product_name_en") or "", key="edit_case_product_en")
-                        e_country = st.text_input("注册国家", value=case.get("registration_country") or "", key="edit_case_country")
-                        e_country_en = st.text_input("注册国家（英文）", value=case.get("registration_country_en") or "", key="edit_case_country_en")
+                        e_case_name = st.text_input("案例名称", value=case.get("case_name") or "", key=f"edit_case_name_{_cid}")
+                        e_case_name_en = st.text_input("案例名称（英文）", value=case.get("case_name_en") or "", key=f"edit_case_name_en_{_cid}")
+                        e_product = st.text_input("产品名称", value=case.get("product_name") or "", key=f"edit_case_product_{_cid}")
+                        e_product_en = st.text_input("产品名称（英文）", value=case.get("product_name_en") or "", key=f"edit_case_product_en_{_cid}")
+                        _country_val = (case.get("registration_country") or "").strip() or (countries[0] if countries else "")
+                        _country_idx = _idx(countries, _country_val)
+                        e_country = st.selectbox("注册国家", countries, index=min(_country_idx, len(countries) - 1) if countries else 0, key=f"edit_case_country_{_cid}")
+                        e_country_en = st.text_input("注册国家（英文）", value=case.get("registration_country_en") or "", placeholder="e.g. China, USA", key=f"edit_case_country_en_{_cid}")
+                        _type_val = (case.get("registration_type") or "").strip() or (REGISTRATION_TYPES[0] if REGISTRATION_TYPES else "")
+                        _type_idx = _idx(REGISTRATION_TYPES, _type_val)
+                        e_type = st.selectbox("注册类别", REGISTRATION_TYPES, index=min(_type_idx, len(REGISTRATION_TYPES) - 1) if REGISTRATION_TYPES else 0, key=f"edit_case_type_{_cid}")
+                        _comp_val = (case.get("registration_component") or "").strip() or (REGISTRATION_COMPONENTS[0] if REGISTRATION_COMPONENTS else "")
+                        _comp_idx = _idx(REGISTRATION_COMPONENTS, _comp_val)
+                        e_comp = st.selectbox("注册组成", REGISTRATION_COMPONENTS, index=min(_comp_idx, len(REGISTRATION_COMPONENTS) - 1) if REGISTRATION_COMPONENTS else 0, key=f"edit_case_comp_{_cid}")
+                        _form_val = (case.get("project_form") or "").strip() or (forms[0] if forms else "")
+                        _form_idx = _idx(forms, _form_val)
+                        e_form = st.selectbox("项目形态", forms, index=min(_form_idx, len(forms) - 1) if forms else 0, key=f"edit_case_form_{_cid}")
                         _doc_lang_val = case.get("document_language") or ""
                         _doc_lang_label = DOC_LANG_VALUE_TO_LABEL.get(_doc_lang_val, "不指定")
                         _doc_lang_idx = DOC_LANG_OPTIONS.index(_doc_lang_label) if _doc_lang_label in DOC_LANG_OPTIONS else 0
-                        e_doc_lang = st.selectbox("案例文档语言", DOC_LANG_OPTIONS, index=_doc_lang_idx, key="edit_case_doc_lang")
-                        e_scope = st.text_area("产品适用范围", value=case.get("scope_of_application") or "", height=60, key="edit_case_scope")
+                        e_doc_lang = st.selectbox("案例文档语言", DOC_LANG_OPTIONS, index=_doc_lang_idx, key=f"edit_case_doc_lang_{_cid}")
+                        e_scope = st.text_area("产品适用范围", value=case.get("scope_of_application") or "", height=60, key=f"edit_case_scope_{_cid}")
                         other_cases_upload = [c for c in cases if c.get("id") != case.get("id")]
                         link_options_upload = ["不关联（独立）"] + [_format_case_option(c) for c in other_cases_upload]
                         _link_idx_upload = 0
@@ -1056,8 +1156,8 @@ def render_step1_page():
                                 if str(c.get("id")) == str(case.get("project_key")) or (c.get("project_key") and str(c.get("project_key")) == str(case.get("project_key"))):
                                     _link_idx_upload = i + 1
                                     break
-                        e_link_upload = st.selectbox("关联到同一项目", link_options_upload, index=min(_link_idx_upload, len(link_options_upload) - 1), key="edit_case_link_upload", help="与所选案例归为同一项目（多国家/多语言版本）；不关联则本案例独立。")
-                        if st.button("保存案例", key="edit_case_save"):
+                        e_link_upload = st.selectbox("关联到同一项目", link_options_upload, index=min(_link_idx_upload, len(link_options_upload) - 1), key=f"edit_case_link_upload_{_cid}", help="与所选案例归为同一项目（多国家/多语言版本）；不关联则本案例独立。")
+                        if st.button("保存案例", key=f"edit_case_save_{_cid}"):
                             project_key_new = ""
                             if e_link_upload and e_link_upload != "不关联（独立）" and e_link_upload in link_options_upload:
                                 idx_link = link_options_upload.index(e_link_upload)
@@ -1072,6 +1172,9 @@ def render_step1_page():
                                 product_name_en=e_product_en.strip() or None,
                                 registration_country=e_country.strip() or None,
                                 registration_country_en=e_country_en.strip() or None,
+                                registration_type=e_type,
+                                registration_component=e_comp,
+                                project_form=e_form,
                                 document_language=DOC_LANG_LABEL_TO_VALUE.get(e_doc_lang, ""),
                                 scope_of_application=e_scope.strip() or None,
                                 project_key=project_key_new,
@@ -1085,12 +1188,8 @@ def render_step1_page():
                     else:
                         st.caption("📁 **已入库文件**：暂无")
                     if st.button("📋 创建本案例的其他国家/语言版本", key="btn_variant_upload", help="切换到新建案例并预填本案例信息，仅改注册国家、文档语言即可创建新版本"):
-                        st.session_state["train_upload_case_sel"] = "➕ 新建案例"
-                        st.session_state["train_copy_from_case_id"] = case["id"]
-                        st.session_state["train_copy_from_sel"] = _format_case_option(case)
-                        _rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
-                        if callable(_rerun):
-                            _rerun()
+                        st.session_state["_pending_variant_upload_case_id"] = case["id"]
+                        _streamlit_rerun()
                     if st.button("🗑️ 删除此案例", key="del_case_upload"):
                         if _case_files:
                             st.warning("该案例下已有入库文件，不能删除。请先删除关联文件后再试。")
@@ -1526,6 +1625,10 @@ def render_step1_page():
             countries_dir = dims_dir.get("registration_countries", ["中国", "美国", "欧盟"]) or ["中国", "美国", "欧盟"]
             forms_dir = dims_dir.get("project_forms", ["Web", "APP", "PC"]) or ["Web", "APP", "PC"]
             cases_dir = _cached_list_project_cases(collection_dir)
+            _pending_var_d = st.session_state.pop("_pending_variant_dir_case_id", None)
+            if _pending_var_d is not None:
+                st.session_state["train_dir_case_sel"] = "➕ 新建案例"
+                st.session_state["train_dir_copy_from_case_id"] = _pending_var_d
             case_options_dir = ["➕ 新建案例"] + [_format_case_option(c) for c in cases_dir]
             sel_case_dir = st.selectbox("选择过往项目案例", case_options_dir, key="train_dir_case_sel",
                                         help="项目案例为过往经验，训练到通用知识库；第三步审核时按产品名称与适用范围匹配。")
@@ -1572,6 +1675,7 @@ def render_step1_page():
                 p_scope_dir = st.text_area("产品适用范围（可选）", value=_def_dir("scope_of_application", ""), placeholder="该过往项目的适用范围", height=60, key="train_dir_case_scope")
             else:
                 try:
+                    _idx_dir = lambda opts, val: opts.index(val) if val in opts else 0
                     idx_dir = case_options_dir.index(sel_case_dir)
                     case_dir = cases_dir[idx_dir - 1]
                     train_dir_case_id = case_dir["id"]
@@ -1580,18 +1684,30 @@ def render_step1_page():
                         f"（产品名称：{case_dir.get('product_name') or '—'}，"
                         f"注册国家：{case_dir.get('registration_country')}）"
                     )
+                    _cid_dir = case_dir.get("id")
                     with st.expander("✏️ 编辑此案例 & 关联项目", expanded=False):
-                        e_case_name_d = st.text_input("案例名称", value=case_dir.get("case_name") or "", key="edit_dir_case_name")
-                        e_case_name_en_d = st.text_input("案例名称（英文）", value=case_dir.get("case_name_en") or "", key="edit_dir_case_name_en")
-                        e_product_d = st.text_input("产品名称", value=case_dir.get("product_name") or "", key="edit_dir_case_product")
-                        e_product_en_d = st.text_input("产品名称（英文）", value=case_dir.get("product_name_en") or "", key="edit_dir_case_product_en")
-                        e_country_d = st.text_input("注册国家", value=case_dir.get("registration_country") or "", key="edit_dir_case_country")
-                        e_country_en_d = st.text_input("注册国家（英文）", value=case_dir.get("registration_country_en") or "", key="edit_dir_case_country_en")
+                        e_case_name_d = st.text_input("案例名称", value=case_dir.get("case_name") or "", key=f"edit_dir_case_name_{_cid_dir}")
+                        e_case_name_en_d = st.text_input("案例名称（英文）", value=case_dir.get("case_name_en") or "", key=f"edit_dir_case_name_en_{_cid_dir}")
+                        e_product_d = st.text_input("产品名称", value=case_dir.get("product_name") or "", key=f"edit_dir_case_product_{_cid_dir}")
+                        e_product_en_d = st.text_input("产品名称（英文）", value=case_dir.get("product_name_en") or "", key=f"edit_dir_case_product_en_{_cid_dir}")
+                        _country_val_d = (case_dir.get("registration_country") or "").strip() or (countries_dir[0] if countries_dir else "")
+                        _country_idx_d = _idx_dir(countries_dir, _country_val_d)
+                        e_country_d = st.selectbox("注册国家", countries_dir, index=min(_country_idx_d, len(countries_dir) - 1) if countries_dir else 0, key=f"edit_dir_case_country_{_cid_dir}")
+                        e_country_en_d = st.text_input("注册国家（英文）", value=case_dir.get("registration_country_en") or "", placeholder="e.g. China, USA", key=f"edit_dir_case_country_en_{_cid_dir}")
+                        _type_val_d = (case_dir.get("registration_type") or "").strip() or (REGISTRATION_TYPES[0] if REGISTRATION_TYPES else "")
+                        _type_idx_d = _idx_dir(REGISTRATION_TYPES, _type_val_d)
+                        e_type_d = st.selectbox("注册类别", REGISTRATION_TYPES, index=min(_type_idx_d, len(REGISTRATION_TYPES) - 1) if REGISTRATION_TYPES else 0, key=f"edit_dir_case_type_{_cid_dir}")
+                        _comp_val_d = (case_dir.get("registration_component") or "").strip() or (REGISTRATION_COMPONENTS[0] if REGISTRATION_COMPONENTS else "")
+                        _comp_idx_d = _idx_dir(REGISTRATION_COMPONENTS, _comp_val_d)
+                        e_comp_d = st.selectbox("注册组成", REGISTRATION_COMPONENTS, index=min(_comp_idx_d, len(REGISTRATION_COMPONENTS) - 1) if REGISTRATION_COMPONENTS else 0, key=f"edit_dir_case_comp_{_cid_dir}")
+                        _form_val_d = (case_dir.get("project_form") or "").strip() or (forms_dir[0] if forms_dir else "")
+                        _form_idx_d = _idx_dir(forms_dir, _form_val_d)
+                        e_form_d = st.selectbox("项目形态", forms_dir, index=min(_form_idx_d, len(forms_dir) - 1) if forms_dir else 0, key=f"edit_dir_case_form_{_cid_dir}")
                         _doc_lang_d = case_dir.get("document_language") or ""
                         _doc_lang_label_d = DOC_LANG_VALUE_TO_LABEL.get(_doc_lang_d, "不指定")
                         _doc_lang_idx_d = DOC_LANG_OPTIONS.index(_doc_lang_label_d) if _doc_lang_label_d in DOC_LANG_OPTIONS else 0
-                        e_doc_lang_d = st.selectbox("案例文档语言", DOC_LANG_OPTIONS, index=_doc_lang_idx_d, key="edit_dir_case_doc_lang")
-                        e_scope_d = st.text_area("产品适用范围", value=case_dir.get("scope_of_application") or "", height=60, key="edit_dir_case_scope")
+                        e_doc_lang_d = st.selectbox("案例文档语言", DOC_LANG_OPTIONS, index=_doc_lang_idx_d, key=f"edit_dir_case_doc_lang_{_cid_dir}")
+                        e_scope_d = st.text_area("产品适用范围", value=case_dir.get("scope_of_application") or "", height=60, key=f"edit_dir_case_scope_{_cid_dir}")
                         other_cases_dir = [c for c in cases_dir if c.get("id") != case_dir.get("id")]
                         link_options_dir = ["不关联（独立）"] + [_format_case_option(c) for c in other_cases_dir]
                         _link_idx_dir = 0
@@ -1600,8 +1716,8 @@ def render_step1_page():
                                 if str(c.get("id")) == str(case_dir.get("project_key")) or (c.get("project_key") and str(c.get("project_key")) == str(case_dir.get("project_key"))):
                                     _link_idx_dir = i + 1
                                     break
-                        e_link_dir = st.selectbox("关联到同一项目", link_options_dir, index=min(_link_idx_dir, len(link_options_dir) - 1), key="edit_dir_case_link", help="与所选案例归为同一项目（多国家/多语言版本）。")
-                        if st.button("保存案例", key="edit_dir_case_save"):
+                        e_link_dir = st.selectbox("关联到同一项目", link_options_dir, index=min(_link_idx_dir, len(link_options_dir) - 1), key=f"edit_dir_case_link_{_cid_dir}", help="与所选案例归为同一项目（多国家/多语言版本）。")
+                        if st.button("保存案例", key=f"edit_dir_case_save_{_cid_dir}"):
                             project_key_d = ""
                             if e_link_dir and e_link_dir != "不关联（独立）" and e_link_dir in link_options_dir:
                                 idx_ld = link_options_dir.index(e_link_dir)
@@ -1616,6 +1732,9 @@ def render_step1_page():
                                 product_name_en=e_product_en_d.strip() or None,
                                 registration_country=e_country_d.strip() or None,
                                 registration_country_en=e_country_en_d.strip() or None,
+                                registration_type=e_type_d,
+                                registration_component=e_comp_d,
+                                project_form=e_form_d,
                                 document_language=DOC_LANG_LABEL_TO_VALUE.get(e_doc_lang_d, ""),
                                 scope_of_application=e_scope_d.strip() or None,
                                 project_key=project_key_d,
@@ -1629,12 +1748,8 @@ def render_step1_page():
                     else:
                         st.caption("📁 **已入库文件**：暂无")
                     if st.button("📋 创建本案例的其他国家/语言版本", key="btn_variant_dir", help="切换到新建案例并预填本案例信息，仅改注册国家、文档语言即可创建新版本"):
-                        st.session_state["train_dir_case_sel"] = "➕ 新建案例"
-                        st.session_state["train_dir_copy_from_case_id"] = case_dir["id"]
-                        st.session_state["train_dir_copy_from_sel"] = _format_case_option(case_dir)
-                        _rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
-                        if callable(_rerun):
-                            _rerun()
+                        st.session_state["_pending_variant_dir_case_id"] = case_dir["id"]
+                        _streamlit_rerun()
                     if st.button("🗑️ 删除此案例", key="del_case_dir"):
                         if _case_files_dir:
                             st.warning("该案例下已有入库文件，不能删除。请先删除关联文件后再试。")
@@ -2249,6 +2364,10 @@ def render_step2_page():
 
 def _render_projects_tab(agent, collection: str):
     """项目列表 + 新建/编辑/删除 + 上传项目专属资料（用缓存避免切换选项时卡顿）"""
+    _pending_msg = st.session_state.pop("projects_success_message", None)
+    if _pending_msg:
+        st.success(_pending_msg)
+
     dims = _cached_dimension_options()
     countries = dims.get("registration_countries", ["中国", "美国", "欧盟"])
     forms = dims.get("project_forms", ["Web", "APP", "PC"])
@@ -2284,7 +2403,7 @@ def _render_projects_tab(agent, collection: str):
                         model=(p_model or "").strip(),
                         model_en=(p_model_en or "").strip(),
                     )
-                    st.success(f"已创建项目「{p_name}」，ID: {pid}")
+                    st.session_state["projects_success_message"] = f"✅ 已创建项目「{p_name.strip()}」，ID: {pid}"
                     st.experimental_rerun()
                 else:
                     st.warning("请填写项目名称")
@@ -2309,19 +2428,24 @@ def _render_projects_tab(agent, collection: str):
         if proj.get("model") or proj.get("model_en"):
             st.caption(f"型号（Model）：{proj.get('model') or '—'} / {proj.get('model_en') or '—'}（字段名称不区分大小写，取值区分大小写、精确匹配含空格）")
 
+        _idx_proj = lambda opts, val: opts.index(val) if (val and val in opts) else 0
         with st.expander("✏️ 编辑项目（支持中/英文）", expanded=False):
             with st.form(f"edit_proj_{pid}"):
-                e_name = st.text_input("项目名称", value=proj.get("name", ""), key=f"ep_name_{pid}")
+                e_name = st.text_input("项目名称", value=proj.get("name") or "", key=f"ep_name_{pid}")
                 e_name_en = st.text_input("项目名称（英文）", value=proj.get("name_en") or "", placeholder="Project name in English", key=f"ep_name_en_{pid}")
                 e_product = st.text_input("产品名称（可选）", value=proj.get("product_name") or "", placeholder="与项目名称一并加入审核点、一致性核对", key=f"ep_product_{pid}")
                 e_product_en = st.text_input("产品名称（英文）", value=proj.get("product_name_en") or "", placeholder="Product name in English", key=f"ep_product_en_{pid}")
                 e_model = st.text_input("型号（可选，Model）", value=proj.get("model") or "", placeholder="字段名称不区分大小写，取值区分大小写、精确匹配（含空格）", key=f"ep_model_{pid}")
                 e_model_en = st.text_input("型号（英文，可选）", value=proj.get("model_en") or "", placeholder="Model in English", key=f"ep_model_en_{pid}")
-                e_country = st.selectbox("注册国家", countries, index=countries.index(proj["registration_country"]) if proj.get("registration_country") in countries else 0, key=f"ep_country_{pid}")
+                _ec_idx = min(_idx_proj(countries, proj.get("registration_country") or ""), len(countries) - 1) if countries else 0
+                e_country = st.selectbox("注册国家", countries, index=_ec_idx, key=f"ep_country_{pid}")
                 e_country_en = st.text_input("注册国家（英文）", value=proj.get("registration_country_en") or "", placeholder="e.g. China", key=f"ep_country_en_{pid}")
-                e_type = st.selectbox("注册类别", REGISTRATION_TYPES, index=REGISTRATION_TYPES.index(proj["registration_type"]) if proj.get("registration_type") in REGISTRATION_TYPES else 0, key=f"ep_type_{pid}")
-                e_comp = st.selectbox("注册组成", REGISTRATION_COMPONENTS, index=REGISTRATION_COMPONENTS.index(proj["registration_component"]) if proj.get("registration_component") in REGISTRATION_COMPONENTS else 0, key=f"ep_comp_{pid}")
-                e_form = st.selectbox("项目形态", forms, index=forms.index(proj["project_form"]) if proj.get("project_form") in forms else 0, key=f"ep_form_{pid}")
+                _et_idx = min(_idx_proj(REGISTRATION_TYPES, proj.get("registration_type") or ""), len(REGISTRATION_TYPES) - 1) if REGISTRATION_TYPES else 0
+                e_type = st.selectbox("注册类别", REGISTRATION_TYPES, index=_et_idx, key=f"ep_type_{pid}")
+                _ecomp_idx = min(_idx_proj(REGISTRATION_COMPONENTS, proj.get("registration_component") or ""), len(REGISTRATION_COMPONENTS) - 1) if REGISTRATION_COMPONENTS else 0
+                e_comp = st.selectbox("注册组成", REGISTRATION_COMPONENTS, index=_ecomp_idx, key=f"ep_comp_{pid}")
+                _ef_idx = min(_idx_proj(forms, proj.get("project_form") or ""), len(forms) - 1) if forms else 0
+                e_form = st.selectbox("项目形态", forms, index=_ef_idx, key=f"ep_form_{pid}")
                 e_scope = st.text_area("产品适用范围", value=proj.get("scope_of_application") or "", placeholder="审核时要求文档描述内容不超出此范围", height=80, key=f"ep_scope_{pid}")
                 if st.form_submit_button("保存"):
                     update_project(
@@ -2339,7 +2463,7 @@ def _render_projects_tab(agent, collection: str):
                         model=e_model.strip() if e_model else "",
                         model_en=e_model_en.strip() if e_model_en else "",
                     )
-                    st.success("已更新")
+                    st.session_state["projects_success_message"] = "✅ 项目已更新"
                     st.experimental_rerun()
         if st.button("🗑️ 删除项目", key=f"del_proj_{pid}"):
             try:
@@ -2347,7 +2471,7 @@ def _render_projects_tab(agent, collection: str):
             except Exception:
                 pass
             delete_project(pid)
-            st.success("已删除项目")
+            st.session_state["projects_success_message"] = "✅ 项目已删除"
             st.experimental_rerun()
 
         try:
@@ -2847,6 +2971,12 @@ def render_step3_page():
     tab1, tab2 = st.tabs(["📤 上传文件审核", "📝 文本审核"])
 
     with tab1:
+        _retry_ok = st.session_state.pop("review_retry_ok_msg", None)
+        if _retry_ok:
+            st.success(_retry_ok)
+        _retry_partial = st.session_state.pop("review_retry_partial_msg", None)
+        if _retry_partial:
+            st.warning(_retry_partial)
         with st.expander("🔗 金山文档在线审核（粘贴链接即可审核，无需下载到本地）", expanded=False):
             from src.core.kdocs_client import has_api_credentials as _kdocs_has_api
             if _kdocs_has_api():
@@ -2900,6 +3030,7 @@ def render_step3_page():
                                     report,
                                     model_info=get_current_model_info() or "",
                                 )
+                                _invalidate_audit_history_cache()
                             except Exception:
                                 pass
                             st.session_state.review_reports = [report]
@@ -3003,6 +3134,10 @@ def render_step3_page():
             if review_context is None:
                 review_context = {}
             review_context["document_language"] = DOC_LANG_LABEL_TO_VALUE.get(_doc_lang_sel, "")
+            # 与侧栏一致，供审核内核（如长文档分块并发策略）识别实际提供方
+            review_context["current_provider"] = (
+                st.session_state.get("current_provider") or settings.provider or ""
+            ).strip().lower()
             # 按项目审核时自动按项目适用注册类别匹配审核点；通用审核不区分类别、使用全部审核点
             if project_id:
                 review_context["_filter_by_registration_type"] = True
@@ -3053,6 +3188,7 @@ def render_step3_page():
                                     consistency_report,
                                     model_info=get_current_model_info() or "",
                                 )
+                                _invalidate_audit_history_cache()
                             except Exception as save_err:
                                 st.warning(f"多文档一致性报告已生成，但写入历史审核报告失败，请稍后在「历史审核报告」中确认是否可见：{save_err}")
                             review_status.success("多文档一致性与模板风格审核完成。")
@@ -3070,6 +3206,9 @@ def render_step3_page():
                         )
                 else:
                     for idx, (path, display_name, is_from_archive) in enumerate(items):
+                        # 批量虽为逐份串行，DeepSeek 等仍可能在连续请求下更易触发网关抖动，份间轻微间隔
+                        if idx > 0 and (review_context.get("current_provider") or "") == "deepseek":
+                            time.sleep(0.6)
                         pct = int(idx / total_files * 100)
                         review_bar.progress(pct)
                         review_status.info(
@@ -3083,13 +3222,16 @@ def render_step3_page():
                             t0 = time.time()
                             mi = get_current_model_info()
                             with st.spinner(f"AI 正在审核 [{display_name}]，请耐心等待..."):
-                                report = agent.review(
-                                    path,
-                                    project_id=project_id,
-                                    review_context=review_context,
-                                    system_prompt=review_sys_edit.strip() or None,
-                                    user_prompt=review_usr_edit.strip() or None,
-                                    extra_instructions=review_extra_edit.strip() or None,
+                                report = _call_with_transient_retry(
+                                    lambda: agent.review(
+                                        path,
+                                        project_id=project_id,
+                                        review_context=review_context,
+                                        system_prompt=review_sys_edit.strip() or None,
+                                        user_prompt=review_usr_edit.strip() or None,
+                                        extra_instructions=review_extra_edit.strip() or None,
+                                    ),
+                                    attempts=3,
                                 )
                             elapsed = time.time() - t0
                             report["original_filename"] = display_name
@@ -3100,6 +3242,7 @@ def render_step3_page():
                             if not do_multi_later:
                                 try:
                                     save_audit_report(agent.collection_name, report, model_info=mi)
+                                    _invalidate_audit_history_cache()
                                 except Exception:
                                     pass
                             n_points = report.get("total_points", 0)
@@ -3115,10 +3258,10 @@ def render_step3_page():
                                 f"- :white_check_mark: **{display_name}** — {n_points} 个审核点, {_format_time(elapsed)}"
                             )
                         except Exception as e:
-                            err_str = str(e)
+                            err_str = _format_review_exception(e)
                             failed_items.append((path, display_name, is_from_archive))
                             failed_errors.append(err_str)
-                            log_lines.append(f"- :x: **{display_name}** 失败：{err_str}")
+                            log_lines.append(f"- :x: **{display_name}** 失败：{err_str[:300]}{'…' if len(err_str) > 300 else ''}")
                             add_operation_log(
                                 op_type="review_error",
                                 collection=agent.collection_name,
@@ -3178,6 +3321,7 @@ def render_step3_page():
                             "_review_meta": _batch_meta,
                         }
                         save_audit_report(agent.collection_name, _partial_batch, model_info=get_current_model_info() or "")
+                        _invalidate_audit_history_cache()
                     except Exception as _save_err:
                         st.caption(f"已完成的报告写入历史失败：{_save_err}")
             else:
@@ -3236,6 +3380,7 @@ def render_step3_page():
                                     batch_report,
                                     model_info=get_current_model_info() or "",
                                 )
+                                _invalidate_audit_history_cache()
                             except Exception as save_err:
                                 st.warning(f"批量报告写入历史失败：{save_err}")
                             log_lines.append(
@@ -3266,6 +3411,7 @@ def render_step3_page():
                                         "_review_meta": _batch_meta,
                                     }
                                     save_audit_report(agent.collection_name, _batch_no_consistency, model_info=get_current_model_info() or "")
+                                    _invalidate_audit_history_cache()
                                 except Exception as _save_err:
                                     st.warning(f"本批报告写入历史失败：{_save_err}")
                     else:
@@ -3288,6 +3434,7 @@ def render_step3_page():
                                     "_review_meta": _batch_meta,
                                 }
                                 save_audit_report(agent.collection_name, _batch_skip_multi, model_info=get_current_model_info() or "")
+                                _invalidate_audit_history_cache()
                             except Exception as _save_err:
                                 st.warning(f"本批报告写入历史失败：{_save_err}")
 
@@ -3329,52 +3476,106 @@ def render_step3_page():
     if st.session_state.get("review_failed_items"):
         failed_list = st.session_state.review_failed_items
         failed_errs = st.session_state.get("review_failed_errors") or []
-        st.warning(f"本批次有 **{len(failed_list)}** 个文件审核失败，可点击下方按钮仅对失败项重新审核（与已成功报告合并为同一批）。")
-        if failed_errs:
-            with st.expander("查看失败原因（便于排查接口/模型配置）", expanded=True):
-                st.caption("首个失败原因：")
-                st.code(failed_errs[0], language="text")
-                if len(failed_errs) > 1:
-                    st.caption("全部失败原因：")
-                    for i, err in enumerate(failed_errs, 1):
-                        st.text(f"{i}. {err[:500]}{'…' if len(err) > 500 else ''}")
-        for _path, _dn, _ in failed_list:
-            st.caption(f"• {_dn}")
+        st.warning(
+            f"本批次有 **{len(failed_list)}** 个文件审核失败，可点击下方按钮仅对失败项重新审核（与已成功报告合并为同一批）。"
+            " 重新审核时页面会显示进度，单份可能耗时较长，请勿重复点击。"
+        )
+        with st.expander("查看失败原因（便于排查接口/模型配置）", expanded=True):
+            for i, (_path, dn, _) in enumerate(failed_list):
+                err = failed_errs[i] if i < len(failed_errs) else ""
+                err = (err or "").strip() or "（未记录到详细原因，可重新审核或重新上传该文件）"
+                st.markdown(f"**{i + 1}. {dn}**")
+                st.code(err[:12000], language="text")
         if st.button("🔄 重新审核失败项", key="retry_failed_review_btn"):
             agent = init_agent()
             project_id = st.session_state.get("review_project_id")
-            review_context = st.session_state.get("review_context")
+            review_context = dict(st.session_state.get("review_context") or {})
             review_sys_edit = st.session_state.get("review_sys_edit_step3", "") or st.session_state.get("review_sys_edit", "")
             review_usr_edit = st.session_state.get("review_usr_edit_step3", "") or st.session_state.get("review_usr_edit", "")
             review_extra_edit = st.session_state.get("review_extra_edit_step3", "") or st.session_state.get("review_extra_edit", "")
             merged = list(st.session_state.get("review_success_reports", []))
-            for path, display_name, is_from_archive in failed_list:
-                try:
-                    report = agent.review(
-                        path,
-                        project_id=project_id,
-                        review_context=review_context,
-                        system_prompt=review_sys_edit.strip() or None,
-                        user_prompt=review_usr_edit.strip() or None,
-                        extra_instructions=review_extra_edit.strip() or None,
+            _dirs = list(st.session_state.get("review_failed_temp_dirs", []))
+            still_failed = []
+            still_errors = []
+            n_fail = len(failed_list)
+            retry_bar = st.progress(0)
+            retry_status = st.empty()
+            for idx, (path, display_name, is_from_archive) in enumerate(failed_list):
+                retry_bar.progress(min(int((idx / max(n_fail, 1)) * 99), 99))
+                retry_status.info(f"正在重新审核 **{idx + 1}/{n_fail}**：{display_name} …（请稍候，勿关闭页面）")
+                if not Path(path).exists():
+                    still_failed.append((path, display_name, is_from_archive))
+                    still_errors.append(
+                        f"临时文件已不存在（可能会话过期或已被清理），请在本页重新上传 **{display_name}** 后再审核。"
                     )
+                    continue
+                try:
+                    t0 = time.time()
+                    with st.spinner(f"AI 正在重新审核 [{display_name}]，请耐心等待…"):
+                        report = _call_with_transient_retry(
+                            lambda: agent.review(
+                                path,
+                                project_id=project_id,
+                                review_context=review_context,
+                                system_prompt=review_sys_edit.strip() or None,
+                                user_prompt=review_usr_edit.strip() or None,
+                                extra_instructions=review_extra_edit.strip() or None,
+                            ),
+                            attempts=3,
+                        )
                     report["original_filename"] = display_name
+                    report["_original_path"] = path
                     _inject_review_meta(report)
                     try:
                         save_audit_report(agent.collection_name, report, model_info=get_current_model_info() or "")
+                        _invalidate_audit_history_cache()
                     except Exception:
                         pass
                     merged.append(report)
-                except Exception:
-                    pass
+                    mi = get_current_model_info()
+                    add_operation_log(
+                        op_type=OP_TYPE_REVIEW,
+                        collection=agent.collection_name,
+                        file_name=display_name,
+                        source=str(path),
+                        extra={
+                            "total_points": report.get("total_points", 0),
+                            "duration_sec": round(time.time() - t0, 2),
+                            "retry_failed_batch": True,
+                        },
+                        model_info=mi,
+                    )
+                except Exception as e:
+                    err_str = _format_review_exception(e)
+                    still_failed.append((path, display_name, is_from_archive))
+                    still_errors.append(err_str)
+                    add_operation_log(
+                        op_type="review_error",
+                        collection=agent.collection_name,
+                        file_name=display_name,
+                        source=str(path),
+                        extra={"error": err_str, "traceback": traceback.format_exc(), "retry_failed_batch": True},
+                        model_info=get_current_model_info(),
+                    )
+            retry_bar.progress(100)
+            retry_status.empty()
             st.session_state.review_reports = merged
-            _dirs = list(st.session_state.get("review_failed_temp_dirs", []))
-            for k in ("review_failed_items", "review_failed_errors", "review_failed_temp_dirs", "review_success_reports"):
-                st.session_state.pop(k, None)
-            for d in _dirs:
-                shutil.rmtree(d, ignore_errors=True)
-            st.success("已对失败项重新审核并合并到本批报告。")
-            st.experimental_rerun()
+            if still_failed:
+                st.session_state.review_failed_items = still_failed
+                st.session_state.review_failed_errors = still_errors
+                st.session_state.review_success_reports = merged
+                st.session_state.review_failed_temp_dirs = _dirs
+                st.session_state["review_retry_partial_msg"] = (
+                    f"重新审核后仍有 **{len(still_failed)}** 个文件失败，**{n_fail - len(still_failed)}** 个已成功合并。"
+                )
+                st.experimental_rerun()
+            else:
+                for k in ("review_failed_items", "review_failed_errors", "review_failed_temp_dirs", "review_success_reports", "review_retry_partial_msg"):
+                    st.session_state.pop(k, None)
+                for d in _dirs:
+                    shutil.rmtree(d, ignore_errors=True)
+                st.session_state["review_retry_ok_msg"] = f"已对 **{n_fail}** 个失败项重新审核并合并到本批报告。"
+                st.experimental_rerun()
 
     with tab2:
         review_text_doc_lang = st.selectbox(
@@ -3401,19 +3602,23 @@ def render_step3_page():
                 _tl = st.session_state.get("review_text_doc_lang") or "不指定"
                 _text_ctx["document_language"] = DOC_LANG_LABEL_TO_VALUE.get(_tl, "")
                 with st.spinner("AI 正在审核文本，请耐心等待..."):
-                    report = agent.review_text(
-                        review_text,
-                        text_file_name,
-                        project_id=project_id,
-                        review_context=_text_ctx,
-                        system_prompt=review_sys_edit.strip() or None,
-                        user_prompt=review_usr_edit.strip() or None,
-                        extra_instructions=review_extra_edit.strip() or None,
+                    report = _call_with_transient_retry(
+                        lambda: agent.review_text(
+                            review_text,
+                            text_file_name,
+                            project_id=project_id,
+                            review_context=_text_ctx,
+                            system_prompt=review_sys_edit.strip() or None,
+                            user_prompt=review_usr_edit.strip() or None,
+                            extra_instructions=review_extra_edit.strip() or None,
+                        ),
+                        attempts=3,
                     )
                 elapsed = time.time() - t0
                 _inject_review_meta(report)
                 try:
                     save_audit_report(agent.collection_name, report, model_info=mi)
+                    _invalidate_audit_history_cache()
                 except Exception:
                     pass
                 n_points = report.get("total_points", 0)
@@ -3478,7 +3683,7 @@ def render_step3_page():
                         merged_report = _merge_audit_reports_into_one(recs, merged_file_name=f"整合报告：{sel_name}")
                         st.session_state.merged_report_result = merged_report
         else:
-            history = get_audit_reports(collection=collection, limit=100)
+            history = _get_cached_audit_reports(collection)
             if not history:
                 st.info("当前暂无历史报告。")
             else:
@@ -3506,8 +3711,9 @@ def render_step3_page():
                             _inject_review_meta(merged_report)
                         save_audit_report(collection, merged_report, model_info=get_current_model_info())
                         st.session_state.pop("merged_report_result", None)
+                        _invalidate_audit_history_cache()
                         st.success("已保存，可在上方历史报告中查看。")
-                        st.experimental_rerun()
+                        _streamlit_rerun()
                     except Exception as e:
                         st.error(f"保存失败：{e}")
             with c2:
@@ -3547,48 +3753,93 @@ def render_step3_page():
 
     try:
         collection = st.session_state.get("collection_name", "regulations")
-        history = get_audit_reports(collection=collection, limit=100)
-        if history:
-            for rec in history:
-                ts = rec.get("created_at", "")
-                fname = rec.get("file_name", "")
-                tp = rec.get("total_points", 0)
-                mid = rec.get("model_info", "")
-                rpt = rec.get("report", {})
-                # 从报告中提取审核类型标签
-                _h_meta = _extract_history_meta(rpt)
-                _h_type_tag = f"[{_h_meta.get('audit_type', '通用审核')}] " if _h_meta else ""
-                label = f"{ts} | {_h_type_tag}{fname} | {tp}个审核点"
-                if mid:
-                    label += f" | {mid}"
-                with st.expander(label, expanded=False):
-                    if rpt:
-                        _render_history_meta_header(rpt, rec.get("id", 0))
-                        if rpt.get("batch") and rpt.get("reports"):
-                            _render_reports_table_layout(
-                                rpt["reports"],
-                                base_key_prefix=f"hist_{rec.get('id')}_r",
-                                history_id=rec.get("id") or 0,
-                                parent_batch_report=rpt,
-                                key_suffix=f"_hist_{rec.get('id')}",
-                                allow_nested_expander=False,
-                            )
-                        else:
-                            if not rpt.get("related_doc_names"):
-                                rpt["related_doc_names"] = [rpt.get("original_filename", rpt.get("file_name", fname or "未知"))]
-                            _render_reports_table_layout(
-                                [rpt],
-                                base_key_prefix=f"hist_{rec.get('id')}",
-                                history_id=rec.get("id") or 0,
-                                parent_batch_report=None,
-                                key_suffix=f"_hist_{rec.get('id')}",
-                                allow_nested_expander=False,
-                            )
-                        _render_history_report_download(rec.get("id"), rpt, fname or "report")
-                    else:
-                        st.json(rec.get("report_json", "{}"))
+        history = _get_cached_audit_reports(collection)
+        hed = st.session_state.get("_hist_editing_id")
+        er = st.session_state.get("_hist_editing_report")
+
+        if hed is not None and er is not None:
+            st.markdown("##### 📂 历史报告编辑区（仅加载当前这一条）")
+            h1, h2 = st.columns([1, 3])
+            with h1:
+                if st.button("✖ 关闭编辑区", key="_hist_close_editor"):
+                    _hid = st.session_state.get("_hist_editing_id")
+                    st.session_state.pop("_hist_editing_id", None)
+                    st.session_state.pop("_hist_editing_report", None)
+                    if _hid is not None:
+                        st.session_state.pop(f"_hist_dl_blob_{_hid}", None)
+                    _invalidate_audit_history_cache()
+                    _streamlit_rerun()
+            with h2:
+                st.caption(f"报告 ID **{hed}**；在下方用下拉框选「审核点」再编辑或纠正，保存后自动退出纠正界面。")
+            fname = er.get("file_name") or er.get("original_filename") or "report"
+            _render_history_meta_header(er, hed)
+            if er.get("batch") and er.get("reports"):
+                _render_reports_table_layout(
+                    er["reports"],
+                    base_key_prefix=f"hist_{hed}_r",
+                    history_id=hed,
+                    parent_batch_report=er,
+                    key_suffix=f"_hist_{hed}",
+                    allow_nested_expander=False,
+                )
+            else:
+                if not er.get("related_doc_names"):
+                    er["related_doc_names"] = [er.get("original_filename", er.get("file_name", fname or "未知"))]
+                _render_reports_table_layout(
+                    [er],
+                    base_key_prefix=f"hist_{hed}",
+                    history_id=hed,
+                    parent_batch_report=None,
+                    key_suffix=f"_hist_{hed}",
+                    allow_nested_expander=False,
+                )
+            _render_history_report_download(hed, er, fname or "report")
         else:
-            st.info("暂无历史审核报告。")
+            r1, r2 = st.columns([1, 4])
+            with r1:
+                if st.button("🔄 刷新列表", key="_hist_refresh_list"):
+                    _invalidate_audit_history_cache()
+                    _streamlit_rerun()
+            if not history:
+                st.info("暂无历史审核报告。")
+            else:
+                st.caption(
+                    f"共 **{len(history)}** 条；列表仅占用一个下拉框，**打开**后再加载该条全文，避免每次翻页都渲染全部报告。"
+                )
+
+                def _hist_row_label(i: int) -> str:
+                    r = history[i]
+                    rpt = r.get("report") or {}
+                    _hm = _extract_history_meta(rpt)
+                    _tag = f"[{_hm.get('audit_type', '通用审核')}] " if _hm else ""
+                    mid = r.get("model_info", "") or ""
+                    suf = f" | {mid}" if mid else ""
+                    return f"{r.get('created_at', '')} | {_tag}{r.get('file_name', '')} | {r.get('total_points', 0)}点 (ID:{r.get('id')}){suf}"
+
+                sel_i = st.selectbox(
+                    "选择历史报告",
+                    options=list(range(len(history))),
+                    format_func=_hist_row_label,
+                    key="_hist_pick_idx",
+                )
+                if st.button("📂 打开选中报告", key="_hist_open_sel"):
+                    rec = history[sel_i]
+                    rpt = rec.get("report")
+                    if not rpt and rec.get("report_json"):
+                        try:
+                            rpt = json.loads(rec["report_json"])
+                        except Exception:
+                            rpt = {}
+                    if not rpt:
+                        st.error("该记录没有可展示的报告正文。")
+                    else:
+                        try:
+                            st.session_state["_hist_editing_id"] = rec["id"]
+                            st.session_state["_hist_editing_report"] = copy.deepcopy(rpt)
+                        except Exception as _copy_err:
+                            st.error(f"加载报告到编辑区失败：{_copy_err}")
+                        else:
+                            _streamlit_rerun()
     except Exception as e:
         st.warning(f"加载历史报告失败：{e}")
 
@@ -3665,7 +3916,7 @@ def _render_multi_doc_report(report: dict, r_idx: int, reports: list, key_prefix
     cols[2].metric("🔵 低风险", report.get("low_count", 0))
     cols[3].metric("ℹ️ 提示", report.get("info_count", 0))
     if report.get("summary"):
-        st.markdown(f"**总结：** {report['summary']}")
+        _markdown_text_with_hover_title("总结：", report["summary"], max_preview=220)
     st.markdown("---")
 
     # ─── 区域二：默认状态配置 ───
@@ -3846,7 +4097,7 @@ def _render_report_flat(report: dict, history_id: int = 0):
     cols[3].metric("ℹ️ 提示", report.get("info_count", 0))
 
     if report.get("summary"):
-        st.markdown(f"**总结：** {report['summary']}")
+        _markdown_text_with_hover_title("总结：", report["summary"], max_preview=220)
     st.markdown("---")
 
     for i, point in enumerate(report.get("audit_points", []), 1):
@@ -4034,13 +4285,77 @@ def _render_history_meta_header(rpt: dict, report_id: int):
     st.markdown("---")
 
 
+_HISTORY_DL_HEAVY_FORMATS = frozenset({"Excel", "PDF", "Word", "HTML"})
+
+
+def _build_history_report_download_payload(reports: list, fmt: str) -> tuple:
+    """生成历史报告下载二进制/文本及 mime、扩展名。失败时抛出异常。"""
+    if fmt == "Excel":
+        data = report_to_excel(reports)
+        return (
+            data,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xlsx",
+        )
+    if fmt == "JSON":
+        return (
+            json.dumps(reports, ensure_ascii=False, indent=2).encode("utf-8"),
+            "application/json",
+            "json",
+        )
+    if fmt == "HTML":
+        return (report_to_html(reports).encode("utf-8"), "text/html", "html")
+    if fmt == "PDF":
+        return (report_to_pdf(reports), "application/pdf", "pdf")
+    if fmt == "Word":
+        return (
+            report_to_docx(reports),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "docx",
+        )
+    # Markdown
+    md_lines = []
+    for r in reports:
+        fn = r.get("original_filename", r.get("file_name", ""))
+        md_lines.append(f"# 审核报告：{fn}\n")
+        md_lines.append(f"**总结：** {r.get('summary', '')}\n")
+        md_lines.append("| 高风险 | 中风险 | 低风险 | 提示 |")
+        md_lines.append("|--------|--------|--------|------|")
+        md_lines.append(
+            f"| {r.get('high_count', 0)} | {r.get('medium_count', 0)} "
+            f"| {r.get('low_count', 0)} | {r.get('info_count', 0)} |\n"
+        )
+        for i, point in enumerate(r.get("audit_points", []), 1):
+            sev_l = {"high": "高", "medium": "中", "low": "低", "info": "提示"}.get(
+                (point.get("severity") or "").lower(), point.get("severity", "")
+            )
+            md_lines.append(f"## [{sev_l}] 审核点 {i}：{point.get('category', '')}")
+            md_lines.append(f"- **位置：** {point.get('location', '')}")
+            md_lines.append(f"- **描述：** {point.get('description', '')}")
+            md_lines.append(f"- **法规依据：** {point.get('regulation_ref', '')}")
+            md_lines.append(f"- **建议：** {point.get('suggestion', '')}")
+            _docs = point.get("modify_docs") or []
+            if _docs:
+                md_lines.append(f"- **需修改文档：** {'、'.join(d for d in _docs if d)}")
+            _action = point.get("action") or ""
+            if _action:
+                md_lines.append(f"- **处理状态：** {_action}")
+            md_lines.append("")
+    text = "\n".join(md_lines)
+    return (text.encode("utf-8"), "text/markdown", "md")
+
+
 def _render_history_report_download(report_id: int, report: dict, display_name: str):
-    """历史报告区域：格式下拉 + 下载按钮。batch 报告导出其 reports 列表。"""
+    """历史报告区域：格式下拉 + 下载按钮。batch 报告导出其 reports 列表。
+
+    重格式（Excel/PDF/Word/HTML）改为点击「生成」后再下载，避免每次 rerun 都全量导出导致长时间阻塞甚至白屏。
+    """
     st.markdown("**📥 下载此报告**")
     safe_name = "".join(c for c in (display_name or "report") if c.isalnum() or c in "._- ").strip() or "report"
     safe_name = safe_name[:64]
 
-    format_options = ["Excel", "PDF", "Word", "HTML", "JSON", "Markdown"]
+    # 默认 JSON，避免一打开历史报告就同步跑 Excel（大报告会卡死/白屏）
+    format_options = ["JSON", "Markdown", "HTML", "Excel", "PDF", "Word"]
     idx = st.selectbox(
         "选择下载格式",
         format_options,
@@ -4051,67 +4366,31 @@ def _render_history_report_download(report_id: int, report: dict, display_name: 
     else:
         reports = [report]
 
-    if idx == "Excel":
-        try:
-            data = report_to_excel(reports)
-            mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            ext = "xlsx"
-        except Exception as e:
-            st.caption(f"Excel 生成失败: {e}")
-            return
-    elif idx == "JSON":
-        data = json.dumps(reports, ensure_ascii=False, indent=2)
-        mime = "application/json"
-        ext = "json"
-    elif idx == "HTML":
-        data = report_to_html(reports)
-        mime = "text/html"
-        ext = "html"
-    elif idx == "PDF":
-        try:
-            data = report_to_pdf(reports)
-            mime = "application/pdf"
-            ext = "pdf"
-        except Exception as e:
-            st.caption(f"PDF 生成失败: {e}")
-            return
-    elif idx == "Word":
-        try:
-            data = report_to_docx(reports)
-            mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            ext = "docx"
-        except Exception as e:
-            st.caption(f"Word 生成失败: {e}")
+    cache_key = f"_hist_dl_blob_{report_id}"
+    cache = st.session_state.get(cache_key)
+    if cache and cache.get("fmt") != idx:
+        st.session_state.pop(cache_key, None)
+        cache = None
+
+    if idx in _HISTORY_DL_HEAVY_FORMATS:
+        if cache and cache.get("fmt") == idx:
+            data, mime, ext = cache["data"], cache["mime"], cache["ext"]
+        else:
+            st.caption("Excel / PDF / Word / HTML 生成较慢，请先点击下方按钮生成，再下载（避免页面长时间无响应）。")
+            if st.button("⏳ 生成下载文件", key=f"hist_gen_{report_id}"):
+                try:
+                    data, mime, ext = _build_history_report_download_payload(reports, idx)
+                    st.session_state[cache_key] = {"fmt": idx, "data": data, "mime": mime, "ext": ext}
+                    _streamlit_rerun()
+                except Exception as e:
+                    st.error(f"生成失败：{e}")
             return
     else:
-        md_lines = []
-        for r in reports:
-            fn = r.get("original_filename", r.get("file_name", ""))
-            md_lines.append(f"# 审核报告：{fn}\n")
-            md_lines.append(f"**总结：** {r.get('summary', '')}\n")
-            md_lines.append("| 高风险 | 中风险 | 低风险 | 提示 |")
-            md_lines.append("|--------|--------|--------|------|")
-            md_lines.append(
-                f"| {r.get('high_count', 0)} | {r.get('medium_count', 0)} "
-                f"| {r.get('low_count', 0)} | {r.get('info_count', 0)} |\n"
-            )
-            for i, point in enumerate(r.get("audit_points", []), 1):
-                sev_l = {"high": "高", "medium": "中", "low": "低", "info": "提示"}.get((point.get("severity") or "").lower(), point.get("severity", ""))
-                md_lines.append(f"## [{sev_l}] 审核点 {i}：{point.get('category', '')}")
-                md_lines.append(f"- **位置：** {point.get('location', '')}")
-                md_lines.append(f"- **描述：** {point.get('description', '')}")
-                md_lines.append(f"- **法规依据：** {point.get('regulation_ref', '')}")
-                md_lines.append(f"- **建议：** {point.get('suggestion', '')}")
-                _docs = point.get("modify_docs") or []
-                if _docs:
-                    md_lines.append(f"- **需修改文档：** {'、'.join(d for d in _docs if d)}")
-                _action = point.get("action") or ""
-                if _action:
-                    md_lines.append(f"- **处理状态：** {_action}")
-                md_lines.append("")
-        data = "\n".join(md_lines)
-        mime = "text/markdown"
-        ext = "md"
+        try:
+            data, mime, ext = _build_history_report_download_payload(reports, idx)
+        except Exception as e:
+            st.error(f"生成失败：{e}")
+            return
 
     st.download_button(
         f"📥 下载 {idx}",
@@ -4132,9 +4411,18 @@ def _aggregate_batch_report_totals(parent: dict) -> None:
     parent["info_count"] = sum(r.get("info_count", 0) for r in reports)
 
 
-def _render_correction_form(report: dict, report_id: int, point_idx: int, point: dict, parent_batch_report: dict = None, sub_report_index: int = None):
-    """纠正表单：可编辑描述、建议、需修改的文档、处理状态等，保存纠正 / 取消纠正。批量报告时传入 parent_batch_report 与 sub_report_index 以正确写回整份报告。"""
-    prefix = f"cf_{report_id}_{point_idx}"
+def _render_correction_form(
+    report: dict,
+    report_id: int,
+    point_idx: int,
+    point: dict,
+    parent_batch_report: dict = None,
+    sub_report_index: int = None,
+    close_state_keys: list = None,
+):
+    """纠正表单：可编辑描述、建议、需修改的文档、处理状态等，保存纠正 / 取消纠正。批量报告时传入 parent_batch_report 与 sub_report_index 以正确写回整份报告。
+    close_state_keys：保存/取消后额外从 session_state 中 pop 的 key（如历史报告详情内的纠正开关）。"""
+    prefix = f"cf_{report_id}_{point_idx}_{sub_report_index if sub_report_index is not None else 'x'}"
     doc_names = report.get("related_doc_names") or []
     current_docs = point.get("modify_docs") or []
     if not isinstance(current_docs, list):
@@ -4150,113 +4438,353 @@ def _render_correction_form(report: dict, report_id: int, point_idx: int, point:
     if not default_docs and doc_names:
         default_docs = list(doc_names)
 
-    new_desc = st.text_area("问题描述", value=point.get("description", ""), key=f"{prefix}_desc")
-    new_sev = st.selectbox("严重程度", ["high", "medium", "low", "info"],
-                           index=["high", "medium", "low", "info"].index(point.get("severity", "info")),
-                           key=f"{prefix}_sev")
-    new_ref = st.text_area("法规依据", value=point.get("regulation_ref", ""), key=f"{prefix}_ref")
-    new_sug = st.text_area("修改建议", value=point.get("suggestion", ""), key=f"{prefix}_sug")
-    if doc_names:
-        new_modify_docs = st.multiselect("需修改的文档", options=doc_names, default=default_docs, key=f"{prefix}_modify_docs")
+    _kind_default = 0
+    if point.get("correction_kind") == "false_positive" or point.get("false_positive_reason"):
+        _kind_default = 1
+    elif point.get("deprecated"):
+        _kind_default = 2
+    corr_kind = st.radio(
+        "纠正方式",
+        ["修订本条内容", "标记为误报", "弃用本条"],
+        index=min(_kind_default, 2),
+        horizontal=True,
+        key=f"{prefix}_kind",
+    )
+
+    if corr_kind == "修订本条内容":
+        new_desc = st.text_area("问题描述", value=point.get("description", ""), key=f"{prefix}_desc")
+        _sev_list = ["high", "medium", "low", "info"]
+        _sv = (point.get("severity") or "info").lower()
+        _sev_i = _sev_list.index(_sv) if _sv in _sev_list else 3
+        new_sev = st.selectbox("严重程度", _sev_list, index=_sev_i, key=f"{prefix}_sev")
+        new_ref = st.text_area("法规依据", value=point.get("regulation_ref", ""), key=f"{prefix}_ref")
+        new_sug = st.text_area("修改建议", value=point.get("suggestion", ""), key=f"{prefix}_sug")
+        if doc_names:
+            new_modify_docs = st.multiselect("需修改的文档", options=doc_names, default=default_docs, key=f"{prefix}_modify_docs")
+        else:
+            new_modify_docs = default_docs
+        current_action = point.get("action") or _get_multi_doc_default_action(point.get("severity", "info"))
+        if current_action not in ACTION_OPTIONS:
+            current_action = ACTION_OPTIONS[0]
+        new_action = st.selectbox("处理状态", ACTION_OPTIONS, index=ACTION_OPTIONS.index(current_action), key=f"{prefix}_action")
+    elif corr_kind == "标记为误报":
+        st.caption("误报：本条不再作为有效审核问题，处理状态将设为「无需修改」。")
+        fp_reason = st.text_area("误报原因（必填）", value=point.get("false_positive_reason") or "", key=f"{prefix}_fp_reason", placeholder="例如：与法规/产品实际不符、模型误判等")
     else:
-        new_modify_docs = default_docs
-    current_action = point.get("action") or _get_multi_doc_default_action(point.get("severity", "info"))
-    if current_action not in ACTION_OPTIONS:
-        current_action = ACTION_OPTIONS[0]
-    new_action = st.selectbox("处理状态", ACTION_OPTIONS, index=ACTION_OPTIONS.index(current_action), key=f"{prefix}_action")
+        st.caption("弃用：本条从有效问题清单中移除（不计入统计）；可选在下方新增一条您认为正确的审核结论。")
+        dep_note = st.text_area("弃用说明（可选）", value=point.get("deprecation_note") or "", key=f"{prefix}_dep_note")
+        add_replace = st.checkbox("同时新增一条正确的审核点（插入本条之后）", value=False, key=f"{prefix}_add_replace")
+        if add_replace:
+            st.markdown("**新增审核点**")
+            n_cat = st.text_input("类别", value=point.get("category") or "一致性", key=f"{prefix}_n_cat")
+            n_loc = st.text_input("位置", value="", key=f"{prefix}_n_loc", placeholder="文档中的章节或位置")
+            n_desc = st.text_area("问题描述（正确结论）", value="", key=f"{prefix}_n_desc", height=80)
+            n_ref = st.text_area("法规依据", value="", key=f"{prefix}_n_ref", height=60)
+            n_sug = st.text_area("修改建议", value="", key=f"{prefix}_n_sug", height=80)
+            n_sev = st.selectbox("严重程度", ["high", "medium", "low", "info"], index=2, key=f"{prefix}_n_sev")
+            if doc_names:
+                n_docs = st.multiselect("需修改的文档", options=doc_names, default=list(doc_names), key=f"{prefix}_n_docs")
+            else:
+                n_docs = []
+            n_action = st.selectbox("处理状态", ACTION_OPTIONS, index=0, key=f"{prefix}_n_action")
+
     feed_kb = st.checkbox("将纠正内容写入知识库（下次审核可参考）", value=True, key=f"{prefix}_feed")
+
+    def _persist(corrected_point: dict, original_snap: dict):
+        collection = st.session_state.get("collection_name", "regulations")
+        save_audit_correction(
+            report_id=report_id,
+            point_index=point_idx,
+            collection=collection,
+            file_name=report.get("file_name", ""),
+            original=original_snap,
+            corrected=corrected_point,
+            fed_to_kb=feed_kb,
+        )
+        if feed_kb:
+            _feed_correction_to_kb(collection, report.get("file_name", ""), corrected_point)
+        add_operation_log(
+            op_type=OP_TYPE_CORRECTION,
+            collection=collection,
+            file_name=report.get("file_name", ""),
+            extra={"report_id": report_id, "point_index": point_idx, "fed_to_kb": feed_kb, "corrected": corrected_point},
+            model_info=get_current_model_info(),
+        )
 
     col_save, col_cancel, _ = st.columns([1, 1, 2])
     with col_save:
         if st.button("💾 保存纠正", key=f"{prefix}_save"):
-            corrected_point = dict(point)
-            corrected_point["description"] = new_desc
-            corrected_point["severity"] = new_sev
-            corrected_point["regulation_ref"] = new_ref
-            corrected_point["suggestion"] = new_sug
-            corrected_point["modify_docs"] = new_modify_docs if doc_names else (point.get("modify_docs") or [])
-            corrected_point["action"] = new_action
-
             collection = st.session_state.get("collection_name", "regulations")
+            original_snap = dict(point)
             try:
-                save_audit_correction(
-                    report_id=report_id,
-                    point_index=point_idx,
-                    collection=collection,
-                    file_name=report.get("file_name", ""),
-                    original=point,
-                    corrected=corrected_point,
-                    fed_to_kb=feed_kb,
-                )
                 points = report.get("audit_points", [])
-                if 0 <= point_idx < len(points):
-                    points[point_idx] = corrected_point
-                    _recount_severity(report)
-                    # 批量报告时更新整份报告 JSON，避免只写入子报告覆盖掉 batch 结构
-                    if parent_batch_report is not None and sub_report_index is not None:
-                        _aggregate_batch_report_totals(parent_batch_report)
-                        update_audit_report(report_id, parent_batch_report)
+                if not (0 <= point_idx < len(points)):
+                    st.error("审核点索引无效")
+                else:
+                    if corr_kind == "标记为误报":
+                        reason = (st.session_state.get(f"{prefix}_fp_reason") or "").strip()
+                        if not reason:
+                            st.error("请填写误报原因")
+                        else:
+                            corrected_point = dict(point)
+                            corrected_point["correction_kind"] = "false_positive"
+                            corrected_point["false_positive_reason"] = reason
+                            corrected_point["action"] = "无需修改"
+                            corrected_point["suggestion"] = (point.get("suggestion") or "").strip() + (f"\n\n【误报说明】{reason}" if reason else "")
+                            points[point_idx] = corrected_point
+                            _recount_severity(report)
+                            _persist(corrected_point, original_snap)
+                            if parent_batch_report is not None and sub_report_index is not None:
+                                _aggregate_batch_report_totals(parent_batch_report)
+                                update_audit_report(report_id, parent_batch_report)
+                            else:
+                                update_audit_report(report_id, report)
+                            st.success("已标记为误报并保存。" + (" 已写入知识库。" if feed_kb else ""))
+                            st.session_state[f"editing_{report_id}_{point_idx + 1}"] = False
+                            for _k in close_state_keys or []:
+                                st.session_state.pop(_k, None)
+                            _invalidate_audit_history_cache()
+                            _streamlit_rerun()
+                    elif corr_kind == "弃用本条":
+                        dep_note_val = (st.session_state.get(f"{prefix}_dep_note") or "").strip()
+                        add_rep = st.session_state.get(f"{prefix}_add_replace", False)
+                        base = dict(point)
+                        base["deprecated"] = True
+                        base["correction_kind"] = "deprecated"
+                        base["deprecation_note"] = dep_note_val
+                        base["action"] = "无需修改"
+                        new_inserted = None
+                        if add_rep:
+                            n_cat_v = (st.session_state.get(f"{prefix}_n_cat") or "").strip() or "一致性"
+                            n_loc_v = (st.session_state.get(f"{prefix}_n_loc") or "").strip()
+                            n_desc_v = (st.session_state.get(f"{prefix}_n_desc") or "").strip()
+                            n_ref_v = (st.session_state.get(f"{prefix}_n_ref") or "").strip()
+                            n_sug_v = (st.session_state.get(f"{prefix}_n_sug") or "").strip()
+                            n_sev_v = st.session_state.get(f"{prefix}_n_sev") or "low"
+                            n_docs_v = st.session_state.get(f"{prefix}_n_docs") if doc_names else (point.get("modify_docs") or [])
+                            if not isinstance(n_docs_v, list):
+                                n_docs_v = list(doc_names) if doc_names else []
+                            n_action_v = st.session_state.get(f"{prefix}_n_action") or "立即修改"
+                            if not n_desc_v.strip():
+                                st.error("新增审核点请填写「问题描述」")
+                            else:
+                                new_inserted = {
+                                    "category": n_cat_v,
+                                    "location": n_loc_v,
+                                    "description": n_desc_v,
+                                    "regulation_ref": n_ref_v,
+                                    "suggestion": n_sug_v,
+                                    "severity": n_sev_v,
+                                    "modify_docs": n_docs_v,
+                                    "action": n_action_v,
+                                    "correction_kind": "user_replacement",
+                                    "replaces_deprecated_index": point_idx,
+                                }
+                        if add_rep and not new_inserted:
+                            pass
+                        else:
+                            points[point_idx] = base
+                            corrected_for_log = dict(base)
+                            if new_inserted:
+                                points.insert(point_idx + 1, new_inserted)
+                                corrected_for_log["replacement_point_added"] = new_inserted
+                            _recount_severity(report)
+                            _persist(corrected_for_log, original_snap)
+                            if parent_batch_report is not None and sub_report_index is not None:
+                                _aggregate_batch_report_totals(parent_batch_report)
+                                update_audit_report(report_id, parent_batch_report)
+                            else:
+                                update_audit_report(report_id, report)
+                            st.success("已弃用本条" + ("，并已插入新审核点。" if new_inserted else "。") + (" 已写入知识库。" if feed_kb else ""))
+                            st.session_state[f"editing_{report_id}_{point_idx + 1}"] = False
+                            for _k in close_state_keys or []:
+                                st.session_state.pop(_k, None)
+                            _invalidate_audit_history_cache()
+                            _streamlit_rerun()
                     else:
-                        update_audit_report(report_id, report)
-
-                if feed_kb:
-                    _feed_correction_to_kb(collection, report.get("file_name", ""), corrected_point)
-
-                add_operation_log(
-                    op_type=OP_TYPE_CORRECTION,
-                    collection=collection,
-                    file_name=report.get("file_name", ""),
-                    extra={"report_id": report_id, "point_index": point_idx,
-                           "fed_to_kb": feed_kb, "corrected": corrected_point},
-                    model_info=get_current_model_info(),
-                )
-                st.success("纠正已保存！" + ("已写入知识库。" if feed_kb else ""))
-                st.session_state[f"editing_{report_id}_{point_idx + 1}"] = False
+                        corrected_point = dict(point)
+                        corrected_point["description"] = st.session_state.get(f"{prefix}_desc", point.get("description", ""))
+                        corrected_point["severity"] = st.session_state.get(f"{prefix}_sev", point.get("severity", "info"))
+                        corrected_point["regulation_ref"] = st.session_state.get(f"{prefix}_ref", point.get("regulation_ref", ""))
+                        corrected_point["suggestion"] = st.session_state.get(f"{prefix}_sug", point.get("suggestion", ""))
+                        corrected_point["modify_docs"] = (
+                            st.session_state.get(f"{prefix}_modify_docs")
+                            if doc_names
+                            else (point.get("modify_docs") or [])
+                        )
+                        corrected_point["action"] = st.session_state.get(f"{prefix}_action", ACTION_OPTIONS[0])
+                        corrected_point.pop("correction_kind", None)
+                        corrected_point.pop("false_positive_reason", None)
+                        corrected_point.pop("deprecated", None)
+                        points[point_idx] = corrected_point
+                        _recount_severity(report)
+                        _persist(corrected_point, original_snap)
+                        if parent_batch_report is not None and sub_report_index is not None:
+                            _aggregate_batch_report_totals(parent_batch_report)
+                            update_audit_report(report_id, parent_batch_report)
+                        else:
+                            update_audit_report(report_id, report)
+                        st.success("纠正已保存！" + ("已写入知识库。" if feed_kb else ""))
+                        st.session_state[f"editing_{report_id}_{point_idx + 1}"] = False
+                        for _k in close_state_keys or []:
+                            st.session_state.pop(_k, None)
+                        _invalidate_audit_history_cache()
+                        _streamlit_rerun()
             except Exception as e:
                 st.error(f"保存纠正失败：{e}")
     with col_cancel:
         if st.button("取消纠正", key=f"{prefix}_cancel"):
             st.session_state[f"editing_{report_id}_{point_idx + 1}"] = False
-            st.experimental_rerun()
+            for _k in close_state_keys or []:
+                st.session_state.pop(_k, None)
+            _streamlit_rerun()
+
+
+def _markdown_text_with_hover_title(label: str, text: str, max_preview: int = 200) -> None:
+    """长文本用浏览器原生 title 悬停显示全文（cursor:help）。"""
+    t = (text or "").strip()
+    if not t:
+        return
+    lab = html.escape(label, quote=False)
+    if len(t) <= max_preview:
+        st.markdown(f"**{lab}** {html.escape(t, quote=False)}")
+        return
+    preview = t[:max_preview] + "…"
+    title_attr = html.escape(t.replace("\r", " ")[:12000], quote=True)
+    prev_esc = html.escape(preview, quote=False)
+    st.markdown(
+        f'<p><strong>{lab}</strong> '
+        f'<span style="border-bottom:1px dotted #888;cursor:help" title="{title_attr}">{prev_esc}</span></p>',
+        unsafe_allow_html=True,
+    )
+
+
+def _streamlit_rerun():
+    """统一 rerun，避免 experimental_rerun 在部分版本上卡住或行为异常。"""
+    fn = getattr(st, "rerun", None)
+    if callable(fn):
+        fn()
+    else:
+        st.experimental_rerun()
+
+
+def _invalidate_audit_history_cache():
+    """写入历史报告/纠正后调用，下次再读列表时重新查库。"""
+    st.session_state["_audit_hist_reload"] = True
+
+
+def _get_cached_audit_reports(collection: str, limit: int = 100) -> list:
+    """同一次浏览复用列表，避免每次整页重跑都查库；写库后需 _invalidate_audit_history_cache。"""
+    snap_k = "_audit_hist_snap_v1"
+    if st.session_state.pop("_audit_hist_reload", None):
+        st.session_state.pop(snap_k, None)
+    snap = st.session_state.get(snap_k)
+    if not snap or snap.get("c") != collection:
+        st.session_state[snap_k] = {
+            "c": collection,
+            "rows": get_audit_reports(collection=collection, limit=limit),
+        }
+    return st.session_state[snap_k]["rows"]
+
+
+def _point_row_label(p: dict, j: int) -> str:
+    pre = "〔弃〕" if p.get("deprecated") else ("〔误〕" if p.get("correction_kind") == "false_positive" or p.get("false_positive_reason") else "")
+    cat = (p.get("category") or "")[:24]
+    d = (p.get("description") or "").replace("\n", " ")[:42]
+    return f"{j + 1}. {pre}{cat} — {d}{'…' if len(p.get('description') or '') > 42 else ''}"
 
 
 def _recount_severity(report: dict):
-    """根据审核点重新统计各严重程度计数"""
+    """根据审核点重新统计各严重程度计数（弃用 deprecated 的点不计入）"""
     counts = {"high": 0, "medium": 0, "low": 0, "info": 0}
-    for p in report.get("audit_points", []):
-        s = p.get("severity", "info")
+    points = report.get("audit_points") or []
+    for p in points:
+        if p.get("deprecated"):
+            continue
+        s = (p.get("severity") or "info").lower()
+        if s not in counts:
+            s = "info"
         counts[s] = counts.get(s, 0) + 1
     report["high_count"] = counts["high"]
     report["medium_count"] = counts["medium"]
     report["low_count"] = counts["low"]
     report["info_count"] = counts["info"]
-    report["total_points"] = sum(counts.values())
+    report["total_points"] = len([p for p in points if not p.get("deprecated")])
 
 
 def _feed_correction_to_kb(collection: str, file_name: str, corrected_point: dict):
-    """将纠正内容作为知识文档写入审核点知识库（含多文档一致性：位置、需修改的文档等）。"""
+    """将误报/弃用/修订写入独立「用户审核反馈」向量库与 knowledge_docs，与第二步审核点清单库区分。"""
     from langchain.schema import Document
-    content = (
-        f"[审核纠正经验] 文件：{file_name}\n"
-        f"类别：{corrected_point.get('category', '')}\n"
-        f"严重程度：{corrected_point.get('severity', '')}\n"
-        f"问题描述：{corrected_point.get('description', '')}\n"
-        f"法规依据：{corrected_point.get('regulation_ref', '')}\n"
-        f"修改建议：{corrected_point.get('suggestion', '')}"
+
+    is_fp = corrected_point.get("correction_kind") == "false_positive" or bool(
+        (corrected_point.get("false_positive_reason") or "").strip()
     )
+    is_dep = bool(corrected_point.get("deprecated"))
+    repl = corrected_point.get("replacement_point_added")
+
+    if is_fp:
+        feedback_kind = "false_positive"
+        content = (
+            f"[用户反馈·误报] 入库分类：{feedback_kind}（非审核点清单原文）\n"
+            f"关联文件：{file_name}\n"
+            f"人工标记为误报。原因：{corrected_point.get('false_positive_reason', '')}\n"
+            f"原审核类别：{corrected_point.get('category', '')}\n"
+            f"原问题描述：{corrected_point.get('description', '')}\n"
+            f"原位置：{corrected_point.get('location', '')}\n"
+            f"原法规依据：{corrected_point.get('regulation_ref', '')}\n"
+            f"说明：若待审文档与上述原审核点在语义上等价，**不得**再输出该审核点。"
+        )
+    elif is_dep:
+        feedback_kind = "deprecated_with_replacement" if repl else "deprecated"
+        content = (
+            f"[用户反馈·弃用审核点] 入库分类：{feedback_kind}（非审核点清单原文）\n"
+            f"关联文件：{file_name}\n"
+            f"弃用说明：{corrected_point.get('deprecation_note', '')}\n"
+            f"原类别/描述摘要：{corrected_point.get('category', '')} / {corrected_point.get('description', '')}\n"
+        )
+        if isinstance(repl, dict):
+            content += (
+                f"\n同时新增替代审核点：类别={repl.get('category', '')}；描述={repl.get('description', '')}；"
+                f"建议={repl.get('suggestion', '')}"
+            )
+    else:
+        feedback_kind = "revision"
+        content = (
+            f"[用户反馈·修订后结论] 入库分类：{feedback_kind}（非审核点清单原文）\n"
+            f"关联文件：{file_name}\n"
+            f"类别：{corrected_point.get('category', '')}\n"
+            f"严重程度：{corrected_point.get('severity', '')}\n"
+            f"问题描述（修订后）：{corrected_point.get('description', '')}\n"
+            f"法规依据：{corrected_point.get('regulation_ref', '')}\n"
+            f"修改建议：{corrected_point.get('suggestion', '')}"
+        )
     loc = corrected_point.get("location") or ""
     if loc:
         content += f"\n位置/涉及文档：{loc}"
     modify_docs = corrected_point.get("modify_docs")
     if isinstance(modify_docs, list) and modify_docs:
         content += f"\n需修改的文档：{', '.join(modify_docs)}"
-    doc = Document(page_content=content, metadata={
-        "source": f"correction:{file_name}",
-        "type": "audit_correction",
-    })
+
+    safe_fn = (file_name or "doc").replace("\\", "/").split("/")[-1][:120]
+    logical_name = f"user_fb_{feedback_kind}__{safe_fn}"
+
+    doc = Document(
+        page_content=content,
+        metadata={
+            "kb_entry_class": "user_audit_feedback",
+            "feedback_kind": feedback_kind,
+            "type": "audit_user_feedback",
+            "origin_file_name": file_name or "",
+            "collection_tag": collection or "",
+        },
+    )
     try:
         agent = init_agent()
-        agent.checkpoint_kb.add_documents([doc], file_name=f"[纠正]{file_name}")
+        agent.checkpoint_feedback_kb.add_documents(
+            [doc],
+            file_name=logical_name,
+            category="audit_user_feedback",
+        )
     except Exception:
         pass
 
@@ -4329,6 +4857,8 @@ def _render_reports_table_layout(
     for r_idx, r in enumerate(reports):
         fn = r.get("original_filename", r.get("file_name", "未知"))
         for p in r.get("audit_points") or []:
+            if p.get("deprecated"):
+                continue
             action = p.get("action") or _get_multi_doc_default_action(p.get("severity", "info"))
             if action == "立即修改":
                 all_immediate.append((fn, p, r))
@@ -4339,6 +4869,7 @@ def _render_reports_table_layout(
             "high": "立即修改", "medium": "立即修改", "low": "延期修改", "info": "无需修改",
         }
         _get_action = lambda s: _da.get((s or "info").lower(), "无需修改")
+        _batch_ready = f"_batch_todo_heavy_ready{key_suffix}"
         batch_todo_cols = st.columns(5)
         with batch_todo_cols[0]:
             csv_bytes = report_todo_to_csv(
@@ -4357,58 +4888,68 @@ def _render_reports_table_layout(
                 key=f"batch_todo_csv_dl{key_suffix}",
                 help="导出本批次全部「立即修改」审核点为待办 CSV",
             )
-        with batch_todo_cols[1]:
-            try:
-                pdf_bytes = report_todo_to_pdf(
-                    reports,
-                    only_immediate=True,
-                    get_default_action=_get_action,
-                    project_name=meta.get("project_name", ""),
-                    product=meta.get("product_name", ""),
-                    country=meta.get("registration_country", ""),
+        if st.session_state.get(_batch_ready):
+            with batch_todo_cols[1]:
+                try:
+                    pdf_bytes = report_todo_to_pdf(
+                        reports,
+                        only_immediate=True,
+                        get_default_action=_get_action,
+                        project_name=meta.get("project_name", ""),
+                        product=meta.get("product_name", ""),
+                        country=meta.get("registration_country", ""),
+                    )
+                    st.download_button(f"📥 全部待办 PDF", data=pdf_bytes, file_name="audit_todo_batch.pdf", mime="application/pdf", key=f"batch_todo_pdf_dl{key_suffix}")
+                except Exception as e:
+                    st.caption(f"PDF 失败: {e}")
+            with batch_todo_cols[2]:
+                try:
+                    docx_bytes = report_todo_to_docx(
+                        reports,
+                        only_immediate=True,
+                        get_default_action=_get_action,
+                        project_name=meta.get("project_name", ""),
+                        product=meta.get("product_name", ""),
+                        country=meta.get("registration_country", ""),
+                    )
+                    st.download_button("📥 全部待办 Word", data=docx_bytes, file_name="audit_todo_batch.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"batch_todo_docx_dl{key_suffix}")
+                except Exception as e:
+                    st.caption(f"Word 失败: {e}")
+            with batch_todo_cols[3]:
+                try:
+                    xlsx_bytes = report_todo_to_excel(
+                        reports,
+                        only_immediate=True,
+                        get_default_action=_get_action,
+                        project_name=meta.get("project_name", ""),
+                        product=meta.get("product_name", ""),
+                        country=meta.get("registration_country", ""),
+                    )
+                    st.download_button("📥 全部待办 Excel", data=xlsx_bytes, file_name="audit_todo_batch.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"batch_todo_xlsx_dl{key_suffix}")
+                except Exception as e:
+                    st.caption(f"Excel 失败: {e}")
+            with batch_todo_cols[4]:
+                todo_lines = []
+                for idx, (fn, p, _r) in enumerate(all_immediate, 1):
+                    todo_lines.append(f"{idx}. [{fn}] {p.get('category', '')}：{p.get('description', '')[:100]}")
+                    todo_lines.append(f"   修改建议：{p.get('suggestion', '')[:120]}")
+                    todo_lines.append("")
+                st.download_button(
+                    "📥 全部待办（文本）",
+                    data="\n".join(todo_lines),
+                    file_name="audit_todo_batch.txt",
+                    mime="text/plain",
+                    key=f"batch_todo_txt_dl{key_suffix}",
                 )
-                st.download_button(f"📥 全部待办 PDF", data=pdf_bytes, file_name="audit_todo_batch.pdf", mime="application/pdf", key=f"batch_todo_pdf_dl{key_suffix}")
-            except Exception as e:
-                st.caption(f"PDF 生成失败: {e}")
-        with batch_todo_cols[2]:
-            try:
-                docx_bytes = report_todo_to_docx(
-                    reports,
-                    only_immediate=True,
-                    get_default_action=_get_action,
-                    project_name=meta.get("project_name", ""),
-                    product=meta.get("product_name", ""),
-                    country=meta.get("registration_country", ""),
-                )
-                st.download_button("📥 全部待办 Word", data=docx_bytes, file_name="audit_todo_batch.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"batch_todo_docx_dl{key_suffix}")
-            except Exception as e:
-                st.caption(f"Word 生成失败: {e}")
-        with batch_todo_cols[3]:
-            try:
-                xlsx_bytes = report_todo_to_excel(
-                    reports,
-                    only_immediate=True,
-                    get_default_action=_get_action,
-                    project_name=meta.get("project_name", ""),
-                    product=meta.get("product_name", ""),
-                    country=meta.get("registration_country", ""),
-                )
-                st.download_button("📥 全部待办 Excel", data=xlsx_bytes, file_name="audit_todo_batch.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"batch_todo_xlsx_dl{key_suffix}")
-            except Exception as e:
-                st.caption(f"Excel 生成失败: {e}")
-        with batch_todo_cols[4]:
-            todo_lines = []
-            for idx, (fn, p, _r) in enumerate(all_immediate, 1):
-                todo_lines.append(f"{idx}. [{fn}] {p.get('category', '')}：{p.get('description', '')[:100]}")
-                todo_lines.append(f"   修改建议：{p.get('suggestion', '')[:120]}")
-                todo_lines.append("")
-            st.download_button(
-                "📥 全部待办（文本）",
-                data="\n".join(todo_lines),
-                file_name="audit_todo_batch.txt",
-                mime="text/plain",
-                key=f"batch_todo_txt_dl{key_suffix}",
-            )
+            if st.button("收起 PDF/Word/Excel 导出", key=f"_batch_todo_hide{key_suffix}"):
+                st.session_state.pop(_batch_ready, None)
+                _streamlit_rerun()
+        else:
+            with batch_todo_cols[1]:
+                st.caption("PDF/Word/Excel 生成较慢")
+            if st.button("📥 加载本批 PDF/Word/Excel/文本导出", key=f"_batch_todo_show{key_suffix}", help="点击后再生成，避免每次打开报告都卡顿"):
+                st.session_state[_batch_ready] = True
+                _streamlit_rerun()
 
     st.markdown("### 审核点详情")
     for r_idx, report in enumerate(reports):
@@ -4433,38 +4974,63 @@ def _render_reports_table_layout(
 
         with doc_container:
             if points:
-                for i, p in enumerate(points):
+                rows_h = [
+                    "<table style='width:100%;border-collapse:collapse;font-size:0.92rem'>",
+                    "<thead><tr><th>#</th><th>级别</th><th>类别</th><th>摘要（悬停看全文）</th></tr></thead><tbody>",
+                ]
+                for j, p in enumerate(points):
                     sev = p.get("severity", "info")
                     icon = _SEVERITY_ICONS.get(sev, "ℹ️")
-                    action = p.get("action") or _get_multi_doc_default_action(sev)
-                    desc_short = (p.get("description") or "")[:60] + ("…" if len(p.get("description", "")) > 60 else "")
-                    cols = st.columns([0.5, 0.8, 1, 3, 1.2])
-                    cols[0].markdown(f"**{i+1}**")
-                    cols[1].markdown(f"{icon} {_SEVERITY_LABELS.get(sev, sev)}")
-                    cols[2].markdown(p.get("category", ""))
-                    cols[3].markdown(desc_short)
-                    btn_key = f"detail_{pk}_{i}{key_suffix}"
-                    if cols[4].button("📋 详情", key=btn_key):
-                        st.session_state[f"_show_detail_{pk}_{i}"] = True
-                        st.experimental_rerun()
+                    lab = _SEVERITY_LABELS.get(sev, sev)
+                    full = (p.get("description") or "").replace("\n", " ").replace("\r", " ").strip()
+                    if p.get("deprecated"):
+                        full = "〔弃用〕" + full
+                    elif p.get("correction_kind") == "false_positive" or p.get("false_positive_reason"):
+                        full = "〔误报〕" + full
+                    short_txt = full[:52] + ("…" if len(full) > 52 else "")
+                    short_esc = html.escape(short_txt, quote=False)
+                    title_attr = html.escape(full[:12000], quote=True)
+                    sev_cell = html.escape(f"{icon}{lab}", quote=False)
+                    cat_cell = html.escape((p.get("category") or "")[:26], quote=False)
+                    rows_h.append(
+                        f"<tr><td>{j + 1}</td><td>{sev_cell}</td><td>{cat_cell}</td>"
+                        f'<td><span style="border-bottom:1px dotted #888;cursor:help" title="{title_attr}">{short_esc}</span></td></tr>'
+                    )
+                rows_h.append("</tbody></table>")
+                st.markdown("\n".join(rows_h), unsafe_allow_html=True)
+                sel_pt = st.selectbox(
+                    f"选择审核点（仅展开这一条）· {file_name[:40]}",
+                    options=list(range(len(points))),
+                    format_func=lambda j: _point_row_label(points[j], j),
+                    key=f"apt_sel_{pk}{key_suffix}",
+                )
+                _render_point_detail_inline(
+                    report,
+                    r_idx,
+                    reports,
+                    sel_pt,
+                    points[sel_pt],
+                    pk=pk,
+                    key_suffix=key_suffix,
+                    history_id=history_id,
+                    parent_batch_report=parent_batch_report,
+                    detail_scope_suffix=key_suffix,
+                )
 
-                    if st.session_state.get(f"_show_detail_{pk}_{i}"):
-                        _render_point_detail_inline(
-                            report, r_idx, reports, i, p,
-                            pk=pk, key_suffix=key_suffix,
-                            history_id=history_id,
-                            parent_batch_report=parent_batch_report,
-                        )
-
-            # 本文档待办导出
-            doc_immediate = [p for p in points if (p.get("action") or _get_multi_doc_default_action(p.get("severity", "info"))) == "立即修改"]
+            # 本文档待办导出（默认仅 CSV；PDF/Word/Excel 按需加载，避免每行详情都触发整页重算卡顿）
+            doc_immediate = [
+                p for p in points
+                if not p.get("deprecated")
+                and (p.get("action") or _get_multi_doc_default_action(p.get("severity", "info"))) == "立即修改"
+            ]
             if doc_immediate:
                 st.markdown(f"**📋 本文档待办（{len(doc_immediate)} 项）**")
                 _da2 = st.session_state.get("multi_doc_default_action") or {
                     "high": "立即修改", "medium": "立即修改", "low": "延期修改", "info": "无需修改",
                 }
                 _get_action_doc = lambda s: _da2.get((s or "info").lower(), "无需修改")
-                c_doc1, c_doc2, c_doc3, c_doc4, c_doc5 = st.columns(5)
+                _doc_heavy = f"_doc_todo_heavy_{pk}{key_suffix}"
+                c_doc1, c_doc2 = st.columns(2)
                 with c_doc1:
                     single_csv = report_todo_to_csv(
                         [report],
@@ -4481,58 +5047,67 @@ def _render_reports_table_layout(
                         mime="text/csv; charset=utf-8",
                         key=f"doc_todo_csv_{pk}{key_suffix}",
                     )
-                with c_doc2:
-                    try:
-                        single_pdf = report_todo_to_pdf(
-                            [report],
-                            only_immediate=True,
-                            get_default_action=_get_action_doc,
-                            project_name=meta.get("project_name", ""),
-                            product=meta.get("product_name", ""),
-                            country=meta.get("registration_country", ""),
+                if st.session_state.get(_doc_heavy):
+                    c2, c3, c4, c5 = st.columns(4)
+                    with c2:
+                        try:
+                            single_pdf = report_todo_to_pdf(
+                                [report],
+                                only_immediate=True,
+                                get_default_action=_get_action_doc,
+                                project_name=meta.get("project_name", ""),
+                                product=meta.get("product_name", ""),
+                                country=meta.get("registration_country", ""),
+                            )
+                            st.download_button("📥 PDF", data=single_pdf, file_name=f"待办_{file_name}.pdf", mime="application/pdf", key=f"doc_todo_pdf_{pk}{key_suffix}")
+                        except Exception:
+                            st.caption("PDF 失败")
+                    with c3:
+                        try:
+                            single_docx = report_todo_to_docx(
+                                [report],
+                                only_immediate=True,
+                                get_default_action=_get_action_doc,
+                                project_name=meta.get("project_name", ""),
+                                product=meta.get("product_name", ""),
+                                country=meta.get("registration_country", ""),
+                            )
+                            st.download_button("📥 Word", data=single_docx, file_name=f"待办_{file_name}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"doc_todo_docx_{pk}{key_suffix}")
+                        except Exception:
+                            st.caption("Word 失败")
+                    with c4:
+                        try:
+                            single_xlsx = report_todo_to_excel(
+                                [report],
+                                only_immediate=True,
+                                get_default_action=_get_action_doc,
+                                project_name=meta.get("project_name", ""),
+                                product=meta.get("product_name", ""),
+                                country=meta.get("registration_country", ""),
+                            )
+                            st.download_button("📥 Excel", data=single_xlsx, file_name=f"待办_{file_name}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"doc_todo_xlsx_{pk}{key_suffix}")
+                        except Exception:
+                            st.caption("Excel 失败")
+                    with c5:
+                        single_lines = []
+                        for idx, p in enumerate(doc_immediate, 1):
+                            single_lines.append(f"{idx}. {p.get('category', '')}：{p.get('description', '')[:100]}")
+                            single_lines.append(f"   修改建议：{p.get('suggestion', '')[:120]}")
+                            single_lines.append("")
+                        st.download_button(
+                            "📥 文本",
+                            data="\n".join(single_lines),
+                            file_name=f"待办_{file_name}.txt",
+                            mime="text/plain",
+                            key=f"doc_todo_txt_{pk}{key_suffix}",
                         )
-                        st.download_button("📥 本文档待办 PDF", data=single_pdf, file_name=f"待办_{file_name}.pdf", mime="application/pdf", key=f"doc_todo_pdf_{pk}{key_suffix}")
-                    except Exception:
-                        st.caption("PDF 失败")
-                with c_doc3:
-                    try:
-                        single_docx = report_todo_to_docx(
-                            [report],
-                            only_immediate=True,
-                            get_default_action=_get_action_doc,
-                            project_name=meta.get("project_name", ""),
-                            product=meta.get("product_name", ""),
-                            country=meta.get("registration_country", ""),
-                        )
-                        st.download_button("📥 本文档待办 Word", data=single_docx, file_name=f"待办_{file_name}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"doc_todo_docx_{pk}{key_suffix}")
-                    except Exception:
-                        st.caption("Word 失败")
-                with c_doc4:
-                    try:
-                        single_xlsx = report_todo_to_excel(
-                            [report],
-                            only_immediate=True,
-                            get_default_action=_get_action_doc,
-                            project_name=meta.get("project_name", ""),
-                            product=meta.get("product_name", ""),
-                            country=meta.get("registration_country", ""),
-                        )
-                        st.download_button("📥 本文档待办 Excel", data=single_xlsx, file_name=f"待办_{file_name}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"doc_todo_xlsx_{pk}{key_suffix}")
-                    except Exception:
-                        st.caption("Excel 失败")
-                with c_doc5:
-                    single_lines = []
-                    for idx, p in enumerate(doc_immediate, 1):
-                        single_lines.append(f"{idx}. {p.get('category', '')}：{p.get('description', '')[:100]}")
-                        single_lines.append(f"   修改建议：{p.get('suggestion', '')[:120]}")
-                        single_lines.append("")
-                    st.download_button(
-                        "📥 本文档待办（文本）",
-                        data="\n".join(single_lines),
-                        file_name=f"待办_{file_name}.txt",
-                        mime="text/plain",
-                        key=f"doc_todo_txt_{pk}{key_suffix}",
-                    )
+                    if st.button("收起慢速导出", key=f"_doc_todo_hide_{pk}{key_suffix}"):
+                        st.session_state.pop(_doc_heavy, None)
+                        _streamlit_rerun()
+                else:
+                    if st.button("加载本文档 PDF/Word/Excel（较慢）", key=f"_doc_todo_show_{pk}{key_suffix}"):
+                        st.session_state[_doc_heavy] = True
+                        _streamlit_rerun()
 
 
 def _render_point_detail_inline(
@@ -4541,16 +5116,35 @@ def _render_point_detail_inline(
     pk: str, key_suffix: str,
     history_id: int = 0,
     parent_batch_report: dict = None,
+    detail_scope_suffix: str = "",
 ):
-    """在审核点行下方展开的详情/编辑面板（替代弹窗，兼容所有 Streamlit 版本）。"""
+    """在审核点行下方展开的详情/编辑面板。同一时间仅展开一条详情（按 detail_scope_suffix 区分），关闭用 _streamlit_rerun。"""
     sev = point.get("severity", "info")
     icon = _SEVERITY_ICONS.get(sev, "ℹ️")
+    _detail_scope = detail_scope_suffix if detail_scope_suffix is not None else ""
     detail_key = f"_show_detail_{pk}_{point_idx}"
     file_name = report.get("original_filename", report.get("file_name", "未知"))
     doc_names = report.get("related_doc_names") or []
+    hist_corr_key = f"_hist_corr_{history_id}_{pk}_{point_idx}{key_suffix}" if history_id else ""
 
     with st.container():
         st.markdown(f"---\n**{icon} 审核点 {point_idx + 1} 详情 — {point.get('category', '未分类')}**")
+
+        if history_id and hist_corr_key and st.session_state.get(hist_corr_key):
+            st.info("**纠正模式**：修改后点「保存纠正」将更新本条历史报告，并可勾选写入知识库供后续审核参考。")
+            _render_correction_form(
+                report,
+                history_id,
+                point_idx,
+                point,
+                parent_batch_report=parent_batch_report,
+                sub_report_index=r_idx if parent_batch_report is not None else None,
+                close_state_keys=[hist_corr_key],
+            )
+            if st.button("↩ 返回普通编辑", key=f"{pk}_detail_{point_idx}{key_suffix}_back_corr"):
+                st.session_state.pop(hist_corr_key, None)
+                _streamlit_rerun()
+            return
 
         c_info1, c_info2 = st.columns(2)
         c_info1.markdown(f"**严重程度：** {_SEVERITY_LABELS.get(sev, sev)}")
@@ -4582,18 +5176,31 @@ def _render_point_detail_inline(
                     reports[r_idx]["audit_points"][point_idx]["suggestion"] = new_sug
                     reports[r_idx]["audit_points"][point_idx]["modify_docs"] = new_modify_docs
                     reports[r_idx]["audit_points"][point_idx]["action"] = new_action
-                st.success("已保存")
                 if history_id:
                     try:
                         updated_report = parent_batch_report if parent_batch_report else report
                         from src.core.db import update_audit_report
                         update_audit_report(history_id, updated_report)
-                    except Exception:
-                        pass
+                        _invalidate_audit_history_cache()
+                        st.success("已保存到历史报告")
+                        _streamlit_rerun()
+                    except Exception as ex:
+                        st.error(f"写入历史失败：{ex}")
+                else:
+                    st.success("已保存（当前会话，刷新页面会丢失未入库的修改）")
         with c_close:
             if st.button("✖ 关闭", key=f"{pfx}_close"):
                 st.session_state.pop(detail_key, None)
-                st.experimental_rerun()
+                if hist_corr_key:
+                    st.session_state.pop(hist_corr_key, None)
+                st.session_state.pop(f"_rpt_detail_active{_detail_scope}", None)
+                _streamlit_rerun()
+
+        if history_id:
+            st.markdown("---")
+            if st.button("✏️ 纠正此审核点（写入历史 / 可选入知识库）", key=f"{pfx}_open_corr", help="与上方「保存修改」不同：会记录纠正日志，并可把经验写入审核点知识库"):
+                st.session_state[hist_corr_key] = True
+                _streamlit_rerun()
 
         st.markdown("---")
 
@@ -4816,6 +5423,430 @@ def render_knowledge_page():
             st.warning(f"加载知识库文档失败：{e}")
 
 
+def render_translation_page():
+    """文档翻译页面：单文件/文件夹/zip，仅中文→英文，保持格式与结构，可选知识库参考。"""
+    st.header("🌐 文档翻译")
+    st.markdown(
+        "面向 FDA 医疗器械认证的文档翻译：仅将中文逐句译为英文，保持原格式与目录结构，不覆盖原稿。"
+        "支持 .docx / .txt / .xlsx；可上传单文件、多文件或 zip，也可填写本地路径。"
+    )
+    st.caption("翻译结果需经人工审校后用于正式提交。支持：中文→英文/德文，英文/德文→中文。")
+
+    if not _require_provider():
+        return
+
+    # 历史翻译结果：查看与下载
+    with st.expander("📥 历史翻译结果", expanded=False):
+        try:
+            trans_logs = get_operation_logs(op_type=OP_TYPE_TRANSLATION, limit=50)
+            if not trans_logs:
+                st.caption("暂无历史翻译记录。")
+            else:
+                for rec in trans_logs:
+                    extra = rec.get("extra") or {}
+                    out_paths = extra.get("out_paths") or []
+                    created = rec.get("created_at")
+                    if hasattr(created, "strftime"):
+                        created = created.strftime("%Y-%m-%d %H:%M")
+                    else:
+                        created = str(created)[:16]
+                    st.markdown(f"**{created}** — {rec.get('file_name') or '翻译'}（共 {len(out_paths)} 个文件）")
+                    if rec.get("source"):
+                        st.caption(f"来源：{rec['source'][:80]}{'…' if len(rec.get('source','')) > 80 else ''}")
+                    for idx, p in enumerate(out_paths):
+                        p_path = Path(p)
+                        if p_path.is_file():
+                            try:
+                                data = p_path.read_bytes()
+                                st.download_button(
+                                    f"📥 {p_path.name}",
+                                    data=data,
+                                    file_name=p_path.name,
+                                    mime="application/octet-stream",
+                                    key=f"hist_dl_{rec.get('id', id(rec))}_{idx}_{p_path.name}",
+                                )
+                            except Exception:
+                                st.caption(f"无法读取：{p}")
+                        else:
+                            st.caption(f"已不存在：{p}")
+                    st.markdown("---")
+        except Exception as e:
+            st.caption(f"加载历史记录失败：{e}")
+
+    trans_cfg = get_translation_config()
+    target_lang_options = [("英文", "en"), ("德文", "de"), ("中文", "zh")]
+    target_lang_label = st.selectbox(
+        "目标语言",
+        [x[0] for x in target_lang_options],
+        index=next((i for i, (_, v) in enumerate(target_lang_options) if v == trans_cfg.get("target_lang", "en")), 0),
+        key="translation_target_lang",
+    )
+    target_lang = next(v for lbl, v in target_lang_options if lbl == target_lang_label)
+
+    with st.expander("公司信息翻译配置（可选）", expanded=False):
+        st.caption("翻译时遇到公司名称、地址、联系人、电话等将优先使用下列译法，保证全文一致。留空则不强制。")
+        cc = trans_cfg.get("company_config") or {}
+        c_company = st.text_input("公司名称（目标语言）", value=cc.get("company_name", "") or "", key="trans_company_name")
+        c_address = st.text_input("地址（目标语言）", value=cc.get("address", "") or "", key="trans_address")
+        c_contact = st.text_input("联系人（目标语言）", value=cc.get("contact", "") or "", key="trans_contact")
+        c_phone = st.text_input("电话", value=cc.get("phone", "") or "", key="trans_phone")
+        c_fax = st.text_input("传真", value=cc.get("fax", "") or "", key="trans_fax")
+        c_email = st.text_input("邮箱", value=cc.get("email", "") or "", key="trans_email")
+        if st.button("保存公司信息配置", key="trans_save_company"):
+            save_translation_config(target_lang=target_lang, company_config={
+                "company_name": c_company.strip(),
+                "address": c_address.strip(),
+                "contact": c_contact.strip(),
+                "phone": c_phone.strip(),
+                "fax": c_fax.strip(),
+                "email": c_email.strip(),
+            })
+            st.success("已保存，翻译时将使用上述译法。")
+
+    company_overrides = {k: v for k, v in {
+        "company_name": c_company.strip(),
+        "address": c_address.strip(),
+        "contact": c_contact.strip(),
+        "phone": c_phone.strip(),
+        "fax": c_fax.strip(),
+        "email": c_email.strip(),
+    }.items() if v}
+    if not company_overrides and (trans_cfg.get("company_config") or {}):
+        company_overrides = trans_cfg["company_config"]
+    company_overrides = company_overrides or None
+
+    collection = st.session_state.get("collection_name", "regulations")
+    st.caption(f"当前知识库：**{collection}**（与第一步训练、第三步文档审核相同）。")
+    use_kb = st.checkbox("使用知识库（词条/法规/案例）作为术语与风格参考", value=True, key="translation_use_kb")
+    col_name = collection if use_kb else None
+
+    trans_proj_mode = st.radio(
+        "翻译上下文（与第三步「文档审核」一致，用于知识库检索与术语对齐）",
+        ["通用（仅按当前知识库检索）", "按项目（选用与审核相同的项目与注册维度）"],
+        horizontal=True,
+        key="translation_proj_mode",
+    )
+    kb_query_extra = ""
+    trans_project_id = None
+    if trans_proj_mode.startswith("按项目"):
+        projects = _cached_list_projects(collection)
+        if not projects:
+            st.warning("当前知识库下暂无项目。请先在「② 审核点管理」→「项目与专属资料」创建项目，或改用「通用」。")
+        else:
+            dims = _cached_dimension_options()
+            countries = dims.get("registration_countries", ["中国", "美国", "欧盟"]) or ["中国", "美国", "欧盟"]
+            forms = dims.get("project_forms", ["Web", "APP", "PC"]) or ["Web", "APP", "PC"]
+            proj_names = [p["name"] for p in projects]
+            selected_name = st.selectbox(
+                "选择翻译所属项目",
+                proj_names,
+                key="translation_proj_name",
+                help="与第三步「按项目审核」使用同一项目列表；检索词条/法规/案例时会带上项目与产品信息。",
+            )
+            proj = next((p for p in projects if p["name"] == selected_name), None)
+            if proj:
+                trans_project_id = proj.get("id")
+                _country = proj.get("registration_country")
+                _type = proj.get("registration_type")
+                _comp = proj.get("registration_component")
+                _form = proj.get("project_form")
+                tc1, tc2 = st.columns(2)
+                with tc1:
+                    sel_tr_c = st.multiselect(
+                        "注册国家", countries,
+                        default=[_country] if _country in countries else [],
+                        key="trans_dim_countries",
+                    )
+                    sel_tr_t = st.multiselect(
+                        "适用注册类别", REGISTRATION_TYPES,
+                        default=[_type] if _type in REGISTRATION_TYPES else [],
+                        key="trans_dim_types",
+                    )
+                with tc2:
+                    sel_tr_comp = st.multiselect(
+                        "注册组成", REGISTRATION_COMPONENTS,
+                        default=[_comp] if _comp in REGISTRATION_COMPONENTS else [],
+                        key="trans_dim_components",
+                    )
+                    sel_tr_f = st.multiselect(
+                        "项目形态", forms,
+                        default=[_form] if _form in forms else [],
+                        key="trans_dim_forms",
+                    )
+                hint_parts = [
+                    proj.get("name") or "",
+                    proj.get("product_name") or "",
+                    proj.get("name_en") or "",
+                    proj.get("product_name_en") or "",
+                    proj.get("model") or "",
+                    proj.get("model_en") or "",
+                    (proj.get("scope_of_application") or "")[:500],
+                    " ".join(sel_tr_c or []),
+                    " ".join(sel_tr_t or []),
+                    " ".join(sel_tr_comp or []),
+                    " ".join(sel_tr_f or []),
+                ]
+                kb_query_extra = " ".join(p for p in hint_parts if p).strip()
+    st.caption("同一批翻译任务内，相同原文只调用一次模型并复用译法，多文件与表格内术语更易保持一致。")
+
+    input_mode = st.radio("输入方式", ["上传文件", "本地路径"], horizontal=True, key="translation_input_mode")
+    input_path = None
+    uploaded_files = []
+
+    if input_mode == "上传文件":
+        uploaded_files = st.file_uploader(
+            "选择文件或 .zip",
+            type=["docx", "txt", "xlsx", "zip"],
+            accept_multiple_files=True,
+            key="translation_upload",
+        )
+        if not uploaded_files:
+            st.info("请上传至少一个 .docx / .txt / .xlsx 或一个 .zip。")
+            return
+    else:
+        input_path = st.text_input(
+            "输入文件或文件夹路径",
+            placeholder="例如：C:\\docs\\file.docx 或 D:\\project\\docs",
+            key="translation_path",
+        )
+        if not (input_path and input_path.strip()):
+            st.info("请填写要翻译的文件或文件夹路径。")
+            return
+        input_path = input_path.strip()
+
+    output_dir = st.text_input(
+        "输出目录（可选，留空则单文件为同目录、目录/zip 为 xxx_translated）",
+        placeholder="留空使用默认",
+        key="translation_output_dir",
+    )
+    output_dir = output_dir.strip() or None
+
+    st.markdown("---")
+    st.subheader("🛠️ 翻译校正（已翻译文件）")
+    st.caption("自动修复：同词异译、截断词、数值表达模式（如 10-2 → 10^-2）等问题。")
+    corr_input_mode = st.radio("校正输入方式", ["上传文件", "本地路径"], horizontal=True, key="corr_input_mode")
+    corr_input_path = None
+    corr_uploaded = []
+    if corr_input_mode == "上传文件":
+        corr_uploaded = st.file_uploader(
+            "选择已翻译文件或 .zip",
+            type=["docx", "txt", "xlsx", "zip"],
+            accept_multiple_files=True,
+            key="corr_upload",
+        )
+    else:
+        corr_input_path = st.text_input(
+            "校正文件/目录路径",
+            placeholder="例如：C:\\docs\\translated.docx 或 D:\\translated_docs",
+            key="corr_path",
+        ).strip()
+    corr_output_dir = st.text_input(
+        "校正输出目录（可选，留空用默认）",
+        placeholder="留空使用默认",
+        key="corr_output_dir",
+    ).strip() or None
+    corr_lang = st.selectbox("校正语言", ["英文", "德文", "中文"], index=0, key="corr_lang")
+    corr_lang_map = {"英文": "en", "德文": "de", "中文": "zh"}
+    corr_use_kb = st.checkbox("校正补全时使用知识库（建议开启）", value=True, key="corr_use_kb")
+    if st.button("开始校正", key="translation_correct_run"):
+        from src.translation.pipeline import correct_path
+        from src.translation.models import SUPPORTED_EXTENSIONS
+        try:
+            if corr_input_mode == "上传文件":
+                import tempfile
+                root = Path(tempfile.mkdtemp(prefix="aicheckword_correct_"))
+                to_process = []
+                for uf in corr_uploaded:
+                    ext = Path(uf.name).suffix.lower()
+                    if ext == ".zip":
+                        zpath = root / uf.name
+                        zpath.write_bytes(uf.getvalue())
+                        to_process.append(str(zpath))
+                    elif ext in SUPPORTED_EXTENSIONS:
+                        fpath = root / uf.name
+                        fpath.write_bytes(uf.getvalue())
+                        to_process.append(str(fpath))
+                if not to_process:
+                    st.warning("请先上传要校正的文件。")
+                else:
+                    out_paths, summary = [], {}
+                    with st.spinner("⏳ 正在校正，请稍候…"):
+                        for inp in to_process:
+                            outs, s = correct_path(
+                                inp,
+                                output_dir=(corr_output_dir or str(root / "out")),
+                                target_lang=corr_lang_map[corr_lang],
+                                collection_name=(collection if corr_use_kb else None),
+                                use_kb=corr_use_kb,
+                                provider=st.session_state.get("current_provider"),
+                            )
+                            out_paths.extend(outs)
+                            for k, v in (s or {}).items():
+                                summary[k] = summary.get(k, 0) + (v or 0)
+                    if out_paths:
+                        st.success(f"✅ 校正完成，共 **{len(out_paths)}** 个文件。")
+                        st.caption(f"修复统计：改动块 {summary.get('changed_blocks',0)}；同词统一 {summary.get('term_unified',0)}；截断词修复 {summary.get('truncation_fixed',0)}；数值表达修复 {summary.get('numeric_fixed',0)}")
+                        for p in out_paths:
+                            p_path = Path(p)
+                            if p_path.is_file():
+                                st.download_button(f"📥 下载校正结果 {p_path.name}", data=p_path.read_bytes(), file_name=p_path.name, mime="application/octet-stream", key=f"dl_corr_{p_path.name}_{id(p)}")
+            else:
+                if not corr_input_path:
+                    st.warning("请填写校正路径。")
+                else:
+                    with st.spinner("⏳ 正在校正，请稍候…"):
+                        out_paths, summary = correct_path(
+                            corr_input_path,
+                            output_dir=corr_output_dir,
+                            target_lang=corr_lang_map[corr_lang],
+                            collection_name=(collection if corr_use_kb else None),
+                            use_kb=corr_use_kb,
+                            provider=st.session_state.get("current_provider"),
+                        )
+                    if out_paths:
+                        st.success(f"✅ 校正完成，共 **{len(out_paths)}** 个文件。")
+                        st.caption(f"修复统计：改动块 {summary.get('changed_blocks',0)}；同词统一 {summary.get('term_unified',0)}；截断词修复 {summary.get('truncation_fixed',0)}；数值表达修复 {summary.get('numeric_fixed',0)}")
+                        for p in out_paths:
+                            st.code(p)
+                    else:
+                        st.warning("未找到可校正文件（支持 .docx / .txt / .xlsx）。")
+        except Exception as e:
+            st.error(f"❌ 校正失败：{e}")
+
+    if st.button("开始翻译", key="translation_run"):
+        from src.translation.pipeline import translate_path
+        from src.translation.models import SUPPORTED_EXTENSIONS
+
+        try:
+            if input_mode == "上传文件":
+                import tempfile
+                import shutil
+                root = Path(tempfile.mkdtemp(prefix="aicheckword_translate_"))
+                to_process = []
+                for uf in uploaded_files:
+                    ext = Path(uf.name).suffix.lower()
+                    if ext == ".zip":
+                        zpath = root / uf.name
+                        zpath.write_bytes(uf.getvalue())
+                        to_process.append(str(zpath))
+                    elif ext in SUPPORTED_EXTENSIONS:
+                        fpath = root / uf.name
+                        fpath.write_bytes(uf.getvalue())
+                        to_process.append(str(fpath))
+                if not to_process:
+                    st.error("未包含可翻译文件（支持 .docx / .txt / .xlsx）。")
+                    return
+                out_paths = []
+                out_dir = output_dir or str(root / "out")
+                with st.spinner("⏳ 正在翻译，请勿关闭或刷新页面…"):
+                    for idx, inp in enumerate(to_process):
+                        if len(to_process) > 1:
+                            st.caption(f"正在处理第 {idx + 1}/{len(to_process)} 个输入…")
+                        out_paths.extend(
+                            translate_path(
+                                inp,
+                                output_dir=out_dir,
+                                collection_name=col_name,
+                                use_kb=use_kb,
+                                provider=st.session_state.get("current_provider"),
+                                target_lang=target_lang,
+                                company_overrides=company_overrides,
+                                kb_query_extra=kb_query_extra or None,
+                            )
+                        )
+                if out_paths:
+                    st.success(f"✅ 翻译完成，共 **{len(out_paths)}** 个文件。请点击下方按钮下载（刷新页面后需重新翻译）。")
+                    if any(str(p).lower().endswith(".docx") for p in out_paths):
+                        st.info("📌 Word 文档中的图片、字体与版式已按原稿保留；图片未参与翻译。")
+                    for p in out_paths:
+                        p_path = Path(p)
+                        if p_path.is_file():
+                            data = p_path.read_bytes()
+                            st.download_button(
+                                f"📥 下载 {p_path.name}",
+                                data=data,
+                                file_name=p_path.name,
+                                mime="application/octet-stream",
+                                key=f"dl_trans_{p_path.name}_{id(p)}",
+                            )
+                    add_operation_log(
+                        op_type=OP_TYPE_TRANSLATION,
+                        collection=collection,
+                        file_name=f"上传 {len(out_paths)} 个文件",
+                        source="上传文件",
+                        extra={
+                            "count": len(out_paths),
+                            "out_paths": out_paths[:20],
+                            "use_kb": use_kb,
+                            "project_id": trans_project_id,
+                            "translation_context": "project" if trans_proj_mode.startswith("按项目") else "general",
+                        },
+                        model_info=get_current_model_info(),
+                    )
+                else:
+                    st.warning("未生成任何翻译文件，请检查输入。")
+                try:
+                    shutil.rmtree(root, ignore_errors=True)
+                except Exception:
+                    pass
+            else:
+                with st.spinner("⏳ 正在翻译，请勿关闭或刷新页面…"):
+                    out_paths = translate_path(
+                        input_path,
+                        output_dir=output_dir,
+                        collection_name=col_name,
+                        use_kb=use_kb,
+                        provider=st.session_state.get("current_provider"),
+                        target_lang=target_lang,
+                        company_overrides=company_overrides,
+                        kb_query_extra=kb_query_extra or None,
+                    )
+                if out_paths:
+                    st.success(f"✅ 翻译完成，共 **{len(out_paths)}** 个文件，已保存到以下路径：")
+                    if any(str(p).lower().endswith(".docx") for p in out_paths):
+                        st.info("📌 Word 文档中的图片、字体与版式已按原稿保留；图片未参与翻译。")
+                    for p in out_paths:
+                        st.code(p)
+                    add_operation_log(
+                        op_type=OP_TYPE_TRANSLATION,
+                        collection=collection,
+                        file_name=Path(input_path).name if input_path else "",
+                        source=input_path or "",
+                        extra={
+                            "count": len(out_paths),
+                            "out_paths": out_paths[:20],
+                            "use_kb": use_kb,
+                            "project_id": trans_project_id,
+                            "translation_context": "project" if trans_proj_mode.startswith("按项目") else "general",
+                        },
+                        model_info=get_current_model_info(),
+                    )
+                else:
+                    st.warning("未找到可翻译文件（支持 .docx / .txt / .xlsx）。")
+        except FileNotFoundError as e:
+            st.error(f"❌ 路径不存在：{e}")
+            add_operation_log(
+                op_type=OP_TYPE_TRANSLATION_ERROR,
+                collection=collection,
+                file_name=Path(input_path).name if input_mode != "上传文件" and input_path else "上传",
+                source=input_path or "上传文件",
+                extra={"error": str(e)},
+                model_info=get_current_model_info(),
+            )
+        except Exception as e:
+            import traceback
+            st.error(f"❌ 翻译失败：{e}")
+            st.code(traceback.format_exc(), language="text")
+            add_operation_log(
+                op_type=OP_TYPE_TRANSLATION_ERROR,
+                collection=collection,
+                file_name=Path(input_path).name if input_mode != "上传文件" and input_path else "上传",
+                source=input_path or "上传文件",
+                extra={"error": str(e), "traceback": traceback.format_exc()},
+                model_info=get_current_model_info(),
+            )
+
+
 def _op_type_label(op_type):
     """操作类型中文标签"""
     labels = {
@@ -4832,6 +5863,8 @@ def _op_type_label(op_type):
         "review_error": "❌ 审核失败",
         "review_text_error": "❌ 文本审核失败",
         OP_TYPE_CORRECTION: "✏️ 审核纠正",
+        OP_TYPE_TRANSLATION: "🌐 文档翻译",
+        OP_TYPE_TRANSLATION_ERROR: "❌ 文档翻译失败",
     }
     return labels.get(op_type, op_type)
 
@@ -4880,7 +5913,7 @@ def render_operations_page():
         op_type_filter = st.selectbox(
             "操作类型",
             ["全部", "法规训练批次", "生成审核点", "审核点训练", "项目专属训练", "项目专属训练失败/中断", "审核批次",
-             "单文件训练", "单文件审核", "文本审核", "审核纠正", "训练失败", "审核失败"],
+             "单文件训练", "单文件审核", "文本审核", "审核纠正", "文档翻译", "文档翻译失败", "训练失败", "审核失败"],
             key="op_type_filter",
         )
     with col_limit:
@@ -4898,6 +5931,8 @@ def render_operations_page():
         "单文件审核": OP_TYPE_REVIEW,
         "文本审核": OP_TYPE_REVIEW_TEXT,
         "审核纠正": OP_TYPE_CORRECTION,
+        "文档翻译": OP_TYPE_TRANSLATION,
+        "文档翻译失败": OP_TYPE_TRANSLATION_ERROR,
         "训练失败": "train_error",
         "审核失败": "review_error",
     }
@@ -4980,6 +6015,12 @@ def render_operations_page():
             title = f"{op_label} | {rec.get('file_name', '')} | 审核点 #{extra.get('point_index', 0)+1}"
             fed = "已回馈" if extra.get("fed_to_kb") else "未回馈"
             detail = f"知识库：{rec.get('collection', '')} | {fed}知识库"
+        elif rec["op_type"] == OP_TYPE_TRANSLATION:
+            title = f"{op_label} | {rec.get('file_name', '')} | 共 {extra.get('count', 0)} 个文件"
+            detail = f"来源：{rec.get('source', '')} | 知识库：{rec.get('collection', '')}" + (" | 使用知识库参考" if extra.get("use_kb") else "")
+        elif rec["op_type"] == OP_TYPE_TRANSLATION_ERROR:
+            title = f"{op_label} | {rec.get('file_name', '')}"
+            detail = f"错误：{extra.get('error', '')} | 来源：{rec.get('source', '')}"
         elif rec["op_type"] in ("train_error", "review_error", "review_text_error"):
             title = f"{op_label} | {rec.get('file_name', '')}"
             detail = f"错误：{extra.get('error', '')} | 知识库：{rec.get('collection', '')}"
@@ -4993,7 +6034,7 @@ def render_operations_page():
 
         with st.expander(f"**{rec.get('created_at', '')}** — {title}", expanded=False):
             st.caption(detail)
-            if rec["op_type"] in ("train_error", "review_error", "review_text_error", OP_TYPE_TRAIN_PROJECT_ERROR) and extra.get("traceback"):
+            if rec["op_type"] in ("train_error", "review_error", "review_text_error", OP_TYPE_TRAIN_PROJECT_ERROR, OP_TYPE_TRANSLATION_ERROR) and extra.get("traceback"):
                 st.markdown("**堆栈日志：**")
                 st.code(extra.get("traceback", ""), language="text")
             if extra:
@@ -5131,6 +6172,7 @@ def main():
             "① 法规训练 & 生成审核点",
             "② 审核点管理 & 训练",
             "③ 文档审核",
+            "🌐 文档翻译",
             "📝 提示词配置",
             "🔎 知识库查询",
             "📋 操作记录",
@@ -5138,14 +6180,20 @@ def main():
         horizontal=True,
     )
 
-    # 在蒙层上显示 loading：全屏遮罩 + 加载文案与动画，内容就绪后自动消失（不占用页面内容区域）
-    _render_loading_overlay()
+    # 仅在切换顶部功能页时短暂显示蒙层；避免编辑/纠正审核点时因任意控件重跑而反复出现「加载中」
+    _prev_nav = st.session_state.get("_main_nav_page")
+    if _prev_nav is not None and _prev_nav != page:
+        _render_loading_overlay()
+    st.session_state["_main_nav_page"] = page
+
     if page == "① 法规训练 & 生成审核点":
         render_step1_page()
     elif page == "② 审核点管理 & 训练":
         render_step2_page()
     elif page == "③ 文档审核":
         render_step3_page()
+    elif page == "🌐 文档翻译":
+        render_translation_page()
     elif page == "📝 提示词配置":
         render_prompts_page()
     elif page == "🔎 知识库查询":
