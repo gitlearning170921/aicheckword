@@ -248,6 +248,12 @@ def init_db() -> None:
             _add_column_if_missing(cur, "app_settings", "review_summary_prompt", "LONGTEXT COMMENT '审核总结提示词，为空则使用内置默认'")
             _add_column_if_missing(cur, "app_settings", "translation_target_lang", "VARCHAR(8) DEFAULT 'en' COMMENT '文档翻译目标语言：en/de/zh'")
             _add_column_if_missing(cur, "app_settings", "translation_company_config", "LONGTEXT COMMENT 'JSON: 公司信息翻译配置 company_name/address/contact/phone 等'")
+            _add_column_if_missing(
+                cur,
+                "app_settings",
+                "runtime_settings_json",
+                "LONGTEXT COMMENT 'JSON 全量运行时配置（除首次连库外主要从库恢复，减少迁移工作量）'",
+            )
             _add_column_if_missing(cur, "dimension_options", "country_extra_keywords", "LONGTEXT COMMENT 'JSON: 国家(以页面选择为准)->法规关键词，用于知识库检索与扩大审核面，如 {\"欧盟\":[\"MDR\"]}'")
             _init_dimension_options(cur)
         conn.commit()
@@ -296,6 +302,68 @@ def load_app_settings() -> Optional[Dict[str, Any]]:
         return dict(row)
     finally:
         conn.close()
+
+
+def save_runtime_settings_blob(data: Dict[str, Any]) -> None:
+    """将全量运行时配置写入 app_settings.runtime_settings_json（JSON 文本）。"""
+    if not data:
+        return
+    init_db()
+    blob = json.dumps(data, ensure_ascii=False)
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE app_settings SET runtime_settings_json = %s, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+                (blob,),
+            )
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO app_settings (id, runtime_settings_json) VALUES (1, %s)",
+                    (blob,),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def persist_settings_dual_write() -> None:
+    """
+    将当前内存中的 config.settings 写入：1) runtime_settings_json 全量 2) 兼容旧版列（侧栏等依赖）。
+    """
+    from config.runtime_settings import serialize_settings_to_flat_dict
+
+    blob_dict = serialize_settings_to_flat_dict()
+    save_runtime_settings_blob(blob_dict)
+    save_app_settings(
+        provider=settings.provider,
+        openai_api_key=settings.openai_api_key or "",
+        openai_base_url=settings.openai_base_url or "",
+        ollama_base_url=settings.ollama_base_url or "",
+        cursor_api_key=settings.cursor_api_key or "",
+        cursor_api_base=settings.cursor_api_base or "",
+        cursor_repository=settings.cursor_repository or "",
+        cursor_ref=settings.cursor_ref or "main",
+        cursor_embedding=settings.cursor_embedding or "ollama",
+        cursor_verify_ssl=bool(getattr(settings, "llm_verify_ssl", getattr(settings, "cursor_verify_ssl", True))),
+        cursor_trust_env=bool(getattr(settings, "llm_trust_env", getattr(settings, "cursor_trust_env", True))),
+        llm_model=settings.llm_model or "",
+        embedding_model=settings.embedding_model or "",
+        deepseek_api_key=getattr(settings, "deepseek_api_key", "") or "",
+        deepseek_base_url=getattr(settings, "deepseek_base_url", "") or "",
+        lingyi_api_key=getattr(settings, "lingyi_api_key", "") or "",
+        lingyi_base_url=getattr(settings, "lingyi_base_url", "") or "",
+        gemini_api_key=getattr(settings, "gemini_api_key", "") or getattr(settings, "google_api_key", "") or "",
+        dashscope_api_key=settings.dashscope_api_key or "",
+        qianfan_ak=settings.qianfan_ak or "",
+        qianfan_sk=settings.qianfan_sk or "",
+    )
+    try:
+        from src.core.knowledge_base import reset_chroma_client_cache
+
+        reset_chroma_client_cache()
+    except Exception:
+        pass
 
 
 def get_review_extra_instructions() -> str:

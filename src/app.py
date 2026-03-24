@@ -18,11 +18,13 @@ for _np in ("NO_PROXY", "no_proxy"):
 
 import json
 import copy
+import gc
 import html
 import time
 import tempfile
 from datetime import datetime
 from typing import Optional
+import uuid
 import shutil
 import traceback
 import inspect
@@ -120,6 +122,8 @@ from src.core.db import (
     OP_TYPE_TRANSLATION_ERROR,
 )
 from src.core.report_export import report_to_html, report_to_docx, report_to_pdf, report_to_excel, report_to_docx_with_comments, report_todo_to_csv, report_todo_to_pdf, report_todo_to_docx, report_todo_to_excel
+from src.streamlit_compat import streamlit_rerun
+from src.system_config_ui import render_system_config_page
 
 
 def _make_ttl_cache(ttl_sec=5):
@@ -359,6 +363,21 @@ def render_sidebar():
                 settings.cursor_trust_env = tt
                 settings.llm_trust_env = tt
                 _cursor_overrides["trust_env"] = tt
+                # 全量 JSON 最后覆盖兼容列（迁机后主要从库恢复）
+                raw_json = db_conf.get("runtime_settings_json")
+                if raw_json:
+                    try:
+                        parsed = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+                        if isinstance(parsed, dict) and parsed:
+                            from config.runtime_settings import (
+                                apply_runtime_config_dict,
+                                sync_cursor_overrides_from_settings,
+                            )
+
+                            apply_runtime_config_dict(parsed)
+                            sync_cursor_overrides_from_settings()
+                    except Exception:
+                        pass
             st.session_state["db_settings_loaded"] = True
             st.session_state["current_provider"] = (settings.provider or "ollama").strip().lower()
 
@@ -576,7 +595,8 @@ def render_sidebar():
             )
             if "agent" in st.session_state:
                 st.session_state.agent.reset_clients()
-            st.success("配置已保存，下次打开自动生效。")
+            st.success("配置已保存，页面将刷新。")
+            streamlit_rerun()
 
         if _provider_ready():
             if settings.is_cursor:
@@ -795,6 +815,21 @@ def _format_review_exception(e: BaseException) -> str:
 def _is_transient_llm_error(e: BaseException) -> bool:
     """识别可自动重试的瞬时网络/网关错误。"""
     text = f"{type(e).__name__}: {e}".lower()
+    # 上下文超长、限流等不应在应用层反复重试，避免请求雪崩与资源耗尽
+    if any(
+        k in text
+        for k in (
+            "context length",
+            "maximum context",
+            "too many tokens",
+            "token limit",
+            "maximum length",
+            "rate limit",
+            "too many requests",
+            "429",
+        )
+    ):
+        return False
     keywords = (
         "apiconnectionerror",
         "readtimeout",
@@ -812,6 +847,13 @@ def _is_transient_llm_error(e: BaseException) -> bool:
         "504",
     )
     return any(k in text for k in keywords)
+
+
+def _review_transient_retry_attempts() -> int:
+    """DeepSeek 等云端接口：应用层少次重试，主要依赖客户端内建重试；避免叠峰。"""
+    if (getattr(settings, "provider", "") or "").strip().lower() == "deepseek":
+        return 2
+    return 3
 
 
 def _call_with_transient_retry(fn, *, attempts: int = 3, base_sleep: float = 1.2):
@@ -2977,6 +3019,9 @@ def render_step3_page():
         _retry_partial = st.session_state.pop("review_retry_partial_msg", None)
         if _retry_partial:
             st.warning(_retry_partial)
+        _batch_status = st.session_state.pop("review_batch_status_msg", None)
+        if _batch_status:
+            st.info(_batch_status)
         with st.expander("🔗 金山文档在线审核（粘贴链接即可审核，无需下载到本地）", expanded=False):
             from src.core.kdocs_client import has_api_credentials as _kdocs_has_api
             if _kdocs_has_api():
@@ -3143,14 +3188,25 @@ def render_step3_page():
                 review_context["_filter_by_registration_type"] = True
 
             total_files = len(items)
+            if total_files > 1:
+                review_context["_batch_review"] = True
+                # 本批唯一 ID：单文档历史记录与批次汇总记录共用，便于在历史列表中归类
+                _rbid = datetime.now().strftime("%Y%m%d_%H%M%S") + "-" + uuid.uuid4().hex[:8]
+                review_context["review_batch_id"] = _rbid
+                st.session_state["review_batch_id"] = _rbid
             st.session_state.review_project_id = project_id
             st.session_state.review_context = review_context
             st.session_state._review_mode_snapshot = review_mode
-            st.caption("💡 文档较多时可能因超时中断，已完成的报告会保存到「历史报告」；建议每批不超过 10 个文件，可分批上传。")
+            st.caption(
+                "💡 批量审核为**逐文件排队**执行；任意模型在文件之间会有短暂间隔（可在 `.env` 设置 `REVIEW_BATCH_INTER_DOC_SLEEP_SEC`，DeepSeek 另见 `REVIEW_DEEPSEEK_INTER_DOC_SLEEP_SEC`），以减轻限流与断连。"
+                " 请**保持本页与浏览器标签打开**直至结束；自托管 Streamlit 若仍中途断开，请调大服务器/反向代理读写超时。"
+                " 已完成的单文件会写入「历史报告」且**显示为上传文件名**；建议每批不超过 10 个文件。"
+            )
             review_bar = st.progress(0)
             review_status = st.empty()
             review_status.info(f"准备审核 {total_files} 个文件...")
             review_current = st.empty()
+            review_panel = st.empty()
             log_display = st.empty()
 
             log_lines = []
@@ -3161,6 +3217,25 @@ def render_step3_page():
             batch_interrupted = False
             batch_error = None
             multi_doc_error_shown = False  # 仅多文档分支内已展示错误时不再用通用“未生成报告”覆盖
+            batch_aggregate_saved = False
+
+            def _render_review_panel(done: int, total: int, success: int, failed: int, start_ts: float, current_name: str = ""):
+                elapsed = max(0.0, time.time() - start_ts)
+                avg = (elapsed / done) if done > 0 else 0.0
+                remain = max(0, total - done)
+                eta = (avg * remain) if done > 0 else 0.0
+                cur = current_name or "等待中"
+                review_panel.markdown(
+                    "\n".join([
+                        "#### 📊 批量审核进度面板",
+                        f"- 当前：`{cur}`",
+                        f"- 进度：`{done}/{total}`（成功 `{success}` / 失败 `{failed}`）",
+                        f"- 已用时：`{_format_time(elapsed)}`",
+                        f"- 预计剩余：`{_format_time(eta) if done > 0 else '计算中…'}`",
+                    ])
+                )
+
+            _render_review_panel(0, total_files, 0, 0, t_start, "准备中")
 
             try:
                 if st.session_state.get("only_multi_doc_review") and len(items) >= 2:
@@ -3170,6 +3245,9 @@ def render_step3_page():
                         try:
                             _ctx = dict(review_context) if review_context else {}
                             _ctx["current_provider"] = st.session_state.get("current_provider") or settings.provider
+                            _ctx["_batch_review"] = True
+                            if (_ctx.get("current_provider") or "").strip().lower() == "deepseek":
+                                _ctx["_skip_llm_summary"] = True
                             with st.spinner("正在调用多文档一致性审核接口（读取文件并请求 AI）…"):
                                 consistency_report = multi_doc_fn(
                                     [(path, display_name) for (path, display_name, _) in items],
@@ -3179,7 +3257,7 @@ def render_step3_page():
                             consistency_report["original_filename"] = "多文档一致性与模板风格审核"
                             consistency_report["related_doc_names"] = [display_name for (_, display_name, _) in items]
                             consistency_report["file_name"] = consistency_report.get("file_name") or "多文档一致性与模板风格审核"
-                            _inject_review_meta(consistency_report)
+                            _inject_review_meta(consistency_report, "batch_multi_doc")
                             all_reports.append(consistency_report)
                             st.session_state.review_reports = all_reports
                             try:
@@ -3206,56 +3284,96 @@ def render_step3_page():
                         )
                 else:
                     for idx, (path, display_name, is_from_archive) in enumerate(items):
-                        # 批量虽为逐份串行，DeepSeek 等仍可能在连续请求下更易触发网关抖动，份间轻微间隔
-                        if idx > 0 and (review_context.get("current_provider") or "") == "deepseek":
-                            time.sleep(0.6)
-                        pct = int(idx / total_files * 100)
-                        review_bar.progress(pct)
-                        review_status.info(
-                            f"审核进度 {idx+1}/{total_files} | "
-                            f"已完成 {len(all_reports)} 个 | "
-                            f"耗时 {_format_time(time.time() - t_start)}"
-                        )
-                        review_current.info(f"正在审核 [{display_name}]...")
-
                         try:
+                            # 批量虽为逐份串行，DeepSeek 等仍可能在连续请求下更易触发网关抖动，份间轻微间隔
+                            # 注意：此处任何异常都按“单文件失败”处理，避免中断整批审核。
+                            # 批量排队：任意提供方份间小间隔 + DeepSeek 额外间隔（取较大者），降低叠峰断连/自动中断
+                            if idx > 0 and total_files > 1:
+                                try:
+                                    _u = float(getattr(settings, "review_batch_inter_doc_sleep_sec", 0.0) or 0.0)
+                                except Exception:
+                                    _u = 0.0
+                                _u = max(0.0, _u)
+                                _gap = _u
+                                if (review_context.get("current_provider") or "") == "deepseek":
+                                    try:
+                                        _d = float(getattr(settings, "review_deepseek_inter_doc_sleep_sec", 0.0) or 0.0)
+                                    except Exception:
+                                        _d = 1.0
+                                    if _d <= 0:
+                                        _d = 1.0
+                                    _gap = max(_gap, _d)
+                                if _gap > 0:
+                                    time.sleep(_gap)
+                            pct = int(idx / total_files * 100)
+                            review_bar.progress(pct)
+                            review_status.info(
+                                f"审核进度 {idx+1}/{total_files} | "
+                                f"已完成 {len(all_reports)} 个 | "
+                                f"耗时 {_format_time(time.time() - t_start)}"
+                            )
+                            review_current.info(f"正在审核 [{display_name}]...")
+                            _render_review_panel(
+                                idx,
+                                total_files,
+                                len(all_reports),
+                                len(failed_items),
+                                t_start,
+                                display_name,
+                            )
+
                             t0 = time.time()
                             mi = get_current_model_info()
                             with st.spinner(f"AI 正在审核 [{display_name}]，请耐心等待..."):
                                 report = _call_with_transient_retry(
-                                    lambda: agent.review(
-                                        path,
+                                    lambda p=path, dn=display_name: agent.review(
+                                        p,
                                         project_id=project_id,
                                         review_context=review_context,
                                         system_prompt=review_sys_edit.strip() or None,
                                         user_prompt=review_usr_edit.strip() or None,
                                         extra_instructions=review_extra_edit.strip() or None,
+                                        display_file_name=dn,
                                     ),
-                                    attempts=3,
+                                    attempts=_review_transient_retry_attempts(),
                                 )
+                            if (review_context.get("current_provider") or "") == "deepseek":
+                                gc.collect()
                             elapsed = time.time() - t0
                             report["original_filename"] = display_name
                             report["_original_path"] = path
-                            _inject_review_meta(report)
+                            _inject_review_meta(report, "batch_member" if total_files > 1 else None)
                             all_reports.append(report)
-                            do_multi_later = len(items) >= 2 and st.session_state.get("do_multi_doc_consistency", True)
-                            if not do_multi_later:
-                                try:
-                                    save_audit_report(agent.collection_name, report, model_info=mi)
-                                    _invalidate_audit_history_cache()
-                                except Exception:
-                                    pass
+                            # 单文件成功后立即落库，避免批量中断/取消或最终不足 2 份成功时丢失历史报告。
+                            # 多文档一致性报告后续仍可单独保存为批次汇总，不影响这里的单文件归档。
+                            try:
+                                save_audit_report(agent.collection_name, report, model_info=mi)
+                                _invalidate_audit_history_cache()
+                            except Exception:
+                                pass
                             n_points = report.get("total_points", 0)
                             add_operation_log(
                                 op_type=OP_TYPE_REVIEW,
                                 collection=agent.collection_name,
                                 file_name=display_name,
                                 source=str(path),
-                                extra={"total_points": n_points, "duration_sec": round(elapsed, 2)},
+                                extra={
+                                    "total_points": n_points,
+                                    "duration_sec": round(elapsed, 2),
+                                    **({"review_batch_id": review_context.get("review_batch_id")} if total_files > 1 and review_context.get("review_batch_id") else {}),
+                                },
                                 model_info=mi,
                             )
                             log_lines.append(
                                 f"- :white_check_mark: **{display_name}** — {n_points} 个审核点, {_format_time(elapsed)}"
+                            )
+                            _render_review_panel(
+                                idx + 1,
+                                total_files,
+                                len(all_reports),
+                                len(failed_items),
+                                t_start,
+                                display_name,
                             )
                         except Exception as e:
                             err_str = _format_review_exception(e)
@@ -3269,6 +3387,14 @@ def render_step3_page():
                                 source=str(path),
                                 extra={"error": err_str, "traceback": traceback.format_exc()},
                                 model_info=get_current_model_info(),
+                            )
+                            _render_review_panel(
+                                idx + 1,
+                                total_files,
+                                len(all_reports),
+                                len(failed_items),
+                                t_start,
+                                display_name,
                             )
                             continue
                         log_display.markdown("\n".join(log_lines))
@@ -3293,6 +3419,7 @@ def render_step3_page():
                         "traceback": traceback.format_exc(),
                         "total_audit_points": sum(r.get("total_points", 0) for r in all_reports),
                         "duration_sec": round(time.time() - t_start, 2),
+                        **({"review_batch_id": review_context.get("review_batch_id")} if review_context.get("review_batch_id") else {}),
                     },
                     model_info=get_current_model_info(),
                 )
@@ -3303,13 +3430,14 @@ def render_step3_page():
                 review_status.warning(
                     f"审核过程中断：{batch_error}。已完成 {len(all_reports)}/{total_files} 个文件，耗时 {_format_time(total_time)}。请到「历史报告」查看已审核结果，剩余文件可分批重新上传。"
                 )
+                _render_review_panel(total_files, total_files, len(all_reports), len(failed_items), t_start, "已中断")
                 if all_reports:
                     st.session_state.review_reports = all_reports
                     try:
-                        _batch_meta = _build_review_meta_dict()
+                        _bid = (review_context or {}).get("review_batch_id") or ""
                         _partial_batch = {
-                            "file_name": "批量审核（部分完成）",
-                            "original_filename": "批量审核（部分完成）",
+                            "file_name": (f"批量审核·批次汇总(中断)·{_bid}" if _bid else "批量审核（部分完成）")[:512],
+                            "original_filename": (f"批量审核·批次汇总(中断)·{_bid}" if _bid else "批量审核（部分完成）")[:512],
                             "batch": True,
                             "reports": list(all_reports),
                             "total_points": sum(r.get("total_points", 0) for r in all_reports),
@@ -3317,17 +3445,33 @@ def render_step3_page():
                             "medium_count": sum(r.get("medium_count", 0) for r in all_reports),
                             "low_count": sum(r.get("low_count", 0) for r in all_reports),
                             "info_count": sum(r.get("info_count", 0) for r in all_reports),
-                            "summary": f"本批次中断，已完成 {len(all_reports)}/{total_files} 份报告。",
-                            "_review_meta": _batch_meta,
+                            "summary": (
+                                f"本批次中断（批次ID：{_bid}），已将已完成的 {len(all_reports)}/{total_files} 份单文档审核整合为一条批次记录；"
+                                f"各单文档记录仍可在历史中按同一批次ID筛选识别。"
+                                if _bid
+                                else f"本批次中断，已完成 {len(all_reports)}/{total_files} 份报告。"
+                            ),
                         }
-                        save_audit_report(agent.collection_name, _partial_batch, model_info=get_current_model_info() or "")
+                        _inject_review_meta(_partial_batch, "batch_aggregated")
+                        _partial_batch_id = save_audit_report(
+                            agent.collection_name,
+                            _partial_batch,
+                            model_info=get_current_model_info() or "",
+                        )
                         _invalidate_audit_history_cache()
+                        batch_aggregate_saved = True
+                        _bid = (review_context or {}).get("review_batch_id") or "未分配"
+                        st.session_state["review_batch_status_msg"] = (
+                            f"本批已自动中断：成功 {len(all_reports)} / {total_files}，失败 {total_files - len(all_reports)}。"
+                            f" 已将成功项整合为批次报告（ID:{_partial_batch_id}，批次号：{_bid}）；可在下方点击“重新审核失败项”。"
+                        )
                     except Exception as _save_err:
                         st.caption(f"已完成的报告写入历史失败：{_save_err}")
             else:
                 review_bar.progress(100)
                 total_time = time.time() - t_start
                 review_current.empty()
+                _render_review_panel(total_files, total_files, len(all_reports), len(failed_items), t_start, "已完成")
                 only_multi = st.session_state.get("only_multi_doc_review") and len(items) >= 2
                 if only_multi:
                     if all_reports:
@@ -3348,6 +3492,9 @@ def render_step3_page():
                         try:
                             _ctx = dict(review_context) if review_context else {}
                             _ctx["current_provider"] = st.session_state.get("current_provider") or settings.provider
+                            _ctx["_batch_review"] = True
+                            if (_ctx.get("current_provider") or "").strip().lower() == "deepseek":
+                                _ctx["_skip_llm_summary"] = True
                             review_status.info("正在进行多文档一致性与模板风格审核…")
                             with st.spinner("正在调用多文档一致性审核接口（请求 AI）…"):
                                 consistency_report = multi_doc_fn(
@@ -3358,13 +3505,13 @@ def render_step3_page():
                             consistency_report["original_filename"] = "多文档一致性与模板风格审核"
                             consistency_report["related_doc_names"] = [display_name for (_, display_name, _) in items]
                             consistency_report["file_name"] = consistency_report.get("file_name") or "多文档一致性与模板风格审核"
-                            _inject_review_meta(consistency_report)
+                            _inject_review_meta(consistency_report, "batch_multi_doc")
                             all_reports.append(consistency_report)
                             try:
-                                _batch_meta = _build_review_meta_dict()
+                                _bid = (review_context or {}).get("review_batch_id") or ""
                                 batch_report = {
-                                    "file_name": "批量审核（含多文档一致性）",
-                                    "original_filename": "批量审核（含多文档一致性）",
+                                    "file_name": (f"批量审核·批次汇总(含多文档)·{_bid}" if _bid else "批量审核（含多文档一致性）")[:512],
+                                    "original_filename": (f"批量审核·批次汇总(含多文档)·{_bid}" if _bid else "批量审核（含多文档一致性）")[:512],
                                     "batch": True,
                                     "reports": list(all_reports),
                                     "total_points": sum(r.get("total_points", 0) for r in all_reports),
@@ -3372,15 +3519,20 @@ def render_step3_page():
                                     "medium_count": sum(r.get("medium_count", 0) for r in all_reports),
                                     "low_count": sum(r.get("low_count", 0) for r in all_reports),
                                     "info_count": sum(r.get("info_count", 0) for r in all_reports),
-                                    "summary": f"本批次共 {len(all_reports)} 份报告（含多文档一致性审核）。",
-                                    "_review_meta": _batch_meta,
+                                    "summary": (
+                                        f"本批次汇总（批次ID：{_bid}），共 {len(all_reports)} 份子报告（含多文档一致性审核）。"
+                                        if _bid
+                                        else f"本批次共 {len(all_reports)} 份报告（含多文档一致性审核）。"
+                                    ),
                                 }
+                                _inject_review_meta(batch_report, "batch_aggregated")
                                 save_audit_report(
                                     agent.collection_name,
                                     batch_report,
                                     model_info=get_current_model_info() or "",
                                 )
                                 _invalidate_audit_history_cache()
+                                batch_aggregate_saved = True
                             except Exception as save_err:
                                 st.warning(f"批量报告写入历史失败：{save_err}")
                             log_lines.append(
@@ -3396,10 +3548,10 @@ def render_step3_page():
                             log_display.markdown("\n".join(log_lines))
                             if all_reports:
                                 try:
-                                    _batch_meta = _build_review_meta_dict()
+                                    _bid = (review_context or {}).get("review_batch_id") or ""
                                     _batch_no_consistency = {
-                                        "file_name": "批量审核（多文档一致性未完成）",
-                                        "original_filename": "批量审核（多文档一致性未完成）",
+                                        "file_name": (f"批量审核·批次汇总(多文档未完成)·{_bid}" if _bid else "批量审核（多文档一致性未完成）")[:512],
+                                        "original_filename": (f"批量审核·批次汇总(多文档未完成)·{_bid}" if _bid else "批量审核（多文档一致性未完成）")[:512],
                                         "batch": True,
                                         "reports": list(all_reports),
                                         "total_points": sum(r.get("total_points", 0) for r in all_reports),
@@ -3407,11 +3559,16 @@ def render_step3_page():
                                         "medium_count": sum(r.get("medium_count", 0) for r in all_reports),
                                         "low_count": sum(r.get("low_count", 0) for r in all_reports),
                                         "info_count": sum(r.get("info_count", 0) for r in all_reports),
-                                        "summary": f"本批次共 {len(all_reports)} 份单文档报告；多文档一致性审核未完成。",
-                                        "_review_meta": _batch_meta,
+                                        "summary": (
+                                            f"本批次汇总（批次ID：{_bid}），共 {len(all_reports)} 份单文档报告；多文档一致性审核未完成。"
+                                            if _bid
+                                            else f"本批次共 {len(all_reports)} 份单文档报告；多文档一致性审核未完成。"
+                                        ),
                                     }
+                                    _inject_review_meta(_batch_no_consistency, "batch_aggregated")
                                     save_audit_report(agent.collection_name, _batch_no_consistency, model_info=get_current_model_info() or "")
                                     _invalidate_audit_history_cache()
+                                    batch_aggregate_saved = True
                                 except Exception as _save_err:
                                     st.warning(f"本批报告写入历史失败：{_save_err}")
                     else:
@@ -3419,10 +3576,10 @@ def render_step3_page():
                         log_display.markdown("\n".join(log_lines))
                         if all_reports:
                             try:
-                                _batch_meta = _build_review_meta_dict()
+                                _bid = (review_context or {}).get("review_batch_id") or ""
                                 _batch_skip_multi = {
-                                    "file_name": "批量审核（含多文档一致性）",
-                                    "original_filename": "批量审核（含多文档一致性）",
+                                    "file_name": (f"批量审核·批次汇总·{_bid}" if _bid else "批量审核（含多文档一致性）")[:512],
+                                    "original_filename": (f"批量审核·批次汇总·{_bid}" if _bid else "批量审核（含多文档一致性）")[:512],
                                     "batch": True,
                                     "reports": list(all_reports),
                                     "total_points": sum(r.get("total_points", 0) for r in all_reports),
@@ -3430,13 +3587,88 @@ def render_step3_page():
                                     "medium_count": sum(r.get("medium_count", 0) for r in all_reports),
                                     "low_count": sum(r.get("low_count", 0) for r in all_reports),
                                     "info_count": sum(r.get("info_count", 0) for r in all_reports),
-                                    "summary": f"本批次共 {len(all_reports)} 份报告（多文档一致性未执行）。",
-                                    "_review_meta": _batch_meta,
+                                    "summary": (
+                                        f"本批次汇总（批次ID：{_bid}），共 {len(all_reports)} 份单文档报告（未执行多文档一致性）。"
+                                        if _bid
+                                        else f"本批次共 {len(all_reports)} 份报告（多文档一致性未执行）。"
+                                    ),
                                 }
+                                _inject_review_meta(_batch_skip_multi, "batch_aggregated")
                                 save_audit_report(agent.collection_name, _batch_skip_multi, model_info=get_current_model_info() or "")
                                 _invalidate_audit_history_cache()
+                                batch_aggregate_saved = True
                             except Exception as _save_err:
                                 st.warning(f"本批报告写入历史失败：{_save_err}")
+
+                # 未勾选「多文档一致性」时：仍将本批已完成的单文档审核整合为一条批次汇总记录（与逐文件记录并存）
+                if (
+                    total_files > 1
+                    and not st.session_state.get("only_multi_doc_review")
+                    and all_reports
+                    and not st.session_state.get("do_multi_doc_consistency", True)
+                ):
+                    try:
+                        _bid = (review_context or {}).get("review_batch_id") or ""
+                        _batch_singles_only = {
+                            "file_name": (f"批量审核·批次汇总·{_bid}" if _bid else "批量审核（批次汇总）")[:512],
+                            "original_filename": (f"批量审核·批次汇总·{_bid}" if _bid else "批量审核（批次汇总）")[:512],
+                            "batch": True,
+                            "reports": list(all_reports),
+                            "total_points": sum(r.get("total_points", 0) for r in all_reports),
+                            "high_count": sum(r.get("high_count", 0) for r in all_reports),
+                            "medium_count": sum(r.get("medium_count", 0) for r in all_reports),
+                            "low_count": sum(r.get("low_count", 0) for r in all_reports),
+                            "info_count": sum(r.get("info_count", 0) for r in all_reports),
+                            "summary": (
+                                f"本批次汇总（批次ID：{_bid}），共 {len(all_reports)} 份单文档报告（未执行多文档一致性审核）。"
+                                if _bid
+                                else f"本批次共 {len(all_reports)} 份单文档报告（未执行多文档一致性审核）。"
+                            ),
+                        }
+                        _inject_review_meta(_batch_singles_only, "batch_aggregated")
+                        save_audit_report(
+                            agent.collection_name,
+                            _batch_singles_only,
+                            model_info=get_current_model_info() or "",
+                        )
+                        _invalidate_audit_history_cache()
+                        batch_aggregate_saved = True
+                    except Exception as _save_err:
+                        st.warning(f"批次汇总报告写入历史失败：{_save_err}")
+
+                # 若本批存在失败项且尚未生成批次汇总，自动补一条“部分完成”汇总，便于定位与重试
+                if failed_items and all_reports and not batch_aggregate_saved:
+                    try:
+                        _bid = (review_context or {}).get("review_batch_id") or ""
+                        _auto_partial = {
+                            "file_name": (f"批量审核·批次汇总(部分完成)·{_bid}" if _bid else "批量审核（部分完成）")[:512],
+                            "original_filename": (f"批量审核·批次汇总(部分完成)·{_bid}" if _bid else "批量审核（部分完成）")[:512],
+                            "batch": True,
+                            "reports": list(all_reports),
+                            "total_points": sum(r.get("total_points", 0) for r in all_reports),
+                            "high_count": sum(r.get("high_count", 0) for r in all_reports),
+                            "medium_count": sum(r.get("medium_count", 0) for r in all_reports),
+                            "low_count": sum(r.get("low_count", 0) for r in all_reports),
+                            "info_count": sum(r.get("info_count", 0) for r in all_reports),
+                            "summary": (
+                                f"本批次部分完成（批次ID：{_bid}），成功 {len(all_reports)} / {total_files}；其余文件可重试。"
+                                if _bid else f"本批次部分完成，成功 {len(all_reports)} / {total_files}；其余文件可重试。"
+                            ),
+                        }
+                        _inject_review_meta(_auto_partial, "batch_aggregated")
+                        _auto_partial_id = save_audit_report(
+                            agent.collection_name,
+                            _auto_partial,
+                            model_info=get_current_model_info() or "",
+                        )
+                        _invalidate_audit_history_cache()
+                        batch_aggregate_saved = True
+                        st.session_state["review_batch_status_msg"] = (
+                            f"本批部分完成：成功 {len(all_reports)} / {total_files}，失败 {len(failed_items)}。"
+                            f" 已生成批次汇总（ID:{_auto_partial_id}）；可在下方点击“重新审核失败项”。"
+                        )
+                    except Exception as _save_err:
+                        st.warning(f"自动生成部分完成批次汇总失败：{_save_err}")
 
                 if all_reports:
                     st.session_state.review_reports = all_reports
@@ -3448,6 +3680,8 @@ def render_step3_page():
                         "total_audit_points": total_points,
                         "duration_sec": round(total_time, 2),
                 }
+                if review_context.get("review_batch_id"):
+                    batch_extra["review_batch_id"] = review_context["review_batch_id"]
                 if failed_errors:
                     batch_extra["first_error"] = failed_errors[0]
                     batch_extra["errors"] = failed_errors
@@ -3460,6 +3694,7 @@ def render_step3_page():
                     model_info=get_current_model_info(),
                 )
             finally:
+                st.session_state.pop("review_batch_id", None)
                 failed_set = {(p, d, a) for (p, d, a) in failed_items}
                 for path, _display_name, is_from_archive in items:
                     if not is_from_archive and (path, _display_name, is_from_archive) not in failed_set:
@@ -3469,6 +3704,12 @@ def render_step3_page():
                     st.session_state.review_failed_errors = list(failed_errors)
                     st.session_state.review_failed_temp_dirs = temp_dirs
                     st.session_state.review_success_reports = list(all_reports)
+                    if "review_batch_status_msg" not in st.session_state:
+                        _bid = (review_context or {}).get("review_batch_id") or "未分配"
+                        st.session_state["review_batch_status_msg"] = (
+                            f"本批未全部完成（批次号：{_bid}）：成功 {len(all_reports)} / {total_files}，失败 {len(failed_items)}。"
+                            " 下方可查看失败原因并一键重试失败项。"
+                        )
                 else:
                     for d in temp_dirs:
                         shutil.rmtree(d, ignore_errors=True)
@@ -3500,9 +3741,31 @@ def render_step3_page():
             n_fail = len(failed_list)
             retry_bar = st.progress(0)
             retry_status = st.empty()
+            retry_panel = st.empty()
+            retry_t0 = time.time()
+
+            def _render_retry_panel(done: int, total: int, failed_now: int, start_ts: float, current_name: str = ""):
+                elapsed = max(0.0, time.time() - start_ts)
+                avg = (elapsed / done) if done > 0 else 0.0
+                remain = max(0, total - done)
+                eta = (avg * remain) if done > 0 else 0.0
+                cur = current_name or "等待中"
+                retry_panel.markdown(
+                    "\n".join([
+                        "#### 🔁 失败项重试进度",
+                        f"- 当前：`{cur}`",
+                        f"- 进度：`{done}/{total}`",
+                        f"- 仍失败：`{failed_now}`",
+                        f"- 已用时：`{_format_time(elapsed)}`",
+                        f"- 预计剩余：`{_format_time(eta) if done > 0 else '计算中…'}`",
+                    ])
+                )
+
+            _render_retry_panel(0, n_fail, 0, retry_t0, "准备中")
             for idx, (path, display_name, is_from_archive) in enumerate(failed_list):
                 retry_bar.progress(min(int((idx / max(n_fail, 1)) * 99), 99))
                 retry_status.info(f"正在重新审核 **{idx + 1}/{n_fail}**：{display_name} …（请稍候，勿关闭页面）")
+                _render_retry_panel(idx, n_fail, len(still_failed), retry_t0, display_name)
                 if not Path(path).exists():
                     still_failed.append((path, display_name, is_from_archive))
                     still_errors.append(
@@ -3513,17 +3776,21 @@ def render_step3_page():
                     t0 = time.time()
                     with st.spinner(f"AI 正在重新审核 [{display_name}]，请耐心等待…"):
                         report = _call_with_transient_retry(
-                            lambda: agent.review(
-                                path,
+                            lambda p=path, dn=display_name: agent.review(
+                                p,
                                 project_id=project_id,
                                 review_context=review_context,
                                 system_prompt=review_sys_edit.strip() or None,
                                 user_prompt=review_usr_edit.strip() or None,
                                 extra_instructions=review_extra_edit.strip() or None,
+                                display_file_name=dn,
                             ),
-                            attempts=3,
+                            attempts=_review_transient_retry_attempts(),
                         )
+                    if (review_context.get("current_provider") or "") == "deepseek":
+                        gc.collect()
                     report["original_filename"] = display_name
+                    report["file_name"] = display_name
                     report["_original_path"] = path
                     _inject_review_meta(report)
                     try:
@@ -3557,8 +3824,10 @@ def render_step3_page():
                         extra={"error": err_str, "traceback": traceback.format_exc(), "retry_failed_batch": True},
                         model_info=get_current_model_info(),
                     )
+                _render_retry_panel(idx + 1, n_fail, len(still_failed), retry_t0, display_name)
             retry_bar.progress(100)
             retry_status.empty()
+            _render_retry_panel(n_fail, n_fail, len(still_failed), retry_t0, "重试完成")
             st.session_state.review_reports = merged
             if still_failed:
                 st.session_state.review_failed_items = still_failed
@@ -3612,7 +3881,7 @@ def render_step3_page():
                             user_prompt=review_usr_edit.strip() or None,
                             extra_instructions=review_extra_edit.strip() or None,
                         ),
-                        attempts=3,
+                        attempts=_review_transient_retry_attempts(),
                     )
                 elapsed = time.time() - t0
                 _inject_review_meta(report)
@@ -3812,9 +4081,23 @@ def render_step3_page():
                     rpt = r.get("report") or {}
                     _hm = _extract_history_meta(rpt)
                     _tag = f"[{_hm.get('audit_type', '通用审核')}] " if _hm else ""
+                    bid = (
+                        (_hm.get("review_batch_id") or rpt.get("review_batch_id") or "") or ""
+                    ).strip()
+                    rk = (rpt.get("review_batch_record_kind") or "").strip()
+                    batch_part = ""
+                    if bid:
+                        if rk == "batch_aggregated" or rpt.get("batch"):
+                            batch_part = f"[批次汇总·{bid}] "
+                        elif rk == "batch_multi_doc":
+                            batch_part = f"[多文档一致性·{bid}] "
+                        elif rk == "batch_member":
+                            batch_part = f"[批次单文·{bid}] "
+                        else:
+                            batch_part = f"[批次·{bid}] "
                     mid = r.get("model_info", "") or ""
                     suf = f" | {mid}" if mid else ""
-                    return f"{r.get('created_at', '')} | {_tag}{r.get('file_name', '')} | {r.get('total_points', 0)}点 (ID:{r.get('id')}){suf}"
+                    return f"{r.get('created_at', '')} | {_tag}{batch_part}{r.get('file_name', '')} | {r.get('total_points', 0)}点 (ID:{r.get('id')}){suf}"
 
                 sel_i = st.selectbox(
                     "选择历史报告",
@@ -3880,12 +4163,22 @@ def _build_review_meta_dict() -> dict:
     pid = st.session_state.get("review_project_id")
     if pid:
         meta["project_id"] = pid
+    _rbid = (ctx.get("review_batch_id") or st.session_state.get("review_batch_id") or "").strip()
+    if _rbid:
+        meta["review_batch_id"] = _rbid
     return meta
 
 
-def _inject_review_meta(report: dict):
-    """将当前审核模式/项目信息注入报告 dict，便于后续展示与持久化。"""
+def _inject_review_meta(report: dict, batch_record_kind: Optional[str] = None):
+    """将当前审核模式/项目信息注入报告 dict，便于后续展示与持久化。
+    batch_record_kind：批量审核时区分记录类型（batch_member / batch_aggregated / batch_multi_doc）。"""
     report["_review_meta"] = _build_review_meta_dict()
+    meta = report.get("_review_meta") or {}
+    _bid = (meta.get("review_batch_id") or "").strip()
+    if _bid:
+        report["review_batch_id"] = _bid
+    if batch_record_kind:
+        report["review_batch_record_kind"] = batch_record_kind
 
 ACTION_OPTIONS = ["立即修改", "延期修改", "无需修改"]
 
@@ -4282,6 +4575,15 @@ def _render_history_meta_header(rpt: dict, report_id: int):
         if meta.get("registration_country"):
             parts.append(f"**国家：** {meta['registration_country']}")
     st.markdown("　|　".join(parts))
+    bid = (meta.get("review_batch_id") or rpt.get("review_batch_id") or "").strip()
+    rk = (rpt.get("review_batch_record_kind") or "").strip()
+    if bid:
+        _kind_map = {
+            "batch_aggregated": "批次汇总（多份整合）",
+            "batch_member": "批次内单文档",
+            "batch_multi_doc": "多文档一致性（同属该批次）",
+        }
+        st.caption(f"归属批次：`{bid}` · {_kind_map.get(rk, '批次相关')}")
     st.markdown("---")
 
 
@@ -6176,8 +6478,10 @@ def main():
             "📝 提示词配置",
             "🔎 知识库查询",
             "📋 操作记录",
+            "⚙️ 系统配置",
         ],
         horizontal=True,
+        key="main_function_nav_page",
     )
 
     # 仅在切换顶部功能页时短暂显示蒙层；避免编辑/纠正审核点时因任意控件重跑而反复出现「加载中」
@@ -6185,6 +6489,10 @@ def main():
     if _prev_nav is not None and _prev_nav != page:
         _render_loading_overlay()
     st.session_state["_main_nav_page"] = page
+
+    # 离开系统配置页后清除标记，下次进入时从 settings（含侧栏/库已加载值）重新灌入表单
+    if page != "⚙️ 系统配置":
+        st.session_state["_sys_cfg_in_page"] = False
 
     if page == "① 法规训练 & 生成审核点":
         render_step1_page()
@@ -6200,6 +6508,8 @@ def main():
         render_knowledge_page()
     elif page == "📋 操作记录":
         render_operations_page()
+    elif page == "⚙️ 系统配置":
+        render_system_config_page()
 
 
 if __name__ == "__main__":

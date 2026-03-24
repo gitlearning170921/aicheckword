@@ -58,6 +58,8 @@ def create_chat_llm(temperature: float = 0.1):
             raise RuntimeError(f"{p} 模式下请先配置 API Key（.env 或侧栏）")
         # DeepSeek 等大上下文审核耗时更长；过短易在客户端表现为连接/读超时类错误
         req_timeout = 600.0 if p == "deepseek" else 180.0
+        # DeepSeek 在客户端层过多重试会叠峰请求、放大 CPU/内存与限流风险，略降重试由应用层单次重试兜底
+        _mr = 2 if p == "deepseek" else 5
         return ChatOpenAI(
             model=settings.llm_model,
             api_key=api_key,
@@ -65,7 +67,7 @@ def create_chat_llm(temperature: float = 0.1):
             temperature=temperature,
             http_client=_openai_http_client(timeout=httpx.Timeout(req_timeout, connect=45.0)),
             request_timeout=req_timeout,
-            max_retries=6 if p == "deepseek" else 5,
+            max_retries=_mr,
         )
 
     # Google Gemini

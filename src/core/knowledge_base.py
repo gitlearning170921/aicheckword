@@ -1,10 +1,13 @@
 """知识库管理：基于 ChromaDB 的向量存储与检索，支持 Ollama (本地) 和 OpenAI 两种 Embedding
    同时将文档块持久化到 MySQL，重启服务不丢失记录。
+
+   多机共享：在服务器上运行 Chroma 的 HTTP 服务，各客户端配置 chroma_server_host（见 config/settings）。
 """
 
+import json
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
 from langchain.schema import Document
@@ -56,6 +59,44 @@ def _add_batch_with_retry(vectorstore: Chroma, batch: List[Document]) -> None:
         raise last_err
 
 
+_chroma_singleton: Optional[chromadb.ClientAPI] = None
+_chroma_singleton_key: Optional[Tuple[Any, ...]] = None
+
+
+def reset_chroma_client_cache() -> None:
+    """切换远程/本地 Chroma 配置后或测试时调用，使下次连接使用新配置。"""
+    global _chroma_singleton, _chroma_singleton_key
+    _chroma_singleton = None
+    _chroma_singleton_key = None
+
+
+def _chroma_remote_config_key() -> Tuple[Any, ...]:
+    s = settings
+    return (
+        (s.chroma_server_host or "").strip().lower(),
+        int(getattr(s, "chroma_server_port", 8000) or 8000),
+        bool(getattr(s, "chroma_server_ssl", False)),
+        (getattr(s, "chroma_server_headers_json", "") or "").strip(),
+    )
+
+
+def _parse_chroma_headers() -> Optional[Dict[str, str]]:
+    raw = (getattr(settings, "chroma_server_headers_json", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        if isinstance(d, dict):
+            return {str(k): str(v) for k, v in d.items()}
+    except Exception:
+        pass
+    return None
+
+
+def _is_chroma_remote() -> bool:
+    return bool((settings.chroma_server_host or "").strip())
+
+
 def _create_embeddings():
     # DeepSeek/零一 不提供 /v1/embeddings，若用其 base_url 会 404；统一用 Ollama 做向量化
     # 优先用 session 中的当前 provider（Streamlit 侧栏选择），否则用 settings.provider
@@ -97,7 +138,26 @@ def _create_embeddings():
 
 
 def _get_chroma_client() -> chromadb.ClientAPI:
-    return chromadb.PersistentClient(path=str(settings.chroma_path))
+    """本地 PersistentClient（默认）或远程 HttpClient（多机共享）。"""
+    global _chroma_singleton, _chroma_singleton_key
+    key = _chroma_remote_config_key() if _is_chroma_remote() else ("local", str(settings.chroma_path))
+    if _chroma_singleton is not None and _chroma_singleton_key == key:
+        return _chroma_singleton
+    if _is_chroma_remote():
+        host = (settings.chroma_server_host or "").strip()
+        port = int(getattr(settings, "chroma_server_port", 8000) or 8000)
+        ssl = bool(getattr(settings, "chroma_server_ssl", False))
+        headers = _parse_chroma_headers()
+        _chroma_singleton = chromadb.HttpClient(
+            host=host,
+            port=port,
+            ssl=ssl,
+            headers=headers,
+        )
+    else:
+        _chroma_singleton = chromadb.PersistentClient(path=str(settings.chroma_path))
+    _chroma_singleton_key = key
+    return _chroma_singleton
 
 
 class KnowledgeBase:
@@ -126,11 +186,15 @@ class KnowledgeBase:
     @property
     def vectorstore(self) -> Chroma:
         if self._vectorstore is None:
-            self._vectorstore = Chroma(
-                collection_name=self.collection_name,
-                embedding_function=self.embeddings,
-                persist_directory=str(settings.chroma_path),
-            )
+            kw = {
+                "collection_name": self.collection_name,
+                "embedding_function": self.embeddings,
+            }
+            if _is_chroma_remote():
+                kw["client"] = _get_chroma_client()
+            else:
+                kw["persist_directory"] = str(settings.chroma_path)
+            self._vectorstore = Chroma(**kw)
         return self._vectorstore
 
     def reset_clients(self):

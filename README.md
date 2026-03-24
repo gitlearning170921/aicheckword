@@ -23,6 +23,14 @@ cp .env.example .env
 streamlit run src/app.py
 ```
 
+## 系统配置与迁机（MySQL）
+
+- 应用启动后，**除首次连接数据库外**，其余运行时配置可从表 `app_settings.runtime_settings_json` 自动加载（侧栏首次连库后生效）。
+- 在 Web 端顶部 **「⚙️ 系统配置」** 可查看、编辑并**保存到数据库**；表单默认带入当前内存中的配置。
+- **迁到新电脑**：新机器 `.env` 中至少配置 **MySQL 能连上原库**；启动后其余项会从库恢复。也可在系统配置页 **导出 .env 片段** 作备份。
+- 修改 **MySQL 连接字段** 后需**重启应用**才会使用新连接。
+- **多机共享向量库**：在一台服务器运行 Chroma Server，各客户端配置 `chroma_server_host`（见 [docs/chroma-shared.md](docs/chroma-shared.md)）。
+
 ## 多用户 / 多设备访问
 
 - **本机打开**：用 **`http://localhost:8501`**（或 `http://127.0.0.1:8501`）。**不要**在浏览器里输入 `http://0.0.0.0:8501`（0.0.0.0 仅表示“监听所有网卡”，不能当网址用）。

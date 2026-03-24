@@ -52,7 +52,12 @@ class Settings(BaseSettings):
     embedding_model: str = "nomic-embed-text"
 
     # 向量库与分块
+    # 本地模式：数据在 chroma_persist_dir。多机共享：在一台机器上部署 Chroma Server，各客户端填写 chroma_server_host（非空则走 HTTP，忽略本地目录作为存储位置）。
     chroma_persist_dir: str = "./knowledge_store"
+    chroma_server_host: str = ""  # 例：10.0.0.5 或 chroma.internal；留空=仅用本地 PersistentClient
+    chroma_server_port: int = 8000
+    chroma_server_ssl: bool = False  # True 时 HTTPS
+    chroma_server_headers_json: str = ""  # 可选，JSON：{"Authorization":"Bearer ..."}，用于自建网关鉴权
     chunk_size: int = 1000
     chunk_overlap: int = 200
     # 嵌入请求：远程主机强制关闭连接时重试（如 WinError 10054）
@@ -61,6 +66,20 @@ class Settings(BaseSettings):
     # 大文件训练：块数超过阈值时自动缩小每批数量，减少单次请求超时/断连
     embedding_large_file_threshold: int = 60
     embedding_large_file_batch_size: int = 12
+
+    # ─── 文档审核稳定性（DeepSeek 等云端 API，多文件时降低 Chroma/内存与重复 LLM 调用）───
+    # 两次 LLM（Chat）请求最小间隔（秒）。仅对 provider=deepseek 生效；0=使用内置默认约 0.9；-1=关闭
+    review_llm_min_interval_sec: float = 0.0
+    # 单次审核从 Chroma 取回的候选条数上限（仅 deepseek 生效，减轻检索与拼接上下文体积）
+    review_deepseek_chroma_fetch_cap: int = 96
+    # 实际拼入提示的审核点参考条数上限（deepseek）
+    review_deepseek_target_cap: int = 64
+    # 批量审核（多文件）时跳过第二次「总结」模型调用，改用规则摘要（每文件少 1 次 API）
+    review_batch_skip_llm_summary: bool = True
+    # 批量审核时相邻两个文件之间的额外间隔（秒），仅 deepseek；0=使用内置默认 1.0
+    review_deepseek_inter_doc_sleep_sec: float = 0.0
+    # 批量审核（≥2 文件）时，任意提供方在「下一文件」前的最小间隔（秒），减轻网关限流与叠峰导致的断连；0=关闭
+    review_batch_inter_doc_sleep_sec: float = 0.35
 
     # API 服务
     api_host: str = "0.0.0.0"
@@ -104,6 +123,11 @@ class Settings(BaseSettings):
     @property
     def chroma_path(self) -> Path:
         return Path(self.chroma_persist_dir)
+
+    @property
+    def chroma_use_remote_server(self) -> bool:
+        """是否使用远程 Chroma HTTP 服务（多机共享同一向量库）。"""
+        return bool((self.chroma_server_host or "").strip())
 
     @property
     def training_path(self) -> Path:

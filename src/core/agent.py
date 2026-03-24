@@ -336,8 +336,10 @@ class ReviewAgent:
         system_prompt: Optional[str] = None,
         user_prompt: Optional[str] = None,
         extra_instructions: Optional[str] = None,
+        display_file_name: Optional[str] = None,
     ) -> dict:
-        """system_prompt / user_prompt / extra_instructions 为本次覆盖，不传则用数据库或内置默认。"""
+        """system_prompt / user_prompt / extra_instructions 为本次覆盖，不传则用数据库或内置默认。
+        display_file_name：上传/展示用文件名；批量审核时传入可避免历史报告里出现临时文件路径名。"""
         project_context_text = ""
         if project_id:
             try:
@@ -358,7 +360,12 @@ class ReviewAgent:
             system_prompt=sys_p,
             user_prompt=usr_p,
         )
-        return report.to_dict()
+        out = report.to_dict()
+        disp = (display_file_name or "").strip()
+        if disp:
+            out["file_name"] = disp
+            out["original_filename"] = disp
+        return out
 
     def review_text(
         self,
