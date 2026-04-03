@@ -434,6 +434,32 @@ class ReviewAgent:
         report = self.reviewer.review_multi_document_consistency(doc_list, review_context=ctx)
         return report.to_dict()
 
+    def review_traceability_cross_document(
+        self,
+        items: List[tuple],
+        project_id: Optional[int] = None,
+        review_context: Optional[Dict[str, Any]] = None,
+    ) -> dict:
+        """
+        跨文档可追溯性专项审核。items = [(path, display_name), ...]。
+        读取各文件正文后调用 reviewer 专项流程，并结合审核点知识库中可追溯性相关检索结果。
+        """
+        doc_list = []
+        for path, display_name in items:
+            try:
+                docs = load_single_file(path)
+                text = "\n\n".join(getattr(d, "page_content", str(d)) for d in docs) if docs else ""
+            except Exception:
+                text = ""
+            doc_list.append((display_name, text))
+        ctx = self._build_review_context(project_id, review_context) if (project_id or review_context) else review_context
+        report = self.reviewer.review_traceability_cross_document(doc_list, review_context=ctx)
+        out = report.to_dict()
+        out["file_name"] = out.get("file_name") or "跨文档可追溯性审核"
+        out["original_filename"] = "跨文档可追溯性审核"
+        out["related_doc_names"] = [n for n, _ in doc_list]
+        return out
+
     # ─── 通用查询 ────────────────────────────────────
 
     def search_knowledge(self, query: str, top_k: int = 5, use_checkpoints: bool = False) -> List[dict]:

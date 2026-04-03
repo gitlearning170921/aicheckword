@@ -19,11 +19,12 @@ for _np in ("NO_PROXY", "no_proxy"):
 import json
 import copy
 import gc
+import pickle
 import html
 import time
 import tempfile
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 import uuid
 import shutil
 import traceback
@@ -40,6 +41,100 @@ logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
 logging.getLogger("chromadb").setLevel(logging.WARNING)
 
 import streamlit as st
+import pandas as pd
+
+
+def _st_button_compat(label: str, *, key: str, **kwargs) -> bool:
+    """兼容旧版 Streamlit：无 use_container_width 等参数时自动降级。"""
+    safe = {k: v for k, v in kwargs.items() if k in ("help", "disabled", "on_click", "args", "kwargs")}
+    try:
+        return st.button(label, key=key, use_container_width=True, **safe)
+    except TypeError:
+        try:
+            return st.button(label, key=key, **safe)
+        except TypeError:
+            return st.button(label, key=key)
+
+
+def _st_radio_compat(
+    label: str,
+    options,
+    *,
+    key: str,
+    index: Optional[int] = None,
+    horizontal: bool = True,
+    **kwargs,
+):
+    """兼容旧版 Streamlit：无 radio(horizontal=...) 时退回纵向排列。"""
+    kw = {"key": key, **kwargs}
+    if index is not None:
+        kw["index"] = index
+    if horizontal:
+        try:
+            return st.radio(label, options, horizontal=True, **kw)
+        except TypeError:
+            pass
+    return st.radio(label, options, **kw)
+
+
+def _st_main_page_nav(labels: list, *, state_key: str, title: str = "选择功能"):
+    """顶部功能入口：有 horizontal radio 时用横向单选；极旧版（如 Streamlit 1.9）用两行按钮 + 状态变量。"""
+    if not labels:
+        raise ValueError("_st_main_page_nav: empty labels")
+    if state_key not in st.session_state or st.session_state[state_key] not in labels:
+        st.session_state[state_key] = labels[0]
+    try:
+        return st.radio(title, labels, horizontal=True, key=state_key)
+    except TypeError:
+        pass
+    st.markdown(f"**{title}**")
+    half = (len(labels) + 1) // 2
+    row_a, row_b = labels[:half], labels[half:]
+    ra = st.columns(len(row_a))
+    for i, lab in enumerate(row_a):
+        with ra[i]:
+            if _st_button_compat(lab, key=f"{state_key}_rowa_{i}"):
+                st.session_state[state_key] = lab
+    if row_b:
+        rb = st.columns(len(row_b))
+        for j, lab in enumerate(row_b):
+            with rb[j]:
+                if _st_button_compat(lab, key=f"{state_key}_rowb_{j}"):
+                    st.session_state[state_key] = lab
+    cur = st.session_state[state_key]
+    st.caption(f"当前：**{cur}**")
+    return cur
+
+
+def _st_run_tabs_or_pick(labels: list, *, radio_label: str, session_key: str, tab_bodies: list):
+    """有 st.tabs 时用原生标签页；否则用横向按钮行模拟（比纵向 radio 更接近「横向 Tab」）。
+
+    说明：Streamlit 1.9 等极旧版本无 st.tabs、无 radio(horizontal=)，原先会退化为纵向列表。
+    """
+    if len(labels) != len(tab_bodies):
+        raise ValueError("_st_run_tabs_or_pick: labels and tab_bodies length mismatch")
+    tabs_fn = getattr(st, "tabs", None)
+    if callable(tabs_fn):
+        widgets = tabs_fn(labels)
+        for i, w in enumerate(widgets):
+            with w:
+                tab_bodies[i]()
+        return
+    idx_key = f"{session_key}_poly_tab_idx"
+    if idx_key not in st.session_state:
+        st.session_state[idx_key] = 0
+    n = len(labels)
+    st.caption(radio_label)
+    btn_cols = st.columns(n)
+    for i, lab in enumerate(labels):
+        with btn_cols[i]:
+            if _st_button_compat(lab, key=f"{session_key}_poly_tb_{i}"):
+                st.session_state[idx_key] = i
+    idx = int(st.session_state.get(idx_key) or 0)
+    idx = max(0, min(idx, n - 1))
+    st.session_state[idx_key] = idx
+    tab_bodies[idx]()
+
 
 from config import settings
 from src.core.agent import ReviewAgent
@@ -52,6 +147,9 @@ from src.core.document_loader import (
     is_deprecated_path,
     extract_section_outline_from_texts,
 )
+from src.core.langchain_compat import Document as LCDocument
+from src.core.knowledge_base import _add_batch_with_retry, annotate_main_knowledge_documents
+from src.core.audit_perf import audit_perf_enabled, audit_perf_log, audit_perf_time_block
 from src.core.db import (
     load_app_settings,
     save_app_settings,
@@ -65,11 +163,13 @@ from src.core.db import (
     get_audit_reports_by_file_name,
     get_audit_report_file_names,
     update_audit_report,
+    invalidate_audit_reports_list_cache,
     save_audit_correction,
     get_knowledge_stats,
     get_checkpoint_stats,
     get_knowledge_stats_by_category,
     clear_knowledge_docs,
+    append_knowledge_docs,
     save_audit_checklist,
     get_audit_checklists,
     get_audit_checklist_by_id,
@@ -122,7 +222,7 @@ from src.core.db import (
     OP_TYPE_TRANSLATION_ERROR,
 )
 from src.core.report_export import report_to_html, report_to_docx, report_to_pdf, report_to_excel, report_to_docx_with_comments, report_todo_to_csv, report_todo_to_pdf, report_todo_to_docx, report_todo_to_excel
-from src.streamlit_compat import streamlit_rerun
+from src.streamlit_compat import streamlit_divider, streamlit_rerun
 from src.system_config_ui import render_system_config_page
 
 
@@ -912,14 +1012,179 @@ def _render_loading_overlay():
 CATEGORY_LABELS = {"regulation": "法规文件", "program": "程序文件", "project_case": "项目案例文件", "glossary": "词条"}
 CATEGORY_VALUES = {"法规文件": "regulation", "程序文件": "program", "项目案例文件": "project_case", "词条": "glossary"}
 
+_TRAIN_CHUNKED_JOB_KEY = "_train_embed_chunked_job"
 
-def _train_single_file(agent, file_path, file_name, status_box, embed_bar, log_lines, category: str = "regulation", case_id=None):
+
+def _effective_embed_batch_size(total: int, batch_size: int = 12) -> int:
+    threshold = getattr(settings, "embedding_large_file_threshold", 60)
+    max_batch = getattr(settings, "embedding_large_file_batch_size", 12)
+    return min(batch_size, max_batch) if total > threshold else batch_size
+
+
+def _plain_specs_to_lc_documents(specs: list) -> list:
+    return [
+        LCDocument(page_content=(p.get("page_content") or ""), metadata=dict(p.get("metadata") or {}))
+        for p in specs
+    ]
+
+
+def _lc_documents_to_plain_specs(chunks: list) -> list:
+    return [
+        {"page_content": d.page_content or "", "metadata": dict(d.metadata or {})}
+        for d in chunks
+    ]
+
+
+def _clear_train_chunked_job(job: Optional[dict] = None) -> None:
+    j = job if job is not None else st.session_state.get(_TRAIN_CHUNKED_JOB_KEY)
+    if not j:
+        st.session_state.pop(_TRAIN_CHUNKED_JOB_KEY, None)
+        return
+    p = j.get("pickle_path")
+    if p:
+        try:
+            Path(p).unlink(missing_ok=True)
+        except Exception:
+            pass
+    st.session_state.pop(_TRAIN_CHUNKED_JOB_KEY, None)
+
+
+def _train_embed_resume_progress_for_ui(queue_idx: int, display_name: str) -> tuple:
+    """若当前文件正在分段向量化，返回 (0~1 的已写入比例, 说明文案)。供在 init_agent 之前渲染进度条。"""
+    job = st.session_state.get(_TRAIN_CHUNKED_JOB_KEY)
+    if not job:
+        return 0.0, ""
+    if job.get("queue_idx") != queue_idx or job.get("display_name") != display_name:
+        return 0.0, ""
+    tot = int(job.get("total") or 0)
+    done = int(job.get("next_i") or 0)
+    if tot <= 0:
+        return 0.0, ""
+    frac = min(1.0, max(0.0, done / tot))
+    cap = (
+        f"📊 **本文件**向量化进度：{done}/{tot} 块（分段刷新页面中；请勿长时间将本标签页置于后台）"
+    )
+    return frac, cap
+
+
+def _train_single_file(
+    agent,
+    file_path,
+    file_name,
+    status_box,
+    embed_bar,
+    log_lines,
+    category: str = "regulation",
+    case_id=None,
+    queue_idx: Optional[int] = None,
+):
     """
     训练单个文件。通过 st.empty() 实时刷新状态。
+    分块数较多时按多轮 rerun 分段向量化，降低长时间阻塞导致的 WebSocket 断连（表现为训练「自动取消」）。
     log_lines: list, 累积日志，每次追加后刷新显示。
     返回 (成功?, 块数, 耗时)
     """
     t0 = time.time()
+    st_chunk_th = max(1, int(getattr(settings, "embedding_streamlit_chunk_threshold", 48)))
+    batches_per_rerun = max(1, int(getattr(settings, "embedding_streamlit_batches_per_rerun", 1)))
+
+    job = st.session_state.get(_TRAIN_CHUNKED_JOB_KEY)
+    if job and queue_idx is not None:
+        if job.get("queue_idx") != queue_idx or job.get("display_name") != file_name:
+            _clear_train_chunked_job(job)
+
+    job = st.session_state.get(_TRAIN_CHUNKED_JOB_KEY)
+    if (
+        job
+        and queue_idx is not None
+        and job.get("queue_idx") == queue_idx
+        and job.get("display_name") == file_name
+        and (job.get("collection") or "") == (agent.collection_name or "")
+    ):
+        pickle_path = job.get("pickle_path")
+        if not pickle_path or not Path(pickle_path).is_file():
+            _clear_train_chunked_job(job)
+            status_box.error(f"[{file_name}] 分段训练状态丢失，请重新训练该文件。")
+            log_lines.append(f"- :x: **{file_name}** 分段状态丢失，已中止")
+            return False, 0, time.time() - t0
+        try:
+            with open(pickle_path, "rb") as f:
+                specs = pickle.load(f)
+            chunks = _plain_specs_to_lc_documents(specs)
+        except Exception as e:
+            _clear_train_chunked_job(job)
+            err_msg = str(e)
+            log_lines.append(f"- :x: **{file_name}** 恢复分段训练失败：{err_msg}")
+            status_box.error(f"恢复失败：{err_msg}")
+            return False, 0, time.time() - t0
+
+        total = len(chunks)
+        eff_bs = int(job.get("effective_batch_size") or _effective_embed_batch_size(total, 12))
+        next_i = int(job.get("next_i") or 0)
+        t_start = float(job.get("t0") or t0)
+        embed_bar.progress(min(1.0, max(0.0, next_i / total)) if total else 0.0)
+
+        batches_this_run = 0
+        try:
+            while next_i < total and batches_this_run < batches_per_rerun:
+                batch = chunks[next_i : next_i + eff_bs]
+                if not batch:
+                    break
+                batch_start = next_i
+                _add_batch_with_retry(agent.kb.vectorstore, batch)
+                append_knowledge_docs(
+                    agent.collection_name, file_name, batch_start, batch, category=category
+                )
+                next_i += len(batch)
+                batches_this_run += 1
+                frac = min(1.0, max(0.0, next_i / total))
+                embed_bar.progress(frac)
+                pct = int(frac * 100)
+                status_box.info(
+                    f"🔄 [{file_name}] 向量化 {next_i}/{total} 块 ({pct}%)（分段刷新防页面断连）"
+                )
+        except Exception as e:
+            tb = traceback.format_exc()
+            err_msg = str(e)
+            _clear_train_chunked_job(job)
+            log_lines.append(f"- :x: **{file_name}** 入库失败：{err_msg}")
+            status_box.error(f"入库失败：{err_msg}")
+            add_operation_log(
+                op_type="train_error",
+                collection=agent.collection_name,
+                file_name=file_name,
+                source=str(file_path),
+                extra={"error": err_msg, "traceback": tb, "stage": "embed_chunked", "category": category},
+                model_info=get_current_model_info(),
+            )
+            return False, 0, time.time() - t_start
+
+        if next_i >= total:
+            _clear_train_chunked_job(job)
+            elapsed = time.time() - t_start
+            embed_bar.progress(1.0)
+            log_lines.append(
+                f"- :white_check_mark: **{file_name}** — {total} 块, {_format_time(elapsed)}"
+            )
+            status_box.success(f"[{file_name}] 完成! {total} 块, {_format_time(elapsed)}")
+            add_operation_log(
+                op_type="train",
+                collection=agent.collection_name,
+                file_name=file_name,
+                source=str(file_path),
+                extra={"chunks": total, "duration_sec": elapsed, "category": category, "streamlit_chunked": True},
+                model_info=get_current_model_info(),
+            )
+            return True, total, elapsed
+
+        job["next_i"] = next_i
+        st.session_state[_TRAIN_CHUNKED_JOB_KEY] = job
+        try:
+            st.session_state["train_queue_log"] = list(log_lines)
+        except Exception:
+            pass
+        time.sleep(0.12)
+        st.experimental_rerun()
 
     status_box.info(f"📂 [{file_name}] 正在加载文件...")
     try:
@@ -947,23 +1212,68 @@ def _train_single_file(agent, file_path, file_name, status_box, embed_bar, log_l
         status_box.warning(f"[{file_name}] 内容为空")
         return True, 0, time.time() - t0
 
-    embed_bar.progress(0)
+    total = len(chunks)
 
-    def on_batch_done(done, total):
-        pct = int(done / total * 100)
-        embed_bar.progress(pct)
+    if queue_idx is not None and total > st_chunk_th:
+        annotate_main_knowledge_documents(chunks, file_name, category=category, case_id=case_id)
+        fd, pickle_path = tempfile.mkstemp(suffix=".pkl", prefix="aicheckword_chunked_embed_")
+        os.close(fd)
+        try:
+            with open(pickle_path, "wb") as f:
+                pickle.dump(_lc_documents_to_plain_specs(chunks), f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            try:
+                Path(pickle_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            err_msg = str(e)
+            log_lines.append(f"- :x: **{file_name}** 无法启动分段训练：{err_msg}")
+            status_box.error(err_msg)
+            return False, 0, time.time() - t0
+
+        st.session_state[_TRAIN_CHUNKED_JOB_KEY] = {
+            "pickle_path": pickle_path,
+            "queue_idx": queue_idx,
+            "display_name": file_name,
+            "collection": agent.collection_name,
+            "category": category,
+            "case_id": case_id,
+            "next_i": 0,
+            "total": total,
+            "effective_batch_size": _effective_embed_batch_size(total, 12),
+            "batches_per_rerun": batches_per_rerun,
+            "t0": time.time(),
+        }
+        embed_bar.progress(0.0)
         status_box.info(
-            f"🔄 [{file_name}] 向量化 {done}/{total} 块 ({pct}%)"
+            f"📎 [{file_name}] 共 {total} 块，将分段向量化（每步刷新页面），请勿切换至后台过久…"
+        )
+        try:
+            st.session_state["train_queue_log"] = list(log_lines)
+        except Exception:
+            pass
+        time.sleep(0.12)
+        st.experimental_rerun()
+
+    embed_bar.progress(0.0)
+
+    def on_batch_done(done, total_n):
+        frac = min(1.0, max(0.0, (done / total_n) if total_n else 0.0))
+        embed_bar.progress(frac)
+        pct = int(frac * 100)
+        status_box.info(
+            f"🔄 [{file_name}] 向量化 {done}/{total_n} 块 ({pct}%)"
         )
 
     try:
-        with st.spinner(f"[{file_name}] 正在向量化 {len(chunks)} 块..."):
-            add_progress = agent.kb.add_documents_with_progress
-            sig = inspect.signature(add_progress)
-            kwargs = dict(documents=chunks, batch_size=12, callback=on_batch_done, file_name=file_name, category=category)
-            if "case_id" in sig.parameters:
-                kwargs["case_id"] = case_id
-            count = add_progress(**kwargs)
+        # 不要用 st.spinner 包住整段向量化：块内进度条/状态往往要等 spinner 结束才一并刷新，表现为「看不到进度」
+        status_box.info(f"🔄 [{file_name}] 正在向量化 {len(chunks)} 块…")
+        add_progress = agent.kb.add_documents_with_progress
+        sig = inspect.signature(add_progress)
+        kwargs = dict(documents=chunks, batch_size=12, callback=on_batch_done, file_name=file_name, category=category)
+        if "case_id" in sig.parameters:
+            kwargs["case_id"] = case_id
+        count = add_progress(**kwargs)
     except Exception as e:
         tb = traceback.format_exc()
         err_msg = str(e)
@@ -980,7 +1290,7 @@ def _train_single_file(agent, file_path, file_name, status_box, embed_bar, log_l
         return False, 0, time.time() - t0
 
     elapsed = time.time() - t0
-    embed_bar.progress(100)
+    embed_bar.progress(1.0)
     log_lines.append(
         f"- :white_check_mark: **{file_name}** — {count} 块, {_format_time(elapsed)}"
     )
@@ -1064,6 +1374,7 @@ def render_step1_page():
         if not _ha_queue_items:
             st.warning("\u5168\u90e8\u6587\u4ef6\u5747\u91cd\u540d\uff0c\u5df2\u8df3\u8fc7\uff0c\u65e0\u6587\u4ef6\u9700\u8981\u8bad\u7ec3\u3002")
         else:
+            _clear_train_chunked_job()
             st.session_state["train_queue"] = _ha_queue_items
             st.session_state["train_queue_index"] = 0
             st.session_state["train_queue_temp_dirs"] = st.session_state.get("train_pending_temp_dirs", [])
@@ -1082,9 +1393,7 @@ def render_step1_page():
                 st.session_state["train_queue_case_id"] = _ha_case_id
             st.experimental_rerun()
 
-    tab1, tab2, tab3 = st.tabs(["📤 上传文件训练", "📂 从目录训练", "📝 生成审核点"])
-
-    with tab1:
+    def _step1_tab_upload():
         if (
             st.session_state.get("train_queue")
             and st.session_state.get("train_queue_source") == "directory"
@@ -1288,6 +1597,9 @@ def render_step1_page():
 
             # 先输出提示，再加载 agent（首次加载较慢，用 spinner 包住避免误以为死机）
             st.info(f"🔄 **正在训练第 {idx + 1}/{total_files} 个文件**，请勿关闭页面。")
+            _emb_frac0, _emb_cap0 = _train_embed_resume_progress_for_ui(idx, display_name)
+            if _emb_cap0:
+                st.caption(_emb_cap0)
             try:
                 with st.spinner("正在加载模型与知识库（首次约 10–30 秒，请稍候）…"):
                     agent = init_agent()
@@ -1303,7 +1615,8 @@ def render_step1_page():
             overall_bar = st.progress((idx) / max(total_files, 1))
             overall_text = st.empty()
             status_box = st.empty()
-            embed_bar = st.empty()
+            # 须用 st.progress(0) 而非 st.empty()：在部分 Streamlit 版本上对 empty 调用 .progress() 会导致嵌入进度条不显示
+            embed_bar = st.progress(min(1.0, max(0.0, _emb_frac0)))
             log_display = st.empty()
             overall_text.info(
                 f"总进度 {idx + 1}/{total_files} | 成功 {st.session_state.get('train_queue_success', 0)} | "
@@ -1319,7 +1632,18 @@ def render_step1_page():
                     except Exception as e:
                         log_lines.append(f"- ⚠️ **{display_name}** 覆盖前清理失败：{e}")
 
-                ok, chunks, elapsed = _train_single_file(agent, path, display_name, status_box, embed_bar, log_lines, category=category, case_id=st.session_state.get("train_queue_case_id"))
+                ok, chunks, elapsed = _train_single_file(
+                    agent,
+                    path,
+                    display_name,
+                    status_box,
+                    embed_bar,
+                    log_lines,
+                    category=category,
+                    case_id=st.session_state.get("train_queue_case_id"),
+                    queue_idx=idx,
+                )
+                log_display.markdown("\n".join(log_lines))
                 if ok:
                     st.session_state["train_queue_success"] = st.session_state.get("train_queue_success", 0) + 1
                     st.session_state["train_queue_chunks"] = st.session_state.get("train_queue_chunks", 0) + chunks
@@ -1334,6 +1658,10 @@ def render_step1_page():
             except Exception as e:
                 log_lines.append(f"- :x: **{display_name}** 异常：{e}")
                 st.session_state["train_queue_fail"] = st.session_state.get("train_queue_fail", 0) + 1
+                try:
+                    log_display.markdown("\n".join(log_lines))
+                except Exception:
+                    pass
                 try:
                     add_operation_log(
                         op_type="train_error",
@@ -1488,6 +1816,7 @@ def render_step1_page():
                 return
 
             # 无重复时也走“每轮一个文件”队列，避免文档多时中途超时中断
+            _clear_train_chunked_job()
             st.session_state["train_queue"] = items
             st.session_state["train_queue_index"] = 0
             st.session_state["train_queue_temp_dirs"] = temp_dirs
@@ -1506,7 +1835,7 @@ def render_step1_page():
             time.sleep(0.8)
             st.experimental_rerun()
 
-    with tab2:
+    def _step1_tab_directory():
         # 目录训练时在此 tab 显示进度，不在「上传文件训练」页显示
         if (
             st.session_state.get("train_queue")
@@ -1523,6 +1852,9 @@ def render_step1_page():
             log_lines = list(st.session_state.get("train_queue_log", []))
 
             st.info(f"🔄 **正在训练第 {idx + 1}/{total_files} 个文件**（从目录），请勿关闭页面。")
+            _emb_frac0d, _emb_cap0d = _train_embed_resume_progress_for_ui(idx, display_name)
+            if _emb_cap0d:
+                st.caption(_emb_cap0d)
             try:
                 with st.spinner("正在加载模型与知识库（首次约 10–30 秒，请稍候）…"):
                     agent = init_agent()
@@ -1538,7 +1870,7 @@ def render_step1_page():
             overall_bar = st.progress((idx) / max(total_files, 1))
             overall_text = st.empty()
             status_box = st.empty()
-            embed_bar = st.empty()
+            embed_bar = st.progress(min(1.0, max(0.0, _emb_frac0d)))
             log_display = st.empty()
             overall_text.info(
                 f"总进度 {idx + 1}/{total_files} | 成功 {st.session_state.get('train_queue_success', 0)} | "
@@ -1553,7 +1885,18 @@ def render_step1_page():
                         log_lines.append(f"- 🔄 **{display_name}** 已覆盖旧内容，正在重新训练…")
                     except Exception as e:
                         log_lines.append(f"- ⚠️ **{display_name}** 覆盖前清理失败：{e}")
-                ok, chunks, elapsed = _train_single_file(agent, path, display_name, status_box, embed_bar, log_lines, category=category, case_id=train_queue_case_id_dir)
+                ok, chunks, elapsed = _train_single_file(
+                    agent,
+                    path,
+                    display_name,
+                    status_box,
+                    embed_bar,
+                    log_lines,
+                    category=category,
+                    case_id=train_queue_case_id_dir,
+                    queue_idx=idx,
+                )
+                log_display.markdown("\n".join(log_lines))
                 if ok:
                     st.session_state["train_queue_success"] = st.session_state.get("train_queue_success", 0) + 1
                     st.session_state["train_queue_chunks"] = st.session_state.get("train_queue_chunks", 0) + chunks
@@ -1567,6 +1910,10 @@ def render_step1_page():
             except Exception as e:
                 log_lines.append(f"- :x: **{display_name}** 异常：{e}")
                 st.session_state["train_queue_fail"] = st.session_state.get("train_queue_fail", 0) + 1
+                try:
+                    log_display.markdown("\n".join(log_lines))
+                except Exception:
+                    pass
                 try:
                     add_operation_log(
                         op_type="train_error",
@@ -1891,6 +2238,7 @@ def render_step1_page():
                 st.experimental_rerun()
                 return
             # 无重名，直接入队
+            _clear_train_chunked_job()
             st.session_state["train_queue"] = items
             st.session_state["train_queue_index"] = 0
             st.session_state["train_queue_temp_dirs"] = []
@@ -1908,7 +2256,7 @@ def render_step1_page():
                 st.session_state["train_queue_case_id"] = train_case_id_dir
             st.experimental_rerun()
 
-    with tab3:
+    def _step1_tab_generate():
         st.markdown(
             "基于第一步训练的法规知识库，让 AI 自动生成结构化审核点清单。\n"
             "也可以上传已有的**基础审核点文档**，AI 会在此基础上优化补充。"
@@ -2086,6 +2434,14 @@ def render_step1_page():
                         )
                     st.code(traceback.format_exc(), language="text")
 
+    _step1_tab_labels = ["📤 上传文件训练", "📂 从目录训练", "📝 生成审核点"]
+    _st_run_tabs_or_pick(
+        _step1_tab_labels,
+        radio_label="第一步子功能",
+        session_key="step1_tabs",
+        tab_bodies=[_step1_tab_upload, _step1_tab_directory, _step1_tab_generate],
+    )
+
 
 def _render_checklist_preview(checklist: list, flat: bool = False, key_suffix: str = ""):
     """预览审核点清单。flat=True 时用 markdown 展示，避免嵌套 expander 报错"""
@@ -2178,9 +2534,7 @@ def render_step2_page():
     agent = init_agent()
     collection = st.session_state.get("collection_name", "regulations")
 
-    tab_manage, tab_import, tab_projects = st.tabs(["📋 审核点清单管理", "📤 导入审核点", "📁 项目与专属资料"])
-
-    with tab_manage:
+    def _step2_tab_manage():
         # 审核点训练重名确认：若用户点了「训练此清单」且名称已存在，在此确认覆盖或跳过
         if st.session_state.get("train_cl_confirm_id") is not None:
             confirm_id = st.session_state["train_cl_confirm_id"]
@@ -2345,7 +2699,7 @@ def render_step2_page():
                             st.success(f"已删除清单「{cl_name}」")
                             st.experimental_rerun()
 
-    with tab_import:
+    def _step2_tab_import():
         st.markdown("上传审核点 JSON 文件（格式同生成的清单 JSON）或纯文本审核点文档。")
 
         import_file = st.file_uploader(
@@ -2400,8 +2754,16 @@ def render_step2_page():
                 st.error(f"导入失败：{e}")
                 st.code(traceback.format_exc(), language="text")
 
-    with tab_projects:
+    def _step2_tab_projects():
         _render_projects_tab(agent, collection)
+
+    _step2_tab_labels = ["📋 审核点清单管理", "📤 导入审核点", "📁 项目与专属资料"]
+    _st_run_tabs_or_pick(
+        _step2_tab_labels,
+        radio_label="第二步子功能",
+        session_key="step2_tabs",
+        tab_bodies=[_step2_tab_manage, _step2_tab_import, _step2_tab_projects],
+    )
 
 
 def _render_projects_tab(agent, collection: str):
@@ -2892,6 +3254,7 @@ def _train_checklist(agent, checklist: list, cl_id: int, cl_name: str):
 
 def render_step3_page():
     """第三步：文档审核"""
+    _ap_t0 = time.perf_counter()
     st.header("③ 文档审核")
     st.markdown(
         "**第三步**：上传待审核的注册文档，AI 将根据**审核点知识库**（第二步训练结果）及可选的**项目专属要求**识别审核点。"
@@ -2907,7 +3270,7 @@ def render_step3_page():
     # 先渲染审核模式，避免切换时重复执行 init_agent（按项目审核用缓存拉取项目列表，减轻卡顿）
     project_id = None
     review_context = None
-    review_mode = st.radio("审核模式", ["仅通用审核", "按项目审核"], horizontal=True, key="review_mode")
+    review_mode = _st_radio_compat("审核模式", ["仅通用审核", "按项目审核"], key="review_mode")
     if review_mode == "按项目审核":
         projects = _cached_list_projects(collection)
         if not projects:
@@ -3010,9 +3373,7 @@ def render_step3_page():
             except Exception as e:
                 st.error(f"保存失败：{e}")
 
-    tab1, tab2 = st.tabs(["📤 上传文件审核", "📝 文本审核"])
-
-    with tab1:
+    def _step3_tab_upload_review():
         _retry_ok = st.session_state.pop("review_retry_ok_msg", None)
         if _retry_ok:
             st.success(_retry_ok)
@@ -3097,14 +3458,79 @@ def render_step3_page():
                 "进行多文档一致性与模板风格审核（2 个及以上文件时）",
                 value=True,
                 key="do_multi_doc_consistency",
-                help="完成后将额外生成一份「多文档一致性与模板风格」报告，检查各文档间信息一致性、术语与格式风格是否统一。",
+                help="额外生成「多文档一致性与模板风格」报告：产品信息、术语、版本日期、模板风格等跨文档一致性。**不含** REQ/风险/CS/测试编号等追溯链专项（请用下方「跨文档可追溯性审核」按钮）。",
             )
             only_multi_doc = st.checkbox(
                 "仅进行多文档一致性与模板风格审核（不跑单文档审核，需 2 个及以上文件）",
                 value=False,
                 key="only_multi_doc_review",
-                help="勾选后点击下方按钮将只执行多文档一致性/模板风格审核，不逐份单文档审核。",
+                help="只跑多文档一致性/模板风格，不逐份单文档审核。追溯编号跨文档对齐请另点「跨文档可追溯性审核」。",
             )
+            if len(review_files) >= 2:
+                st.caption(
+                    "单文档审核时模型**看不到同批其他文件**，可能误报「未上传其他文档、无法做跨文档追溯」。"
+                    "专项会重点核对：**软件需求规范里追溯表所填 CS 编号**与**风险分析文档**是否一一对应且含义一致；**《软件可追溯性分析》矩阵**与需求/风险/设计/测试文档的**全链路追溯关系**是否一致（不跑单文档审核）。"
+                )
+                if st.button(
+                    "🔗 仅执行：跨文档可追溯性审核（本批全部文件 + 知识库制度）",
+                    key="review_traceability_cross_btn",
+                    help="核对 SRS 追溯表中的 CS 与风险分析、可追溯性分析矩阵与各文档编号是否闭环一致，以及 REQ/测试等编号跨文档对齐。",
+                ):
+                    items_tr: list = []
+                    temp_dirs_tr: list = []
+                    try:
+                        items_tr, temp_dirs_tr = _expand_uploads(review_files)
+                        if len(items_tr) < 2:
+                            st.warning("需要至少 2 个可解析的文件。")
+                        else:
+                            agent = init_agent()
+                            _tr_ctx = dict(review_context) if review_context else {}
+                            _doc_lang_sel = st.session_state.get("review_doc_lang") or "不指定"
+                            _tr_ctx["document_language"] = DOC_LANG_LABEL_TO_VALUE.get(_doc_lang_sel, "")
+                            _tr_ctx["current_provider"] = (
+                                st.session_state.get("current_provider") or settings.provider or ""
+                            ).strip().lower()
+                            if project_id:
+                                _tr_ctx["_filter_by_registration_type"] = True
+                            _rbid_tr = datetime.now().strftime("%Y%m%d_%H%M%S") + "-" + uuid.uuid4().hex[:8]
+                            _tr_ctx["review_batch_id"] = _rbid_tr
+                            st.session_state["review_batch_id"] = _rbid_tr
+                            _tr_ctx["_batch_review"] = True
+                            if (_tr_ctx.get("current_provider") or "").strip().lower() == "deepseek":
+                                _tr_ctx["_skip_llm_summary"] = True
+                            _trace_fn = getattr(agent, "review_traceability_cross_document", None)
+                            if not callable(_trace_fn):
+                                st.error("当前运行环境不支持跨文档可追溯性审核，请确认已更新代码后重启应用。")
+                            else:
+                                _flat = [(p, dn) for (p, dn, _) in items_tr]
+                                with st.spinner("跨文档可追溯性审核中（读取文件 + 知识库检索 + 模型分析）…"):
+                                    tr_rep = _trace_fn(_flat, project_id=project_id, review_context=_tr_ctx)
+                                tr_rep["original_filename"] = tr_rep.get("file_name") or "跨文档可追溯性审核"
+                                tr_rep["related_doc_names"] = [dn for (_, dn, _) in items_tr]
+                                _inject_review_meta(tr_rep, "batch_traceability")
+                                _prev_rep = list(st.session_state.get("review_reports") or [])
+                                _prev_rep.append(tr_rep)
+                                st.session_state.review_reports = _prev_rep
+                                try:
+                                    save_audit_report(
+                                        agent.collection_name,
+                                        tr_rep,
+                                        model_info=get_current_model_info() or "",
+                                    )
+                                    _invalidate_audit_history_cache()
+                                except Exception as _save_tr:
+                                    st.warning(f"跨文档可追溯性报告已生成，但写入历史失败：{_save_tr}")
+                                st.success(
+                                    f"已完成跨文档可追溯性审核（{tr_rep.get('total_points', 0)} 条审核点），"
+                                    "报告已追加到下方列表并尽量写入历史。"
+                                )
+                    finally:
+                        for _p, _dn, _arch in items_tr:
+                            if not _arch:
+                                Path(_p).unlink(missing_ok=True)
+                        for _d in temp_dirs_tr:
+                            shutil.rmtree(_d, ignore_errors=True)
+                    _streamlit_rerun()
         if review_files and st.button("🔍 开始批量审核" if len(review_files) > 1 else "🔍 开始审核", key="review_btn"):
             items, temp_dirs = _expand_uploads(review_files)
 
@@ -3846,7 +4272,7 @@ def render_step3_page():
                 st.session_state["review_retry_ok_msg"] = f"已对 **{n_fail}** 个失败项重新审核并合并到本批报告。"
                 st.experimental_rerun()
 
-    with tab2:
+    def _step3_tab_text_review():
         review_text_doc_lang = st.selectbox(
             "项目案例审核语言",
             DOC_LANG_OPTIONS,
@@ -3914,6 +4340,14 @@ def render_step3_page():
                     model_info=get_current_model_info(),
                 )
 
+    _step3_review_tab_labels = ["📤 上传文件审核", "📝 文本审核"]
+    _st_run_tabs_or_pick(
+        _step3_review_tab_labels,
+        radio_label="第三步审核方式",
+        session_key="step3_review_tabs",
+        tab_bodies=[_step3_tab_upload_review, _step3_tab_text_review],
+    )
+
     if "review_reports" in st.session_state and st.session_state.review_reports:
         st.markdown("---")
         reports_list = st.session_state.review_reports
@@ -3932,11 +4366,44 @@ def render_step3_page():
     # 历史审核报告
     st.markdown("---")
     st.subheader("📂 历史审核报告")
+    st.caption(
+        "提示：Streamlit 在切换下拉、修改输入时会重跑页面；已关闭「fastReruns」并固定报告编辑框高度，减轻误触刷新感。"
+        " 长时间编辑时请避免同时打开多个本应用标签页。"
+    )
+
+    if st.session_state.get("_hist_editing_id") is not None:
+        st.session_state["_step3_show_history_panel"] = True
+
+    if not st.session_state.get("_step3_show_history_panel", False):
+        st.caption(
+            "为加快本页响应，**历史列表与整合报告**默认未加载；仅审核当前文档时可不展开。"
+            " 需要查看/编辑历史、整合多份报告时再点下方按钮。"
+        )
+        if st.button("📂 加载历史审核与整合功能", key="_step3_open_history_panel"):
+            st.session_state["_step3_show_history_panel"] = True
+            _streamlit_rerun()
+        if audit_perf_enabled():
+            audit_perf_log("render_step3_page", (time.perf_counter() - _ap_t0) * 1000.0, "history_panel_collapsed")
+        return
+
+    st.caption("首次展开本区域会查询 MySQL 并渲染整合区；若长时间白屏请检查数据库连接或查看终端报错。")
+    _hclose, _ = st.columns([1, 3])
+    with _hclose:
+        if st.session_state.get("_hist_editing_id") is None:
+            if st.button("收起历史区域（加快后续操作）", key="_step3_close_history_panel"):
+                st.session_state["_step3_show_history_panel"] = False
+                _streamlit_rerun()
+        else:
+            st.caption("正在编辑历史报告时请先在上方「关闭编辑区」，再收起本区域。")
 
     with st.expander("📋 整合报告（将同一文件或所选多份报告的问题点合并为一份完整报告）", expanded=False):
         collection = st.session_state.get("collection_name", "regulations")
         st.caption("多次审核同一文件时，各次报告问题点可能不一致。可在此按「文件名」或「勾选多份报告」整合为一份去重后的完整报告。")
-        mode = st.radio("整合方式", ["按文件名整合（同一文件的所有历史报告）", "选择多份报告整合"], key="merge_report_mode", horizontal=True)
+        mode = _st_radio_compat(
+            "整合方式",
+            ["按文件名整合（同一文件的所有历史报告）", "选择多份报告整合"],
+            key="merge_report_mode",
+        )
         merged_report = None
         if mode == "按文件名整合（同一文件的所有历史报告）":
             file_names = get_audit_report_file_names(collection)
@@ -3971,7 +4438,15 @@ def render_step3_page():
             if not merged_report.get("related_doc_names"):
                 merged_report["related_doc_names"] = [merged_report.get("original_filename", merged_report.get("file_name", "整合报告"))]
             st.success(f"已生成整合报告：共 **{merged_report.get('total_points', 0)}** 个不重复问题点。")
-            _render_multi_doc_report(merged_report, 0, [merged_report], key_prefix="merged")
+            # 与主报告一致：表格摘要 + 下拉只展开一条审核点，避免 _render_multi_doc_report 对每条都建 text_area 导致极慢
+            _render_reports_table_layout(
+                [merged_report],
+                base_key_prefix="merged_r",
+                history_id=0,
+                parent_batch_report=None,
+                key_suffix="_merged_edit",
+                allow_nested_expander=True,
+            )
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("保存为历史报告", key="save_merged_report_btn"):
@@ -4022,7 +4497,14 @@ def render_step3_page():
 
     try:
         collection = st.session_state.get("collection_name", "regulations")
-        history = _get_cached_audit_reports(collection)
+        try:
+            history = _get_cached_audit_reports(collection)
+        except Exception as _hist_load_ex:
+            st.error(f"历史列表加载失败：{_hist_load_ex}")
+            history = []
+        _open_hist_err = st.session_state.pop("_hist_open_error", None)
+        if _open_hist_err:
+            st.error(_open_hist_err)
         hed = st.session_state.get("_hist_editing_id")
         er = st.session_state.get("_hist_editing_report")
 
@@ -4034,35 +4516,18 @@ def render_step3_page():
                     _hid = st.session_state.get("_hist_editing_id")
                     st.session_state.pop("_hist_editing_id", None)
                     st.session_state.pop("_hist_editing_report", None)
+                    st.session_state.pop("_hist_pending_corrections", None)
+                    st.session_state.pop("_hist_draft_dirty", None)
                     if _hid is not None:
                         st.session_state.pop(f"_hist_dl_blob_{_hid}", None)
                     _invalidate_audit_history_cache()
                     _streamlit_rerun()
             with h2:
-                st.caption(f"报告 ID **{hed}**；在下方用下拉框选「审核点」再编辑或纠正，保存后自动退出纠正界面。")
-            fname = er.get("file_name") or er.get("original_filename") or "report"
-            _render_history_meta_header(er, hed)
-            if er.get("batch") and er.get("reports"):
-                _render_reports_table_layout(
-                    er["reports"],
-                    base_key_prefix=f"hist_{hed}_r",
-                    history_id=hed,
-                    parent_batch_report=er,
-                    key_suffix=f"_hist_{hed}",
-                    allow_nested_expander=False,
+                st.caption(
+                    f"报告 ID **{hed}**：审核点以**整表**展示与编辑，点 **✏编号** 展开纠正。"
+                    f" 本地批量模式（默认开）下改完点顶部「一次性保存」写库；关闭则每表下可「保存本表到数据库」。"
                 )
-            else:
-                if not er.get("related_doc_names"):
-                    er["related_doc_names"] = [er.get("original_filename", er.get("file_name", fname or "未知"))]
-                _render_reports_table_layout(
-                    [er],
-                    base_key_prefix=f"hist_{hed}",
-                    history_id=hed,
-                    parent_batch_report=None,
-                    key_suffix=f"_hist_{hed}",
-                    allow_nested_expander=False,
-                )
-            _render_history_report_download(hed, er, fname or "report")
+            _render_open_history_editor_body()
         else:
             r1, r2 = st.columns([1, 4])
             with r1:
@@ -4091,6 +4556,8 @@ def render_step3_page():
                             batch_part = f"[批次汇总·{bid}] "
                         elif rk == "batch_multi_doc":
                             batch_part = f"[多文档一致性·{bid}] "
+                        elif rk == "batch_traceability":
+                            batch_part = f"[跨文档可追溯·{bid}] "
                         elif rk == "batch_member":
                             batch_part = f"[批次单文·{bid}] "
                         else:
@@ -4099,32 +4566,36 @@ def render_step3_page():
                     suf = f" | {mid}" if mid else ""
                     return f"{r.get('created_at', '')} | {_tag}{batch_part}{r.get('file_name', '')} | {r.get('total_points', 0)}点 (ID:{r.get('id')}){suf}"
 
-                sel_i = st.selectbox(
+                st.selectbox(
                     "选择历史报告",
                     options=list(range(len(history))),
                     format_func=_hist_row_label,
                     key="_hist_pick_idx",
                 )
-                if st.button("📂 打开选中报告", key="_hist_open_sel"):
-                    rec = history[sel_i]
-                    rpt = rec.get("report")
-                    if not rpt and rec.get("report_json"):
-                        try:
-                            rpt = json.loads(rec["report_json"])
-                        except Exception:
-                            rpt = {}
-                    if not rpt:
-                        st.error("该记录没有可展示的报告正文。")
-                    else:
-                        try:
-                            st.session_state["_hist_editing_id"] = rec["id"]
-                            st.session_state["_hist_editing_report"] = copy.deepcopy(rpt)
-                        except Exception as _copy_err:
-                            st.error(f"加载报告到编辑区失败：{_copy_err}")
-                        else:
-                            _streamlit_rerun()
+                _pick_i = int(st.session_state.get("_hist_pick_idx", 0) or 0)
+                if 0 <= _pick_i < len(history):
+                    _rid = int(history[_pick_i].get("id") or 0)
+                    if _rid > 0:
+                        _lite_url = _fastapi_report_edit_url(_rid)
+                        st.markdown(
+                            f'<p><b>轻量编辑</b>（新窗口，免 Streamlit 整页重载）：'
+                            f'<a href="{html.escape(_lite_url, quote=True)}" target="_blank" rel="noopener noreferrer">'
+                            f"{html.escape(_lite_url, quote=False)}</a></p>",
+                            unsafe_allow_html=True,
+                        )
+                        st.caption("若链接打不开，请设置环境变量 AICHECKWORD_API_PUBLIC_BASE 为浏览器可访问的 API 根地址（如 http://服务器IP:8000）。")
+                # on_click 在本轮 rerun 的脚本主体之前执行，打开后同一次运行即可进入编辑区分支，
+                # 避免先渲染列表再 st.rerun 与 st.fragment 二次重绘导致的「加载完又收起」。
+                st.button(
+                    "📂 打开选中报告",
+                    key="_hist_open_sel",
+                    on_click=_hist_open_selected_callback,
+                )
     except Exception as e:
         st.warning(f"加载历史报告失败：{e}")
+
+    if audit_perf_enabled():
+        audit_perf_log("render_step3_page", (time.perf_counter() - _ap_t0) * 1000.0, "full")
 
 
 _SEVERITY_ICONS = {"high": "🔴", "medium": "🟡", "low": "🔵", "info": "ℹ️"}
@@ -4171,7 +4642,7 @@ def _build_review_meta_dict() -> dict:
 
 def _inject_review_meta(report: dict, batch_record_kind: Optional[str] = None):
     """将当前审核模式/项目信息注入报告 dict，便于后续展示与持久化。
-    batch_record_kind：批量审核时区分记录类型（batch_member / batch_aggregated / batch_multi_doc）。"""
+    batch_record_kind：批量审核时区分记录类型（batch_member / batch_aggregated / batch_multi_doc / batch_traceability）。"""
     report["_review_meta"] = _build_review_meta_dict()
     meta = report.get("_review_meta") or {}
     _bid = (meta.get("review_batch_id") or "").strip()
@@ -4191,6 +4662,255 @@ def _get_multi_doc_default_action(severity: str) -> str:
         "info": "无需修改",
     }
     return defaults.get(severity, "无需修改")
+
+
+def _coerce_modify_docs_list(raw) -> list:
+    """将审核点 modify_docs 规范为字符串列表（支持 tuple、JSON 数组字符串、单字符串）。"""
+    if raw is None:
+        return []
+    if isinstance(raw, tuple):
+        raw = list(raw)
+    if isinstance(raw, list):
+        out = []
+        for x in raw:
+            if x is None:
+                continue
+            s = str(x).strip()
+            if s:
+                out.append(s)
+        return out
+    if isinstance(raw, str):
+        t = raw.strip()
+        if t.startswith("["):
+            try:
+                parsed = json.loads(t)
+                if isinstance(parsed, (list, tuple)):
+                    return _coerce_modify_docs_list(parsed)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        return [t] if t else []
+    s = str(raw).strip()
+    return [s] if s else []
+
+
+def _unique_doc_display_names(doc_names: list) -> list:
+    """related_doc_names 去重保序，避免重复 option 导致 multiselect 选中异常。"""
+    seen = set()
+    out: list = []
+    for d in doc_names or []:
+        if d is None:
+            continue
+        s = str(d).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _point_modify_docs_merged_list(point: Optional[dict]) -> list:
+    """合并审核点里可能分散在多个键下的「需修改文档」（如 modify_docs、需修改文档）。"""
+    if not isinstance(point, dict):
+        return []
+    merged: list = []
+    for k in ("modify_docs", "需修改文档", "modify_documents"):
+        if k not in point:
+            continue
+        merged.extend(_coerce_modify_docs_list(point.get(k)))
+    seen = set()
+    out: list = []
+    for x in merged:
+        x = (x or "").strip()
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _effective_point_modify_docs_list(
+    point: Optional[dict],
+    related_doc_names: Optional[list] = None,
+    file_name_hint: str = "",
+) -> list:
+    """历史表/导出用：优先合并 modify_docs 等键；仍为空时用本份报告的关联文档名或文件名推断（单文档常见）。"""
+    md = _point_modify_docs_merged_list(point)
+    if md:
+        return md
+    rel = related_doc_names if related_doc_names is not None else []
+    u = _unique_doc_display_names(rel)
+    if len(u) == 1:
+        return list(u)
+    if len(u) > 1:
+        # 多文档报告：须以审核点内 modify_docs 为准，勿用单文件名误填整列
+        return []
+    fn = (file_name_hint or "").strip()
+    if fn and fn != "未知":
+        return [fn]
+    return []
+
+
+def _doc_file_stem_cf(path: str) -> str:
+    """文件名（不含路径）去扩展名后小写，用于「说明书」与「说明书.docx」对齐。"""
+    base = (path or "").replace("\\", "/").split("/")[-1].strip()
+    if not base:
+        return ""
+    b = base.casefold()
+    return b.rsplit(".", 1)[0] if "." in b else b
+
+
+def _strip_doc_display_wrappers(segment: str) -> str:
+    """去掉显示名两侧的书名号、引号等（如 related_doc_names 为「xxx.docx」而 modify_docs 为 xxx.docx）。"""
+    s = (segment or "").strip()
+    for _ in range(4):
+        changed = False
+        if s.startswith(("\u300c", "\u300a", "\u201c", "\u2018", '"', "'")):
+            s = s[1:].lstrip()
+            changed = True
+        if s.endswith(("\u300d", "\u300b", "\u201d", "\u2019", '"', "'")):
+            s = s[:-1].rstrip()
+            changed = True
+        if not changed:
+            break
+    return s.strip()
+
+
+def _match_doc_name_option(option: str, stored: str) -> bool:
+    """option 为 related_doc_names 中一项；stored 为 modify_docs 中一项（可能为路径、仅文件名或简称）。"""
+    o = (option or "").replace("\\", "/").strip()
+    s = (stored or "").replace("\\", "/").strip()
+    if not o or not s:
+        return False
+    ob = _strip_doc_display_wrappers(o.split("/")[-1])
+    sb = _strip_doc_display_wrappers(s.split("/")[-1])
+    ol, sl = ob.casefold(), sb.casefold()
+    if (
+        o == s
+        or o.endswith("/" + s)
+        or s.endswith("/" + o)
+        or ol == sl
+        or o.endswith("/" + sb)
+        or s.endswith("/" + ob)
+    ):
+        return True
+    stem_o = _doc_file_stem_cf(ob)
+    stem_s = _doc_file_stem_cf(sb)
+    if stem_o and stem_s and stem_o == stem_s:
+        return True
+    # 简称包含于全名（如「风险管理」↔「医疗器械风险管理报告.docx」），避免多选空白
+    if len(sl) >= 4 and sl in ol:
+        return True
+    if len(ol) >= 4 and ol in sl:
+        return True
+    return False
+
+
+def _default_modify_docs_selection(doc_names: list, raw_modify_docs) -> list:
+    """计算「需修改的文档」多选应对齐的选项（返回值均为 doc_names 中原字符串）。"""
+    names = [str(d).strip() for d in (doc_names or []) if d is not None and str(d).strip()]
+    stored = _coerce_modify_docs_list(raw_modify_docs)
+    if not names:
+        return []
+    if not stored:
+        return list(names)
+    matched = [d for d in names if any(_match_doc_name_option(d, c) for c in stored)]
+    return matched if matched else list(names)
+
+
+def _modify_docs_options_and_picked(doc_names: list, raw_modify_docs) -> Tuple[list, list]:
+    """构建 multiselect 的 options 与默认选中项。
+
+    Streamlit 会丢弃不在 options 里的选中值；若只传 related_doc_names，而 modify_docs 里是模型写的别名/未入库名，
+    界面会变成空白。故把「与任何文档名都对不上」的已存项追加进 options，并按 coerced 映射回 options 中的规范字符串。
+    """
+    names = [str(d).strip() for d in (doc_names or []) if d is not None and str(d).strip()]
+    coerced = _coerce_modify_docs_list(raw_modify_docs)
+    extra: list = []
+    seen_name = set(names)
+    for c in coerced:
+        if c in seen_name:
+            continue
+        if any(_match_doc_name_option(n, c) for n in names):
+            continue
+        if c not in extra:
+            extra.append(c)
+    options = names + extra
+
+    def _picked() -> list:
+        if not coerced:
+            return _default_modify_docs_selection(names, [])
+        out: list = []
+        seen = set()
+        for c in coerced:
+            hit = None
+            if c in options:
+                hit = c
+            else:
+                for opt in options:
+                    if opt in seen:
+                        continue
+                    if _match_doc_name_option(opt, c):
+                        hit = opt
+                        break
+            if hit is not None and hit not in seen:
+                out.append(hit)
+                seen.add(hit)
+        if out:
+            return out
+        return [x for x in coerced if x in options]
+
+    return options, _picked()
+
+
+def _caption_stored_modify_docs(point: dict) -> None:
+    """多选框偶发空白时，仍展示审核点 JSON 里已存的文档列表（只读）。"""
+    md = _point_modify_docs_merged_list(point)
+    if md:
+        st.caption("📎 **本审核点已记录的需修改文档：** " + "、".join(md))
+
+
+def _multiselect_modify_docs(label: str, doc_names: list, raw_modify_docs, *, key: str) -> list:
+    """需修改文档多选：路径/文件名对齐；当审核点数据变化时刷新 session（避免 key 已存在时 default= 永远不生效）。
+
+    当 related_doc_names 暂时为空时，必须返回已存储的 modify_docs，不能返回 []，否则每轮脚本会把报告里的列表写空。
+    """
+    names = _unique_doc_display_names(doc_names)
+    coerced = _coerce_modify_docs_list(raw_modify_docs)
+    if not names:
+        return coerced
+    options, default_docs = _modify_docs_options_and_picked(names, raw_modify_docs)
+    opt_set = set(options)
+    sig = (tuple(options), tuple(coerced))
+    sk = f"{key}__modify_docs_sig"
+    if st.session_state.get(sk) != sig:
+        st.session_state[key] = list(default_docs)
+        st.session_state[sk] = sig
+    else:
+        # 会话里曾被写成 []（Streamlit 丢弃非法选项、或旧版未正确灌入），但数据源仍有需修改文档时补回
+        _cur = st.session_state.get(key)
+        if isinstance(_cur, tuple):
+            _cur = list(_cur)
+        if isinstance(_cur, list) and not _cur and default_docs and coerced:
+            st.session_state[key] = list(default_docs)
+        elif isinstance(_cur, list) and not _cur and default_docs and not coerced:
+            # modify_docs 为空时，与 _default_modify_docs_selection 一致：默认等价于「在可选文档全选」；
+            # 仅 coerced 非空时才在上一分支补回，会导致此处会话被 Streamlit 置空后一直空白，普通编辑看起来像「只有纠正里能带出」。
+            st.session_state[key] = list(default_docs)
+        elif isinstance(_cur, list) and _cur and coerced:
+            valid = [x for x in _cur if x in opt_set]
+            if not valid and default_docs:
+                st.session_state[key] = list(default_docs)
+    if key not in st.session_state:
+        st.session_state[key] = list(default_docs)
+    return st.multiselect(label, options=options, key=key)
+
+
+def _audit_point_modify_docs_key(report_id: int, point_idx: int, scope_key: str, extra_suffix: str = "") -> str:
+    """同一条审核点在「普通编辑」与「纠正表单」中共用 multiselect 的 session key。
+
+    否则纠正用 `cf_*_modify_docs` 会从 point 初始化出有值，而详情里用 `*_detail_*_docs` 仍是空的旧状态。
+    """
+    sk = str(scope_key).replace(" ", "_")[:200]
+    return f"_apt_md_{int(report_id)}_{int(point_idx)}_{sk}{extra_suffix}"
 
 
 def _render_multi_doc_report(report: dict, r_idx: int, reports: list, key_prefix: str = "", history_id: int = 0, parent_batch_report: dict = None):
@@ -4241,31 +4961,31 @@ def _render_multi_doc_report(report: dict, r_idx: int, reports: list, key_prefix
         one_based = i + 1
         in_correction = history_id and st.session_state.get(f"editing_{history_id}_{one_based}")
 
+        _md_unify = _audit_point_modify_docs_key(int(history_id or 0), i, f"{pk}_{r_idx}", "")
         if in_correction:
             # 纠正模式：仅显示纠正表单（一组可编辑 + 保存纠正 / 取消纠正）；批量报告时传入父报告以便保存整份
             _render_correction_form(
                 report, history_id, i, point,
                 parent_batch_report=parent_batch_report,
                 sub_report_index=r_idx if parent_batch_report else None,
+                modify_docs_widget_key=_md_unify,
             )
         else:
             # 正常：可编辑描述/建议、需修改文档、处理状态
-            current_docs = point.get("modify_docs") or []
-            if not isinstance(current_docs, list):
-                current_docs = []
-            if not current_docs and doc_names:
-                current_docs = list(doc_names)
-            default_docs = [d for d in current_docs if d in doc_names]
-
             key_desc = f"{pk}_desc_{r_idx}_{i}"
             key_sug = f"{pk}_sug_{r_idx}_{i}"
-            new_desc = st.text_area("问题描述", value=point.get("description", ""), height=min(120, 60 + len((point.get("description") or "")) // 20), key=key_desc)
-            st.markdown(f"**位置：** {point.get('location', '未知')}")
-            st.markdown(f"**法规依据：** {point.get('regulation_ref', '')}")
-            new_sug = st.text_area("修改建议（请写明需修改哪份或哪几份文档）", value=point.get("suggestion", ""), height=min(120, 60 + len((point.get("suggestion") or "")) // 20), key=key_sug)
+            key_loc = f"{pk}_loc_{r_idx}_{i}"
+            st.caption(f"**类别（只读）** {point.get('category') or '—'}")
+            new_loc = st.text_input("位置", value=point.get("location", "") or "", key=key_loc)
+            st.caption(f"**法规依据（只读）** {point.get('regulation_ref') or '—'}")
+            # 高度固定：避免随字数变化导致 text_area 重建、整页重跑后焦点丢失（像「自动刷新」）
+            new_desc = st.text_area("问题描述", value=point.get("description", ""), height=120, key=key_desc)
+            new_sug = st.text_area("修改建议（请写明需修改哪份或哪几份文档）", value=point.get("suggestion", ""), height=120, key=key_sug)
 
-            key_docs = f"{pk}_modify_docs_{r_idx}_{i}"
-            new_modify_docs = st.multiselect("需修改的文档", options=doc_names, default=default_docs, key=key_docs)
+            _caption_stored_modify_docs(point)
+            new_modify_docs = _multiselect_modify_docs(
+                "需修改的文档", doc_names, _point_modify_docs_merged_list(point), key=_md_unify
+            )
 
             key_action = f"{pk}_action_{r_idx}_{i}"
             current_action = point.get("action") or _get_multi_doc_default_action(severity)
@@ -4275,6 +4995,7 @@ def _render_multi_doc_report(report: dict, r_idx: int, reports: list, key_prefix
             new_action = st.selectbox("处理状态", ACTION_OPTIONS, index=idx_opt, key=key_action)
 
             if r_idx < len(reports) and i < len(reports[r_idx].get("audit_points", [])):
+                reports[r_idx]["audit_points"][i]["location"] = new_loc
                 reports[r_idx]["audit_points"][i]["description"] = new_desc
                 reports[r_idx]["audit_points"][i]["suggestion"] = new_sug
                 reports[r_idx]["audit_points"][i]["modify_docs"] = new_modify_docs
@@ -4305,7 +5026,7 @@ def _render_multi_doc_report(report: dict, r_idx: int, reports: list, key_prefix
             todo_lines.append(f"   修改建议：{p.get('suggestion', '')[:150]}{'…' if len(p.get('suggestion','')) > 150 else ''}")
             todo_lines.append("")
         todo_text = "\n".join(todo_lines)
-        st.text_area("待办列表", value=todo_text, height=min(300, 80 + len(immediate) * 80), key=f"{pk}_todo_preview", disabled=True)
+        st.text_area("待办列表", value=todo_text, height=280, key=f"{pk}_todo_preview", disabled=True)
         _default_act = st.session_state.get("multi_doc_default_action") or {
             "high": "立即修改", "medium": "立即修改", "low": "延期修改", "info": "无需修改",
         }
@@ -4410,7 +5131,8 @@ def _render_report_flat(report: dict, history_id: int = 0):
                 st.session_state[f"editing_{history_id}_{i}"] = True
 
             if st.session_state.get(f"editing_{history_id}_{i}"):
-                _render_correction_form(report, history_id, i - 1, point)
+                _md_flat = _audit_point_modify_docs_key(int(history_id), i - 1, f"flat_{history_id}", "")
+                _render_correction_form(report, history_id, i - 1, point, modify_docs_widget_key=_md_flat)
 
         st.markdown("---")
 
@@ -4582,6 +5304,7 @@ def _render_history_meta_header(rpt: dict, report_id: int):
             "batch_aggregated": "批次汇总（多份整合）",
             "batch_member": "批次内单文档",
             "batch_multi_doc": "多文档一致性（同属该批次）",
+            "batch_traceability": "跨文档可追溯性审核（同属该批次）",
         }
         st.caption(f"归属批次：`{bid}` · {_kind_map.get(rk, '批次相关')}")
     st.markdown("---")
@@ -4703,14 +5426,102 @@ def _render_history_report_download(report_id: int, report: dict, display_name: 
     )
 
 
+def _render_open_history_editor_body():
+    """历史报告编辑区主体（表格、审核点、下载）。从 session_state 读取。
+
+    注意：此处不使用 st.fragment。fragment 在「打开报告」后易触发额外局部重跑，表现为内容加载完又被收起。
+    """
+    hed = st.session_state.get("_hist_editing_id")
+    er = st.session_state.get("_hist_editing_report")
+    if hed is None or er is None:
+        return
+    if "_hist_local_draft_mode" not in st.session_state:
+        st.session_state["_hist_local_draft_mode"] = True
+    st.checkbox(
+        "本地批量模式：表格与纠正先写内存，最后点「一次性保存」入库并刷新。",
+        key="_hist_local_draft_mode",
+    )
+    _hu = _fastapi_report_edit_url(int(hed))
+    st.markdown(
+        f'<p><b>轻量编辑（新窗口）</b>：<a href="{html.escape(_hu, quote=True)}" target="_blank" rel="noopener noreferrer">'
+        f"{html.escape(_hu, quote=False)}</a></p>",
+        unsafe_allow_html=True,
+    )
+    local_draft = bool(st.session_state.get("_hist_local_draft_mode", True))
+    n_pending = len(st.session_state.get("_hist_pending_corrections") or [])
+    dirty = bool(st.session_state.get("_hist_draft_dirty"))
+    if local_draft:
+        tb1, tb2, tb3 = st.columns([2, 1, 1])
+        with tb1:
+            st.caption(
+                f"草稿状态：{'有未入库的编辑' if dirty else '无普通编辑未入库'}；"
+                f"排队中的纠正记录 **{n_pending}** 条（保存时一并写入）。"
+            )
+        with tb2:
+            if st.button(
+                "💾 一次性保存到数据库",
+                key="_hist_save_all_db",
+                disabled=not (dirty or n_pending > 0),
+                help="写入 MySQL 并从库刷新本条报告；纠正勾选「入知识库」时在保存时触发（异步线程）",
+            ):
+                ok, err = _hist_save_all_history_to_db(int(hed), er)
+                if ok:
+                    st.success("已保存并从数据库重新加载。")
+                    _streamlit_rerun()
+                else:
+                    st.error(f"保存失败：{err}")
+        with tb3:
+            if st.button("↺ 放弃草稿并从数据库重新加载", key="_hist_reload_from_db"):
+                row = get_audit_report_by_id(int(hed))
+                if row and isinstance(row.get("report"), dict):
+                    st.session_state["_hist_editing_report"] = copy.deepcopy(row["report"])
+                st.session_state["_hist_pending_corrections"] = []
+                st.session_state["_hist_draft_dirty"] = False
+                st.session_state["_hist_widget_gen"] = int(st.session_state.get("_hist_widget_gen", 0)) + 1
+                st.info("已从数据库重新加载；未保存的本地修改已丢弃。")
+                _streamlit_rerun()
+    fname = er.get("file_name") or er.get("original_filename") or "report"
+    _render_history_meta_header(er, hed)
+    _wg = int(st.session_state.get("_hist_widget_gen", 0))
+    _ksuf = f"_hist_{hed}_g{_wg}"
+    try:
+        if er.get("batch") and er.get("reports"):
+            _render_reports_table_layout(
+                er["reports"],
+                base_key_prefix=f"hist_{hed}_r",
+                history_id=hed,
+                parent_batch_report=er,
+                key_suffix=_ksuf,
+                allow_nested_expander=False,
+                history_local_draft=local_draft,
+            )
+        else:
+            if not er.get("related_doc_names"):
+                er["related_doc_names"] = [er.get("original_filename", er.get("file_name", fname or "未知"))]
+            _render_reports_table_layout(
+                [er],
+                base_key_prefix=f"hist_{hed}",
+                history_id=hed,
+                parent_batch_report=None,
+                key_suffix=_ksuf,
+                allow_nested_expander=False,
+                history_local_draft=local_draft,
+            )
+    except Exception as ex:
+        st.error(f"历史报告渲染失败：{ex}")
+        try:
+            st.exception(ex)
+        except Exception:
+            st.text(traceback.format_exc())
+        return
+    _render_history_report_download(hed, er, fname or "report")
+
+
 def _aggregate_batch_report_totals(parent: dict) -> None:
     """根据子报告汇总批量报告的 total_points 与各严重程度计数。"""
-    reports = parent.get("reports") or []
-    parent["total_points"] = sum(r.get("total_points", 0) for r in reports)
-    parent["high_count"] = sum(r.get("high_count", 0) for r in reports)
-    parent["medium_count"] = sum(r.get("medium_count", 0) for r in reports)
-    parent["low_count"] = sum(r.get("low_count", 0) for r in reports)
-    parent["info_count"] = sum(r.get("info_count", 0) for r in reports)
+    from src.core.audit_report_utils import aggregate_batch_report_totals
+
+    aggregate_batch_report_totals(parent)
 
 
 def _render_correction_form(
@@ -4721,50 +5532,45 @@ def _render_correction_form(
     parent_batch_report: dict = None,
     sub_report_index: int = None,
     close_state_keys: list = None,
+    local_draft: bool = False,
+    modify_docs_widget_key: str = None,
 ):
     """纠正表单：可编辑描述、建议、需修改的文档、处理状态等，保存纠正 / 取消纠正。批量报告时传入 parent_batch_report 与 sub_report_index 以正确写回整份报告。
-    close_state_keys：保存/取消后额外从 session_state 中 pop 的 key（如历史报告详情内的纠正开关）。"""
+    close_state_keys：保存/取消后额外从 session_state 中 pop 的 key（如历史报告详情内的纠正开关）。
+    local_draft=True：只改内存并排队纠正记录，由历史区「一次性保存」写库。
+    modify_docs_widget_key：与「普通审核点编辑」共用 multiselect 的 session key。"""
     prefix = f"cf_{report_id}_{point_idx}_{sub_report_index if sub_report_index is not None else 'x'}"
+    _md_key = modify_docs_widget_key if modify_docs_widget_key else f"{prefix}_modify_docs"
     doc_names = report.get("related_doc_names") or []
-    current_docs = point.get("modify_docs") or []
-    if not isinstance(current_docs, list):
-        current_docs = []
-    # 需修改的文档默认带入：已有则按名称/路径匹配，无则默认选报告全部文档
-    def _match(d: str, c: str) -> bool:
-        d, c = (d or "").replace("\\", "/").strip(), (c or "").replace("\\", "/").strip()
-        return d == c or d.endswith("/" + c) or c.endswith("/" + d)
-    if current_docs:
-        default_docs = [d for d in doc_names if any(_match(d, c) for c in current_docs)]
-    else:
-        default_docs = []
-    if not default_docs and doc_names:
-        default_docs = list(doc_names)
 
     _kind_default = 0
     if point.get("correction_kind") == "false_positive" or point.get("false_positive_reason"):
         _kind_default = 1
     elif point.get("deprecated"):
         _kind_default = 2
-    corr_kind = st.radio(
+    corr_kind = _st_radio_compat(
         "纠正方式",
         ["修订本条内容", "标记为误报", "弃用本条"],
         index=min(_kind_default, 2),
-        horizontal=True,
         key=f"{prefix}_kind",
     )
 
     if corr_kind == "修订本条内容":
+        st.caption(f"**类别（只读）** {point.get('category') or '—'}")
+        st.caption(f"**法规依据（只读）** {point.get('regulation_ref') or '—'}")
         new_desc = st.text_area("问题描述", value=point.get("description", ""), key=f"{prefix}_desc")
         _sev_list = ["high", "medium", "low", "info"]
         _sv = (point.get("severity") or "info").lower()
         _sev_i = _sev_list.index(_sv) if _sv in _sev_list else 3
         new_sev = st.selectbox("严重程度", _sev_list, index=_sev_i, key=f"{prefix}_sev")
-        new_ref = st.text_area("法规依据", value=point.get("regulation_ref", ""), key=f"{prefix}_ref")
         new_sug = st.text_area("修改建议", value=point.get("suggestion", ""), key=f"{prefix}_sug")
         if doc_names:
-            new_modify_docs = st.multiselect("需修改的文档", options=doc_names, default=default_docs, key=f"{prefix}_modify_docs")
+            _caption_stored_modify_docs(point)
+            new_modify_docs = _multiselect_modify_docs(
+                "需修改的文档", doc_names, _point_modify_docs_merged_list(point), key=_md_key
+            )
         else:
-            new_modify_docs = default_docs
+            new_modify_docs = _point_modify_docs_merged_list(point)
         current_action = point.get("action") or _get_multi_doc_default_action(point.get("severity", "info"))
         if current_action not in ACTION_OPTIONS:
             current_action = ACTION_OPTIONS[0]
@@ -4835,17 +5641,33 @@ def _render_correction_form(
                             corrected_point["suggestion"] = (point.get("suggestion") or "").strip() + (f"\n\n【误报说明】{reason}" if reason else "")
                             points[point_idx] = corrected_point
                             _recount_severity(report)
-                            _persist(corrected_point, original_snap)
-                            if parent_batch_report is not None and sub_report_index is not None:
-                                _aggregate_batch_report_totals(parent_batch_report)
-                                update_audit_report(report_id, parent_batch_report)
+                            if local_draft:
+                                _hist_append_pending_correction(
+                                    report_id=report_id,
+                                    point_index=point_idx,
+                                    report=report,
+                                    original=original_snap,
+                                    corrected=corrected_point,
+                                    feed_kb=feed_kb,
+                                )
+                                if parent_batch_report is not None and sub_report_index is not None:
+                                    _aggregate_batch_report_totals(parent_batch_report)
+                                st.success(
+                                    "已写入本地草稿（误报已排队）。保存时将写入数据库"
+                                    + ("与知识库。" if feed_kb else "。")
+                                )
                             else:
-                                update_audit_report(report_id, report)
-                            st.success("已标记为误报并保存。" + (" 已写入知识库。" if feed_kb else ""))
+                                _persist(corrected_point, original_snap)
+                                if parent_batch_report is not None and sub_report_index is not None:
+                                    _aggregate_batch_report_totals(parent_batch_report)
+                                    _timed_update_audit_report(report_id, parent_batch_report)
+                                else:
+                                    _timed_update_audit_report(report_id, report)
+                                st.success("已标记为误报并保存。" + (" 已写入知识库。" if feed_kb else ""))
+                                _invalidate_audit_history_cache()
                             st.session_state[f"editing_{report_id}_{point_idx + 1}"] = False
                             for _k in close_state_keys or []:
                                 st.session_state.pop(_k, None)
-                            _invalidate_audit_history_cache()
                             _streamlit_rerun()
                     elif corr_kind == "弃用本条":
                         dep_note_val = (st.session_state.get(f"{prefix}_dep_note") or "").strip()
@@ -4891,26 +5713,41 @@ def _render_correction_form(
                                 points.insert(point_idx + 1, new_inserted)
                                 corrected_for_log["replacement_point_added"] = new_inserted
                             _recount_severity(report)
-                            _persist(corrected_for_log, original_snap)
-                            if parent_batch_report is not None and sub_report_index is not None:
-                                _aggregate_batch_report_totals(parent_batch_report)
-                                update_audit_report(report_id, parent_batch_report)
+                            if local_draft:
+                                _hist_append_pending_correction(
+                                    report_id=report_id,
+                                    point_index=point_idx,
+                                    report=report,
+                                    original=original_snap,
+                                    corrected=corrected_for_log,
+                                    feed_kb=feed_kb,
+                                )
+                                if parent_batch_report is not None and sub_report_index is not None:
+                                    _aggregate_batch_report_totals(parent_batch_report)
+                                st.success(
+                                    "已写入本地草稿（弃用/替换已排队）。保存时将写入数据库"
+                                    + ("与知识库。" if feed_kb else "。")
+                                )
                             else:
-                                update_audit_report(report_id, report)
-                            st.success("已弃用本条" + ("，并已插入新审核点。" if new_inserted else "。") + (" 已写入知识库。" if feed_kb else ""))
+                                _persist(corrected_for_log, original_snap)
+                                if parent_batch_report is not None and sub_report_index is not None:
+                                    _aggregate_batch_report_totals(parent_batch_report)
+                                    _timed_update_audit_report(report_id, parent_batch_report)
+                                else:
+                                    _timed_update_audit_report(report_id, report)
+                                st.success("已弃用本条" + ("，并已插入新审核点。" if new_inserted else "。") + (" 已写入知识库。" if feed_kb else ""))
+                                _invalidate_audit_history_cache()
                             st.session_state[f"editing_{report_id}_{point_idx + 1}"] = False
                             for _k in close_state_keys or []:
                                 st.session_state.pop(_k, None)
-                            _invalidate_audit_history_cache()
                             _streamlit_rerun()
                     else:
                         corrected_point = dict(point)
                         corrected_point["description"] = st.session_state.get(f"{prefix}_desc", point.get("description", ""))
                         corrected_point["severity"] = st.session_state.get(f"{prefix}_sev", point.get("severity", "info"))
-                        corrected_point["regulation_ref"] = st.session_state.get(f"{prefix}_ref", point.get("regulation_ref", ""))
                         corrected_point["suggestion"] = st.session_state.get(f"{prefix}_sug", point.get("suggestion", ""))
                         corrected_point["modify_docs"] = (
-                            st.session_state.get(f"{prefix}_modify_docs")
+                            st.session_state.get(_md_key)
                             if doc_names
                             else (point.get("modify_docs") or [])
                         )
@@ -4920,17 +5757,33 @@ def _render_correction_form(
                         corrected_point.pop("deprecated", None)
                         points[point_idx] = corrected_point
                         _recount_severity(report)
-                        _persist(corrected_point, original_snap)
-                        if parent_batch_report is not None and sub_report_index is not None:
-                            _aggregate_batch_report_totals(parent_batch_report)
-                            update_audit_report(report_id, parent_batch_report)
+                        if local_draft:
+                            _hist_append_pending_correction(
+                                report_id=report_id,
+                                point_index=point_idx,
+                                report=report,
+                                original=original_snap,
+                                corrected=corrected_point,
+                                feed_kb=feed_kb,
+                            )
+                            if parent_batch_report is not None and sub_report_index is not None:
+                                _aggregate_batch_report_totals(parent_batch_report)
+                            st.success(
+                                "已写入本地草稿（修订已排队）。保存时将写入数据库"
+                                + ("与知识库。" if feed_kb else "。")
+                            )
                         else:
-                            update_audit_report(report_id, report)
-                        st.success("纠正已保存！" + ("已写入知识库。" if feed_kb else ""))
+                            _persist(corrected_point, original_snap)
+                            if parent_batch_report is not None and sub_report_index is not None:
+                                _aggregate_batch_report_totals(parent_batch_report)
+                                _timed_update_audit_report(report_id, parent_batch_report)
+                            else:
+                                _timed_update_audit_report(report_id, report)
+                            st.success("纠正已保存！" + ("已写入知识库。" if feed_kb else ""))
+                            _invalidate_audit_history_cache()
                         st.session_state[f"editing_{report_id}_{point_idx + 1}"] = False
                         for _k in close_state_keys or []:
                             st.session_state.pop(_k, None)
-                        _invalidate_audit_history_cache()
                         _streamlit_rerun()
             except Exception as e:
                 st.error(f"保存纠正失败：{e}")
@@ -4973,6 +5826,92 @@ def _streamlit_rerun():
 def _invalidate_audit_history_cache():
     """写入历史报告/纠正后调用，下次再读列表时重新查库。"""
     st.session_state["_audit_hist_reload"] = True
+    try:
+        invalidate_audit_reports_list_cache()
+    except Exception:
+        pass
+
+
+def _timed_update_audit_report(report_id: int, report: dict) -> None:
+    """update_audit_report 包装：开启 audit_perf_log 时输出 MySQL 写入耗时。"""
+    t0 = time.perf_counter()
+    update_audit_report(report_id, report)
+    if audit_perf_enabled():
+        audit_perf_log("update_audit_report", (time.perf_counter() - t0) * 1000.0, f"id={report_id}")
+
+
+def _hist_append_pending_correction(
+    *,
+    report_id: int,
+    point_index: int,
+    report: dict,
+    original: dict,
+    corrected: dict,
+    feed_kb: bool,
+) -> None:
+    """本地批量模式：纠正先记入队列，一次性保存时再写 audit_corrections + 可选向量库。"""
+    collection = st.session_state.get("collection_name", "regulations")
+    fn = report.get("file_name", "") or report.get("original_filename", "")
+    lst = st.session_state.setdefault("_hist_pending_corrections", [])
+    lst.append(
+        {
+            "report_id": report_id,
+            "point_index": point_index,
+            "collection": collection,
+            "file_name": fn,
+            "original": original,
+            "corrected": corrected,
+            "feed_kb": bool(feed_kb),
+        }
+    )
+    st.session_state["_hist_draft_dirty"] = True
+
+
+def _hist_save_all_history_to_db(hed: int, er: dict) -> tuple[bool, str]:
+    """刷出待写入的纠正记录 + 整包更新 audit_reports，再从库拉取一次替换内存草稿。"""
+    try:
+        pending = list(st.session_state.get("_hist_pending_corrections") or [])
+        dirty = bool(st.session_state.get("_hist_draft_dirty"))
+        for item in pending:
+            save_audit_correction(
+                report_id=item["report_id"],
+                point_index=item["point_index"],
+                collection=item.get("collection") or st.session_state.get("collection_name", "regulations"),
+                file_name=item.get("file_name", ""),
+                original=item["original"],
+                corrected=item["corrected"],
+                fed_to_kb=bool(item.get("feed_kb")),
+            )
+            if item.get("feed_kb"):
+                _feed_correction_to_kb(
+                    item.get("collection") or st.session_state.get("collection_name", "regulations"),
+                    item.get("file_name", ""),
+                    item["corrected"],
+                )
+            add_operation_log(
+                op_type=OP_TYPE_CORRECTION,
+                collection=item.get("collection") or st.session_state.get("collection_name", "regulations"),
+                file_name=item.get("file_name", ""),
+                extra={
+                    "report_id": item["report_id"],
+                    "point_index": item["point_index"],
+                    "fed_to_kb": item.get("feed_kb"),
+                    "corrected": item["corrected"],
+                },
+                model_info=get_current_model_info(),
+            )
+        st.session_state["_hist_pending_corrections"] = []
+        if pending or dirty:
+            _timed_update_audit_report(hed, er)
+        row = get_audit_report_by_id(hed)
+        if row and isinstance(row.get("report"), dict):
+            st.session_state["_hist_editing_report"] = copy.deepcopy(row["report"])
+        st.session_state["_hist_draft_dirty"] = False
+        st.session_state["_hist_widget_gen"] = int(st.session_state.get("_hist_widget_gen", 0)) + 1
+        _invalidate_audit_history_cache()
+        return True, ""
+    except Exception as ex:
+        return False, str(ex)
 
 
 def _get_cached_audit_reports(collection: str, limit: int = 100) -> list:
@@ -4989,6 +5928,43 @@ def _get_cached_audit_reports(collection: str, limit: int = 100) -> list:
     return st.session_state[snap_k]["rows"]
 
 
+def _hist_open_selected_callback():
+    """「打开选中报告」的 on_click：在本轮脚本主体执行前写入 _hist_editing_*，避免先画列表再 rerun/fragment 导致界面像自动收起。"""
+    st.session_state.pop("_hist_open_error", None)
+    collection = st.session_state.get("collection_name", "regulations")
+    history = _get_cached_audit_reports(collection)
+    if not history:
+        st.session_state["_hist_open_error"] = "暂无历史审核报告。"
+        return
+    sel_i = st.session_state.get("_hist_pick_idx", 0)
+    try:
+        sel_i = int(sel_i)
+    except (TypeError, ValueError):
+        sel_i = 0
+    if sel_i < 0 or sel_i >= len(history):
+        st.session_state["_hist_open_error"] = "当前选择无效，请重新选择列表中的报告。"
+        return
+    rec = history[sel_i]
+    rpt = rec.get("report")
+    if not rpt and rec.get("report_json"):
+        try:
+            rpt = json.loads(rec["report_json"])
+        except Exception:
+            rpt = {}
+    if not rpt:
+        st.session_state["_hist_open_error"] = "该记录没有可展示的报告正文。"
+        return
+    try:
+        st.session_state["_hist_editing_id"] = rec["id"]
+        st.session_state["_hist_editing_report"] = copy.deepcopy(rpt)
+        st.session_state["_step3_show_history_panel"] = True
+        st.session_state["_hist_pending_corrections"] = []
+        st.session_state["_hist_draft_dirty"] = False
+        st.session_state["_hist_widget_gen"] = int(st.session_state.get("_hist_widget_gen", 0)) + 1
+    except Exception as ex:
+        st.session_state["_hist_open_error"] = f"加载报告到编辑区失败：{ex}"
+
+
 def _point_row_label(p: dict, j: int) -> str:
     pre = "〔弃〕" if p.get("deprecated") else ("〔误〕" if p.get("correction_kind") == "false_positive" or p.get("false_positive_reason") else "")
     cat = (p.get("category") or "")[:24]
@@ -4996,27 +5972,517 @@ def _point_row_label(p: dict, j: int) -> str:
     return f"{j + 1}. {pre}{cat} — {d}{'…' if len(p.get('description') or '') > 42 else ''}"
 
 
+# 历史报告表格编辑：分页行数（减轻单次 rerun 体量）
+HIST_EDIT_PAGE_SIZE = 20
+
+
+def _fastapi_report_edit_url(report_id: int) -> str:
+    """浏览器可打开的 FastAPI 轻量编辑页。优先环境变量 AICHECKWORD_API_PUBLIC_BASE（如 http://10.x.x.x:8000）。"""
+    base = (os.environ.get("AICHECKWORD_API_PUBLIC_BASE") or "").strip().rstrip("/")
+    if not base:
+        port = int(getattr(settings, "api_port", 8000) or 8000)
+        base = f"http://127.0.0.1:{port}"
+    return f"{base}/api/reports/{int(report_id)}/edit"
+
+
+def _st_try_data_editor(df: pd.DataFrame, *, column_config=None, **kwargs) -> Optional[pd.DataFrame]:
+    """兼容旧版 Streamlit：优先 data_editor，其次 experimental_data_editor；均不可用时返回 None。
+
+    PyArrow 对 object 列内混有 int/str 等会抛错（如 Expected bytes, got int）；调用方应保证 df 列类型一致，
+    此处再兜底捕获异常以便走分页表单回退。
+
+    部分浏览器+Streamlit 版本在 data_editor 全宽布局下，WebSocket 增量更新时前端 resize 监听会报
+    Cannot read properties of undefined (reading 'firstElementChild')；可设环境变量
+    AICHECKWORD_DISABLE_DATA_EDITOR=1 完全禁用表格编辑器，走分页表单。
+    """
+    _dd = (os.environ.get("AICHECKWORD_DISABLE_DATA_EDITOR") or "").strip().lower()
+    if _dd in ("1", "true", "yes", "on"):
+        return None
+    safe_kw = {}
+    for k in ("key", "hide_index", "num_rows", "use_container_width"):
+        if k in kwargs:
+            safe_kw[k] = kwargs[k]
+    de = getattr(st, "data_editor", None)
+    if callable(de):
+        kw = dict(safe_kw)
+        if column_config is not None:
+            kw["column_config"] = column_config
+        try:
+            return de(df, **kw)
+        except TypeError:
+            kw.pop("column_config", None)
+            try:
+                return de(df, **kw)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    ex = getattr(st, "experimental_data_editor", None)
+    if callable(ex):
+        try:
+            return ex(df, key=kwargs.get("key"), use_container_width=kwargs.get("use_container_width", False))
+        except TypeError:
+            try:
+                return ex(df)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return None
+
+
+def _hist_cell_display_str(v) -> str:
+    """历史审核点表格展示：统一为 str，避免 DataFrame object 列混 int 导致 st.data_editor / PyArrow 转换失败。"""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, (dict, list)):
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            return str(v)
+    return str(v)
+
+
+def _hist_opt_display_str(v) -> str:
+    """与 _hist_cell_display_str 相同，但显式区分「缺省」与「可序列化的空/零」。"""
+    if v is None:
+        return ""
+    return _hist_cell_display_str(v)
+
+
+def _history_point_row_dict(
+    p: dict,
+    seq_display: int,
+    *,
+    related_doc_names: Optional[list] = None,
+    file_name_hint: str = "",
+) -> dict:
+    raw_sev = p.get("severity")
+    if raw_sev is None or raw_sev == "":
+        sev = "info"
+    else:
+        sev = str(raw_sev).lower()
+    if sev not in ("high", "medium", "low", "info"):
+        sev = "info"
+    md_list = _effective_point_modify_docs_list(p, related_doc_names, file_name_hint)
+    md_s = "，".join(_hist_cell_display_str(x) for x in md_list) if md_list else ""
+    if p.get("deprecated"):
+        tag = "弃用"
+    elif p.get("correction_kind") == "false_positive" or p.get("false_positive_reason"):
+        tag = "误报"
+    else:
+        tag = "正常"
+    act = p.get("action")
+    if act is None or act == "":
+        act = _get_multi_doc_default_action(sev)
+    else:
+        act = str(act)
+    if act not in ACTION_OPTIONS:
+        act = ACTION_OPTIONS[0]
+    return {
+        # 用 str 避免 NumberColumn + PyArrow 将第 0 列推断为 object 混 int 时报 Expected bytes, got int
+        "序号": str(int(seq_display)),
+        "状态": tag,
+        "级别": sev,
+        "类别": _hist_opt_display_str(p.get("category")),
+        "位置": _hist_opt_display_str(p.get("location")),
+        "问题描述": _hist_opt_display_str(p.get("description")),
+        "法规依据": _hist_opt_display_str(p.get("regulation_ref")),
+        "修改建议": _hist_opt_display_str(p.get("suggestion")),
+        "需修改文档": md_s,
+        "处理状态": act,
+    }
+
+
+def _history_df_sanitize_for_editor(df: pd.DataFrame) -> pd.DataFrame:
+    """传给 st.data_editor 前将每列强制为纯 str，杜绝 object 列内混 int/NaN 等导致 PyArrow 转换失败。"""
+
+    def _cell(x):
+        if x is None:
+            return ""
+        try:
+            if pd.isna(x):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return _hist_cell_display_str(x)
+
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in out.columns:
+        out[c] = out[c].map(_cell)
+    return out
+
+
+def _history_points_to_df(
+    points: list,
+    *,
+    related_doc_names: Optional[list] = None,
+    file_name_hint: str = "",
+) -> pd.DataFrame:
+    """历史报告全表：转为 DataFrame。"""
+    rows = []
+    for j, p in enumerate(points):
+        if not isinstance(p, dict):
+            p = {}
+        rows.append(
+            _history_point_row_dict(
+                p, j + 1, related_doc_names=related_doc_names, file_name_hint=file_name_hint
+            )
+        )
+    return _history_df_sanitize_for_editor(pd.DataFrame(rows))
+
+
+def _history_points_to_df_slice(
+    points: list,
+    start: int,
+    end: int,
+    *,
+    related_doc_names: Optional[list] = None,
+    file_name_hint: str = "",
+) -> pd.DataFrame:
+    end = min(int(end), len(points))
+    start = max(0, int(start))
+    rows = []
+    for gi in range(start, end):
+        p = points[gi]
+        if not isinstance(p, dict):
+            p = {}
+        rows.append(
+            _history_point_row_dict(
+                p, gi + 1, related_doc_names=related_doc_names, file_name_hint=file_name_hint
+            )
+        )
+    return _history_df_sanitize_for_editor(pd.DataFrame(rows))
+
+
+def _apply_history_df_to_points_slice(edited_df: pd.DataFrame, points: list, start: int) -> None:
+    """把当前页的表格编辑结果写回 audit_points（原地修改）。"""
+    if edited_df is None or edited_df.empty or not points:
+        return
+    sev_opts = {"high", "medium", "low", "info"}
+    for pos, (_, row) in enumerate(edited_df.iterrows()):
+        gi = start + pos
+        if gi >= len(points):
+            break
+        p = points[gi]
+        sev = str(row.get("级别") or "info").lower()
+        if sev not in sev_opts:
+            sev = "info"
+        p["severity"] = sev
+        # 类别、法规依据表格列为只读，写回时不从 data_editor 覆盖（保持原审核点数据）
+        p["location"] = str(row.get("位置") or "")
+        p["description"] = str(row.get("问题描述") or "")
+        p["suggestion"] = str(row.get("修改建议") or "")
+        md_s = str(row.get("需修改文档") or "")
+        parts = []
+        if "，" in md_s or "," in md_s:
+            parts = [x.strip() for x in md_s.replace("，", ",").split(",") if x.strip()]
+        elif md_s.strip():
+            parts = [md_s.strip()]
+        else:
+            parts = []
+        p["modify_docs"] = parts
+        act = str(row.get("处理状态") or ACTION_OPTIONS[0])
+        if act not in ACTION_OPTIONS:
+            act = ACTION_OPTIONS[0]
+        p["action"] = act
+
+
+def _render_history_fallback_slice(
+    points: list,
+    start: int,
+    end: int,
+    pk: str,
+    key_suffix: str,
+    history_id: int,
+    history_local_draft: bool,
+    *,
+    related_doc_names: Optional[list] = None,
+    file_name_hint: str = "",
+) -> None:
+    """无 st.data_editor 时的分页表单回退。"""
+    if not st.session_state.get("_hist_data_editor_fallback_info"):
+        st.info(
+            "当前 Streamlit 无 `st.data_editor`（版本过旧）。已使用**分页表单**；若镜像允许，可执行 `pip install -U streamlit` 尽量升到新版本。"
+            " 跨网访问 FastAPI 时请设置环境变量 **AICHECKWORD_API_PUBLIC_BASE**（如 `http://服务器IP:8000`）。"
+        )
+        st.session_state["_hist_data_editor_fallback_info"] = True
+    sev_opts = ["high", "medium", "low", "info"]
+    end = min(end, len(points))
+    before = copy.deepcopy([points[i] for i in range(start, end)])
+    for gi in range(start, end):
+        p = points[gi]
+        pfx = f"hfb_{pk}_{gi}{key_suffix}"
+        sv = (p.get("severity") or "info").lower()
+        if sv not in sev_opts:
+            sv = "info"
+        if f"{pfx}_sev" not in st.session_state:
+            st.session_state[f"{pfx}_sev"] = sv
+        act = p.get("action") or _get_multi_doc_default_action(sv)
+        if act not in ACTION_OPTIONS:
+            act = ACTION_OPTIONS[0]
+        if f"{pfx}_act" not in st.session_state:
+            st.session_state[f"{pfx}_act"] = act
+        for fld, sk, default in (
+            ("description", "desc", ""),
+            ("suggestion", "sug", ""),
+            ("location", "loc", ""),
+        ):
+            k = f"{pfx}_{sk}"
+            if k not in st.session_state:
+                st.session_state[k] = p.get(fld, default) or ""
+        md_eff = _effective_point_modify_docs_list(p, related_doc_names, file_name_hint)
+        md_init = "，".join(md_eff)
+        md_sig_k = f"{pfx}__md_src_sig"
+        if st.session_state.get(md_sig_k) != tuple(md_eff):
+            st.session_state[f"{pfx}_md"] = md_init
+            st.session_state[md_sig_k] = tuple(md_eff)
+        st.markdown(f"**第 {gi + 1} 条** · {(p.get('category') or '未分类')[:36]}")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.selectbox("级别", sev_opts, key=f"{pfx}_sev")
+        with c2:
+            st.selectbox("处理状态", ACTION_OPTIONS, key=f"{pfx}_act")
+        st.text_area("问题描述", key=f"{pfx}_desc", height=70)
+        st.text_area("修改建议", key=f"{pfx}_sug", height=70)
+        st.caption(f"**类别（只读）** {p.get('category') or '—'}")
+        st.text_input("位置", key=f"{pfx}_loc")
+        st.caption(f"**法规依据（只读）** {p.get('regulation_ref') or '—'}")
+        if md_eff:
+            st.caption("📎 **本条已记录的需修改文档（与下方输入框同步）：** " + "、".join(md_eff))
+        st.text_input("需修改文档（逗号分隔）", key=f"{pfx}_md")
+    for gi in range(start, end):
+        p = points[gi]
+        pfx = f"hfb_{pk}_{gi}{key_suffix}"
+        p["severity"] = st.session_state.get(f"{pfx}_sev", p.get("severity", "info"))
+        p["action"] = st.session_state.get(f"{pfx}_act", p.get("action", ACTION_OPTIONS[0]))
+        p["description"] = st.session_state.get(f"{pfx}_desc", "")
+        p["suggestion"] = st.session_state.get(f"{pfx}_sug", "")
+        p["location"] = st.session_state.get(f"{pfx}_loc", "")
+        md_s = st.session_state.get(f"{pfx}_md", "")
+        parts = [x.strip() for x in str(md_s).replace("，", ",").split(",") if x.strip()]
+        p["modify_docs"] = parts
+    after = [points[i] for i in range(start, end)]
+    try:
+        if (
+            history_local_draft
+            and history_id
+            and json.dumps(before, ensure_ascii=False, sort_keys=True, default=str)
+            != json.dumps(after, ensure_ascii=False, sort_keys=True, default=str)
+        ):
+            st.session_state["_hist_draft_dirty"] = True
+    except Exception:
+        st.session_state["_hist_draft_dirty"] = True
+
+
+def _render_history_doc_points_table(
+    report: dict,
+    r_idx: int,
+    reports: list,
+    pk: str,
+    key_suffix: str,
+    history_id: int,
+    parent_batch_report: Optional[dict],
+    history_local_draft: bool,
+    file_name: str,
+) -> None:
+    """历史报告：分页可编辑表（或旧版回退表单）+ 当前页「纠正」按钮。"""
+    points = report.get("audit_points") or []
+    if not points:
+        st.caption("本文档无审核点。")
+        return
+
+    if not report.get("related_doc_names"):
+        report["related_doc_names"] = [
+            report.get("original_filename", report.get("file_name", file_name or "未知"))
+        ]
+    _hist_rel = report.get("related_doc_names") or []
+    _hist_fn = (report.get("original_filename") or report.get("file_name") or file_name or "").strip()
+
+    focus_k = f"_hcf_{history_id}_{pk}{key_suffix}"
+    n = len(points)
+    ps = HIST_EDIT_PAGE_SIZE
+    n_pages = max(1, (n + ps - 1) // ps)
+    pg_key = f"_hist_pg_{pk}{key_suffix}"
+    page = st.selectbox(
+        f"审核点分页 · {file_name[:32]}",
+        options=list(range(n_pages)),
+        format_func=lambda i: f"第 {i + 1}/{n_pages} 页（第 {i * ps + 1}–{min((i + 1) * ps, n)} 条，共 {n} 条）",
+        key=pg_key,
+    )
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = 0
+    page = max(0, min(page, n_pages - 1))
+    start = page * ps
+    end = min(start + ps, n)
+
+    df0 = _history_points_to_df_slice(
+        points, start, end, related_doc_names=_hist_rel, file_name_hint=_hist_fn
+    )
+    ed_key = f"hist_ed_{pk}_p{page}{key_suffix}"
+    edited_df: Optional[pd.DataFrame] = None
+    col_cfg = None
+    try:
+        from streamlit.column_config import SelectboxColumn, TextColumn
+
+        col_cfg = {
+            "序号": TextColumn("序号", width="small", disabled=True),
+            "状态": TextColumn("状态", width="small", disabled=True),
+            "级别": SelectboxColumn("级别", options=["high", "medium", "low", "info"], required=True),
+            "类别": TextColumn("类别", width="small", disabled=True),
+            "位置": TextColumn("位置", width="medium"),
+            "问题描述": TextColumn("问题描述", width="large"),
+            "法规依据": TextColumn("法规依据", width="medium", disabled=True),
+            "修改建议": TextColumn("修改建议", width="large"),
+            "需修改文档": TextColumn("需修改文档（逗号/中文逗号分隔）", width="medium"),
+            "处理状态": SelectboxColumn("处理状态", options=list(ACTION_OPTIONS), required=True),
+        }
+    except Exception:
+        col_cfg = None
+
+    def _hist_apply_editor_or_fallback():
+        nonlocal edited_df
+        edited_df = _st_try_data_editor(
+            df0,
+            column_config=col_cfg,
+            key=ed_key,
+            hide_index=True,
+            num_rows="fixed",
+            # False：减轻前端 addResizeListener/滚动与 WebSocket 重绘时的 firstElementChild 报错（全宽表格更易触发）
+            use_container_width=False,
+        )
+        if edited_df is not None and not isinstance(edited_df, pd.DataFrame):
+            try:
+                edited_df = pd.DataFrame(edited_df)
+            except Exception:
+                edited_df = None
+        if edited_df is None:
+            _render_history_fallback_slice(
+                points,
+                start,
+                end,
+                pk,
+                key_suffix,
+                history_id,
+                history_local_draft,
+                related_doc_names=_hist_rel,
+                file_name_hint=_hist_fn,
+            )
+            _recount_severity(report)
+            if parent_batch_report is not None:
+                _aggregate_batch_report_totals(parent_batch_report)
+        else:
+            if not isinstance(edited_df, pd.DataFrame):
+                edited_df = df0
+            if history_local_draft and history_id:
+                try:
+                    if df0.shape == edited_df.shape and df0.to_json() != edited_df.to_json():
+                        st.session_state["_hist_draft_dirty"] = True
+                except Exception:
+                    st.session_state["_hist_draft_dirty"] = True
+            _apply_history_df_to_points_slice(edited_df, points, start)
+            _recount_severity(report)
+            if parent_batch_report is not None:
+                _aggregate_batch_report_totals(parent_batch_report)
+
+    try:
+        _hist_apply_editor_or_fallback()
+    except Exception:
+        logging.getLogger(__name__).exception("历史审核点 data_editor 异常，已回退分页表单")
+        edited_df = None
+        _render_history_fallback_slice(
+            points,
+            start,
+            end,
+            pk,
+            key_suffix,
+            history_id,
+            history_local_draft,
+            related_doc_names=_hist_rel,
+            file_name_hint=_hist_fn,
+        )
+        _recount_severity(report)
+        if parent_batch_report is not None:
+            _aggregate_batch_report_totals(parent_batch_report)
+
+    st.caption("当前页内点 **✏编号** 打开纠正表单；本地批量模式下改完点顶部「一次性保存到数据库」。")
+    step = 14
+    for r0 in range(start, end, step):
+        chunk = list(range(r0, min(r0 + step, end)))
+        bcols = st.columns(len(chunk))
+        for bi, j in enumerate(chunk):
+            p = points[j]
+            if not isinstance(p, dict):
+                p = {}
+            tag = ""
+            if p.get("deprecated"):
+                tag = "·弃"
+            elif p.get("correction_kind") == "false_positive" or p.get("false_positive_reason"):
+                tag = "·误"
+            help_txt = (
+                _hist_opt_display_str(p.get("category"))
+                + " | "
+                + _hist_opt_display_str(p.get("description")).replace("\n", " ")
+            )[:200]
+            if bcols[bi].button(f"✏{j + 1}{tag}", key=f"hbtn_corr_{pk}_{j}{key_suffix}", help=help_txt or None):
+                st.session_state[focus_k] = j
+
+    if history_id and not history_local_draft:
+        if st.button("💾 保存本表到数据库", key=f"hist_tbl_save_{pk}{key_suffix}"):
+            try:
+                root = parent_batch_report if parent_batch_report is not None else report
+                _timed_update_audit_report(history_id, root)
+                _invalidate_audit_history_cache()
+                st.success("已保存。")
+                _streamlit_rerun()
+            except Exception as ex:
+                st.error(f"保存失败：{ex}")
+
+    fj = st.session_state.get(focus_k)
+    if fj is not None and isinstance(fj, int) and 0 <= fj < len(points):
+        streamlit_divider()
+        h1, h2 = st.columns([4, 1])
+        with h1:
+            st.markdown(f"**纠正 · 第 {fj + 1} 条**（{file_name[:60]}）")
+        with h2:
+            if st.button("关闭纠正面板", key=f"hbtn_corr_close_{pk}{key_suffix}"):
+                st.session_state.pop(focus_k, None)
+                _streamlit_rerun()
+        _md_hist = _audit_point_modify_docs_key(int(history_id), int(fj), str(pk), str(key_suffix or ""))
+        _render_correction_form(
+            report,
+            history_id,
+            fj,
+            points[fj],
+            parent_batch_report=parent_batch_report,
+            sub_report_index=r_idx if parent_batch_report is not None else None,
+            close_state_keys=[focus_k],
+            local_draft=bool(history_id and history_local_draft),
+            modify_docs_widget_key=_md_hist,
+        )
+
+
 def _recount_severity(report: dict):
     """根据审核点重新统计各严重程度计数（弃用 deprecated 的点不计入）"""
-    counts = {"high": 0, "medium": 0, "low": 0, "info": 0}
-    points = report.get("audit_points") or []
-    for p in points:
-        if p.get("deprecated"):
-            continue
-        s = (p.get("severity") or "info").lower()
-        if s not in counts:
-            s = "info"
-        counts[s] = counts.get(s, 0) + 1
-    report["high_count"] = counts["high"]
-    report["medium_count"] = counts["medium"]
-    report["low_count"] = counts["low"]
-    report["info_count"] = counts["info"]
-    report["total_points"] = len([p for p in points if not p.get("deprecated")])
+    from src.core.audit_report_utils import recount_severity
+
+    recount_severity(report)
 
 
-def _feed_correction_to_kb(collection: str, file_name: str, corrected_point: dict):
-    """将误报/弃用/修订写入独立「用户审核反馈」向量库与 knowledge_docs，与第二步审核点清单库区分。"""
-    from langchain.schema import Document
+def _feed_correction_to_kb_impl(collection: str, file_name: str, corrected_point: dict) -> None:
+    """同步写入反馈向量库（在后台线程中调用，勿使用 Streamlit session_state）。"""
+    from src.core.langchain_compat import Document
+    from src.core.agent import ReviewAgent
 
     is_fp = corrected_point.get("correction_kind") == "false_positive" or bool(
         (corrected_point.get("false_positive_reason") or "").strip()
@@ -5080,15 +6546,31 @@ def _feed_correction_to_kb(collection: str, file_name: str, corrected_point: dic
             "collection_tag": collection or "",
         },
     )
-    try:
-        agent = init_agent()
-        agent.checkpoint_feedback_kb.add_documents(
-            [doc],
-            file_name=logical_name,
-            category="audit_user_feedback",
-        )
-    except Exception:
-        pass
+    agent = ReviewAgent(collection or "regulations")
+    agent.checkpoint_feedback_kb.add_documents(
+        [doc],
+        file_name=logical_name,
+        category="audit_user_feedback",
+    )
+
+
+def _feed_correction_to_kb(collection: str, file_name: str, corrected_point: dict):
+    """将误报/弃用/修订写入独立「用户审核反馈」向量库。默认后台线程执行，避免阻塞 Streamlit UI。"""
+    import threading
+
+    def _run():
+        t0 = time.perf_counter()
+        try:
+            _feed_correction_to_kb_impl(collection, file_name, corrected_point)
+            if audit_perf_enabled():
+                audit_perf_log("feed_correction_kb_thread", (time.perf_counter() - t0) * 1000.0, "")
+        except Exception:
+            logging.getLogger(__name__).exception("后台写入审核反馈向量库失败")
+
+    if getattr(settings, "async_correction_kb_feed", True):
+        threading.Thread(target=_run, daemon=True).start()
+        return
+    _run()
 
 
 def _render_reports_table_layout(
@@ -5098,9 +6580,11 @@ def _render_reports_table_layout(
     parent_batch_report: dict = None,
     key_suffix: str = "",
     allow_nested_expander: bool = True,
+    history_local_draft: bool = False,
 ):
     """按批次→文档→问题层级渲染报告内容（表格+待办），供当前会话与历史报告共用。
     allow_nested_expander: False 时不在文档块使用 expander（用于已在 expander 内的历史报告，避免 Streamlit 禁止嵌套 expander）。
+    history_local_draft: 历史报告且开启本地批量模式时，单条保存不写库，改由顶部「一次性保存」。
     """
     if not reports:
         return
@@ -5142,18 +6626,29 @@ def _render_reports_table_layout(
     for r_idx, r in enumerate(reports):
         fn = r.get("original_filename", r.get("file_name", "未知"))
         summary_rows.append({
-            "序号": r_idx + 1,
-            "文件名": fn,
-            "🔴高": r.get("high_count", 0),
-            "🟡中": r.get("medium_count", 0),
-            "🔵低": r.get("low_count", 0),
-            "ℹ️提示": r.get("info_count", 0),
-            "总计": r.get("total_points", 0),
+            # 全用 str/int 分列一致：勿把「表头行+数据行」塞进 st.table(list)，否则第 0 列会 str/int 混用触发 PyArrow
+            # Expected bytes, got int / Conversion failed for column 0 with type object
+            "序号": str(r_idx + 1),
+            "文件名": _hist_cell_display_str(fn),
+            "🔴高": int(r.get("high_count", 0) or 0),
+            "🟡中": int(r.get("medium_count", 0) or 0),
+            "🔵低": int(r.get("low_count", 0) or 0),
+            "ℹ️提示": int(r.get("info_count", 0) or 0),
+            "总计": int(r.get("total_points", 0) or 0),
         })
     if summary_rows:
-        headers = ["序号", "文件名", "🔴高", "🟡中", "🔵低", "ℹ️提示", "总计"]
-        table_data = [headers] + [[row[h] for h in headers] for row in summary_rows]
-        st.table(table_data)
+        _sum_headers = ["序号", "文件名", "🔴高", "🟡中", "🔵低", "ℹ️提示", "总计"]
+
+        def _sum_cell(v) -> str:
+            s = str(v).replace("\n", " ").replace("\r", " ")
+            return s.replace("|", "｜")
+
+        _sep = "| " + " | ".join(["---"] * len(_sum_headers)) + " |"
+        _hdr = "| " + " | ".join(_sum_cell(h) for h in _sum_headers) + " |"
+        _lines = [_hdr, _sep]
+        for _sr in summary_rows:
+            _lines.append("| " + " | ".join(_sum_cell(_sr.get(h, "")) for h in _sum_headers) + " |")
+        st.markdown("\n".join(_lines))
 
     all_immediate = []
     for r_idx, r in enumerate(reports):
@@ -5261,9 +6756,11 @@ def _render_reports_table_layout(
         pk = f"{base_key_prefix}{r_idx}"
         points = report.get("audit_points") or []
 
+        # 标题勿含「问题点数」等会随保存而变的文案，否则 Streamlit 会把 expander 视为新组件、展开状态丢失（像自动收起）
+        _exp_label = f"📄 文档 {r_idx + 1}：{file_name}"
         if allow_nested_expander:
             doc_container = st.expander(
-                f"📄 {file_name}（{report.get('total_points', 0)} 个问题点：🔴{report.get('high_count',0)} 🟡{report.get('medium_count',0)} 🔵{report.get('low_count',0)}）",
+                _exp_label,
                 expanded=(len(reports) == 1),
             )
         else:
@@ -5275,49 +6772,69 @@ def _render_reports_table_layout(
             doc_container = st.container()
 
         with doc_container:
+            if allow_nested_expander:
+                st.caption(
+                    f"共 {report.get('total_points', 0)} 个问题点 · 🔴{report.get('high_count', 0)} "
+                    f"🟡{report.get('medium_count', 0)} 🔵{report.get('low_count', 0)} "
+                    f"ℹ️{report.get('info_count', 0)}"
+                )
             if points:
-                rows_h = [
-                    "<table style='width:100%;border-collapse:collapse;font-size:0.92rem'>",
-                    "<thead><tr><th>#</th><th>级别</th><th>类别</th><th>摘要（悬停看全文）</th></tr></thead><tbody>",
-                ]
-                for j, p in enumerate(points):
-                    sev = p.get("severity", "info")
-                    icon = _SEVERITY_ICONS.get(sev, "ℹ️")
-                    lab = _SEVERITY_LABELS.get(sev, sev)
-                    full = (p.get("description") or "").replace("\n", " ").replace("\r", " ").strip()
-                    if p.get("deprecated"):
-                        full = "〔弃用〕" + full
-                    elif p.get("correction_kind") == "false_positive" or p.get("false_positive_reason"):
-                        full = "〔误报〕" + full
-                    short_txt = full[:52] + ("…" if len(full) > 52 else "")
-                    short_esc = html.escape(short_txt, quote=False)
-                    title_attr = html.escape(full[:12000], quote=True)
-                    sev_cell = html.escape(f"{icon}{lab}", quote=False)
-                    cat_cell = html.escape((p.get("category") or "")[:26], quote=False)
-                    rows_h.append(
-                        f"<tr><td>{j + 1}</td><td>{sev_cell}</td><td>{cat_cell}</td>"
-                        f'<td><span style="border-bottom:1px dotted #888;cursor:help" title="{title_attr}">{short_esc}</span></td></tr>'
+                if history_id:
+                    _render_history_doc_points_table(
+                        report,
+                        r_idx,
+                        reports,
+                        pk,
+                        key_suffix,
+                        history_id,
+                        parent_batch_report,
+                        history_local_draft,
+                        file_name,
                     )
-                rows_h.append("</tbody></table>")
-                st.markdown("\n".join(rows_h), unsafe_allow_html=True)
-                sel_pt = st.selectbox(
-                    f"选择审核点（仅展开这一条）· {file_name[:40]}",
-                    options=list(range(len(points))),
-                    format_func=lambda j: _point_row_label(points[j], j),
-                    key=f"apt_sel_{pk}{key_suffix}",
-                )
-                _render_point_detail_inline(
-                    report,
-                    r_idx,
-                    reports,
-                    sel_pt,
-                    points[sel_pt],
-                    pk=pk,
-                    key_suffix=key_suffix,
-                    history_id=history_id,
-                    parent_batch_report=parent_batch_report,
-                    detail_scope_suffix=key_suffix,
-                )
+                else:
+                    rows_h = [
+                        "<table style='width:100%;border-collapse:collapse;font-size:0.92rem'>",
+                        "<thead><tr><th>#</th><th>级别</th><th>类别</th><th>摘要（悬停看全文）</th></tr></thead><tbody>",
+                    ]
+                    for j, p in enumerate(points):
+                        sev = p.get("severity", "info")
+                        icon = _SEVERITY_ICONS.get(sev, "ℹ️")
+                        lab = _SEVERITY_LABELS.get(sev, sev)
+                        full = (p.get("description") or "").replace("\n", " ").replace("\r", " ").strip()
+                        if p.get("deprecated"):
+                            full = "〔弃用〕" + full
+                        elif p.get("correction_kind") == "false_positive" or p.get("false_positive_reason"):
+                            full = "〔误报〕" + full
+                        short_txt = full[:52] + ("…" if len(full) > 52 else "")
+                        short_esc = html.escape(short_txt, quote=False)
+                        title_attr = html.escape(full[:12000], quote=True)
+                        sev_cell = html.escape(f"{icon}{lab}", quote=False)
+                        cat_cell = html.escape((p.get("category") or "")[:26], quote=False)
+                        rows_h.append(
+                            f"<tr><td>{j + 1}</td><td>{sev_cell}</td><td>{cat_cell}</td>"
+                            f'<td><span style="border-bottom:1px dotted #888;cursor:help" title="{title_attr}">{short_esc}</span></td></tr>'
+                        )
+                    rows_h.append("</tbody></table>")
+                    st.markdown("\n".join(rows_h), unsafe_allow_html=True)
+                    sel_pt = st.selectbox(
+                        f"选择审核点（仅展开这一条）· {file_name[:40]}",
+                        options=list(range(len(points))),
+                        format_func=lambda j: _point_row_label(points[j], j),
+                        key=f"apt_sel_{pk}{key_suffix}",
+                    )
+                    _render_point_detail_inline(
+                        report,
+                        r_idx,
+                        reports,
+                        sel_pt,
+                        points[sel_pt],
+                        pk=pk,
+                        key_suffix=key_suffix,
+                        history_id=history_id,
+                        parent_batch_report=parent_batch_report,
+                        detail_scope_suffix=key_suffix,
+                        history_local_draft=history_local_draft,
+                    )
 
             # 本文档待办导出（默认仅 CSV；PDF/Word/Excel 按需加载，避免每行详情都触发整页重算卡顿）
             doc_immediate = [
@@ -5419,6 +6936,7 @@ def _render_point_detail_inline(
     history_id: int = 0,
     parent_batch_report: dict = None,
     detail_scope_suffix: str = "",
+    history_local_draft: bool = False,
 ):
     """在审核点行下方展开的详情/编辑面板。同一时间仅展开一条详情（按 detail_scope_suffix 区分），关闭用 _streamlit_rerun。"""
     sev = point.get("severity", "info")
@@ -5430,6 +6948,7 @@ def _render_point_detail_inline(
     hist_corr_key = f"_hist_corr_{history_id}_{pk}_{point_idx}{key_suffix}" if history_id else ""
 
     with st.container():
+        _md_unify_detail = _audit_point_modify_docs_key(int(history_id or 0), int(point_idx), pk, key_suffix or "")
         st.markdown(f"---\n**{icon} 审核点 {point_idx + 1} 详情 — {point.get('category', '未分类')}**")
 
         if history_id and hist_corr_key and st.session_state.get(hist_corr_key):
@@ -5442,52 +6961,80 @@ def _render_point_detail_inline(
                 parent_batch_report=parent_batch_report,
                 sub_report_index=r_idx if parent_batch_report is not None else None,
                 close_state_keys=[hist_corr_key],
+                local_draft=bool(history_id and history_local_draft),
+                modify_docs_widget_key=_md_unify_detail,
             )
             if st.button("↩ 返回普通编辑", key=f"{pk}_detail_{point_idx}{key_suffix}_back_corr"):
                 st.session_state.pop(hist_corr_key, None)
                 _streamlit_rerun()
             return
 
-        c_info1, c_info2 = st.columns(2)
-        c_info1.markdown(f"**严重程度：** {_SEVERITY_LABELS.get(sev, sev)}")
-        c_info2.markdown(f"**位置：** {point.get('location', '未知')}")
-        st.markdown(f"**法规依据：** {point.get('regulation_ref', '—')}")
-
         pfx = f"{pk}_detail_{point_idx}{key_suffix}"
+        _sev_list = ["high", "medium", "low", "info"]
+        _sv0 = (point.get("severity") or "info").lower()
+        _sev_i0 = _sev_list.index(_sv0) if _sv0 in _sev_list else 3
+        c_sev, c_loc = st.columns(2)
+        with c_sev:
+            try:
+                new_sev = st.selectbox(
+                    "严重程度",
+                    _sev_list,
+                    index=_sev_i0,
+                    format_func=lambda x: _SEVERITY_LABELS.get(x, x),
+                    key=f"{pfx}_sev",
+                )
+            except TypeError:
+                new_sev = st.selectbox("严重程度", _sev_list, index=_sev_i0, key=f"{pfx}_sev")
+        with c_loc:
+            new_loc = st.text_input("位置", value=point.get("location", "") or "", key=f"{pfx}_loc")
+        st.caption(f"**类别（只读）** {point.get('category') or '—'}")
+        st.caption(f"**法规依据（只读）** {point.get('regulation_ref') or '—'}")
         new_desc = st.text_area("问题描述", value=point.get("description", ""), key=f"{pfx}_desc", height=100)
         new_sug = st.text_area("修改建议", value=point.get("suggestion", ""), key=f"{pfx}_sug", height=100)
 
-        current_docs = point.get("modify_docs") or []
-        if not isinstance(current_docs, list):
-            current_docs = []
-        if not current_docs and doc_names:
-            current_docs = list(doc_names)
-        default_docs = [d for d in current_docs if d in doc_names]
-        new_modify_docs = st.multiselect("需修改的文档", options=doc_names, default=default_docs, key=f"{pfx}_docs")
+        _caption_stored_modify_docs(point)
+        new_modify_docs = _multiselect_modify_docs(
+            "需修改的文档", doc_names, _point_modify_docs_merged_list(point), key=_md_unify_detail
+        )
 
-        current_action = point.get("action") or _get_multi_doc_default_action(sev)
+        current_action = point.get("action") or _get_multi_doc_default_action(new_sev)
         if current_action not in ACTION_OPTIONS:
             current_action = ACTION_OPTIONS[0]
         new_action = st.selectbox("处理状态", ACTION_OPTIONS, index=ACTION_OPTIONS.index(current_action), key=f"{pfx}_action")
 
         c_save, c_close = st.columns(2)
         with c_save:
-            if st.button("💾 保存修改", key=f"{pfx}_save"):
+            _save_label = "✅ 应用本条到草稿" if (history_id and history_local_draft) else "💾 保存修改"
+            if st.button(_save_label, key=f"{pfx}_save"):
                 if r_idx < len(reports) and point_idx < len(reports[r_idx].get("audit_points", [])):
+                    _md_save = new_modify_docs
+                    if not _md_save:
+                        _fb = _point_modify_docs_merged_list(point)
+                        if _fb:
+                            _md_save = _fb
+                    reports[r_idx]["audit_points"][point_idx]["severity"] = new_sev
+                    reports[r_idx]["audit_points"][point_idx]["location"] = new_loc
                     reports[r_idx]["audit_points"][point_idx]["description"] = new_desc
                     reports[r_idx]["audit_points"][point_idx]["suggestion"] = new_sug
-                    reports[r_idx]["audit_points"][point_idx]["modify_docs"] = new_modify_docs
+                    reports[r_idx]["audit_points"][point_idx]["modify_docs"] = _md_save
                     reports[r_idx]["audit_points"][point_idx]["action"] = new_action
                 if history_id:
-                    try:
-                        updated_report = parent_batch_report if parent_batch_report else report
-                        from src.core.db import update_audit_report
-                        update_audit_report(history_id, updated_report)
-                        _invalidate_audit_history_cache()
-                        st.success("已保存到历史报告")
-                        _streamlit_rerun()
-                    except Exception as ex:
-                        st.error(f"写入历史失败：{ex}")
+                    if history_local_draft:
+                        tgt = reports[r_idx] if r_idx < len(reports) else report
+                        _recount_severity(tgt)
+                        if parent_batch_report is not None:
+                            _aggregate_batch_report_totals(parent_batch_report)
+                        st.session_state["_hist_draft_dirty"] = True
+                        st.success("已写入本地草稿（尚未保存到数据库）；改完后请点上方「一次性保存到数据库」。")
+                    else:
+                        try:
+                            updated_report = parent_batch_report if parent_batch_report else report
+                            _timed_update_audit_report(history_id, updated_report)
+                            _invalidate_audit_history_cache()
+                            st.success("已保存到历史报告")
+                            _streamlit_rerun()
+                        except Exception as ex:
+                            st.error(f"写入历史失败：{ex}")
                 else:
                     st.success("已保存（当前会话，刷新页面会丢失未入库的修改）")
         with c_close:
@@ -5510,14 +7057,52 @@ def _render_point_detail_inline(
 def render_reports(reports: list):
     """渲染审核报告（当前会话）：按批次→文档→问题层级表格展示，支持单条/批次待办。"""
     st.subheader("📋 审核报告")
-    st.caption("按 **批次 → 文档 → 问题** 层级展示；可导出单文档待办或整批待办 CSV。")
+    st.caption(
+        "按 **批次 → 文档 → 问题** 层级展示；用下拉 **仅展开一条** 审核点编辑，减轻页面控件数量。"
+        " 导出 **Excel/PDF/Word/HTML** 默认不自动生成（避免每次重跑页面都卡顿），需要时在下载区点击加载。"
+    )
 
     _render_reports_table_layout(reports, "r", history_id=0, parent_batch_report=None, key_suffix="")
     _render_download_buttons(reports)
 
 
+def _reports_markdown_for_download(reports: list) -> str:
+    """生成当前会话报告 Markdown 文本（轻量，供下载按钮使用）。"""
+    md_lines = []
+    for report in reports:
+        file_name = report.get("original_filename", report.get("file_name", ""))
+        md_lines.append(f"# 审核报告：{file_name}\n")
+        md_lines.append(f"**总结：** {report.get('summary', '')}\n")
+        md_lines.append("| 高风险 | 中风险 | 低风险 | 提示 |")
+        md_lines.append("|--------|--------|--------|------|")
+        md_lines.append(
+            f"| {report.get('high_count', 0)} | {report.get('medium_count', 0)} "
+            f"| {report.get('low_count', 0)} | {report.get('info_count', 0)} |\n"
+        )
+        for i, point in enumerate(report.get("audit_points", []), 1):
+            sev_label = {"high": "高", "medium": "中", "low": "低", "info": "提示"}.get(
+                (point.get("severity") or "").lower(), point.get("severity", "")
+            )
+            md_lines.append(f"## [{sev_label}] 审核点 {i}：{point.get('category', '')}")
+            md_lines.append(f"- **位置：** {point.get('location', '')}")
+            md_lines.append(f"- **描述：** {point.get('description', '')}")
+            md_lines.append(f"- **法规依据：** {point.get('regulation_ref', '')}")
+            md_lines.append(f"- **建议：** {point.get('suggestion', '')}")
+            _docs = point.get("modify_docs") or []
+            if _docs:
+                md_lines.append(f"- **需修改文档：** {'、'.join(d for d in _docs if d)}")
+            _action = point.get("action") or ""
+            if _action:
+                md_lines.append(f"- **处理状态：** {_action}")
+            md_lines.append("")
+    return "\n".join(md_lines)
+
+
 def _render_download_buttons(reports: list, key_suffix: str = ""):
-    """渲染报告下载按钮组"""
+    """渲染报告下载按钮组。Excel/PDF/Word/HTML/带批注 Word 默认不生成，避免 Streamlit 每次重跑都全量导出导致编辑卡顿。"""
+    ks = key_suffix or "_root"
+    ready_key = f"_sess_audit_dl_heavy_{ks}"
+
     has_single_docx = (
         len(reports) == 1
         and reports[0].get("_original_path")
@@ -5529,9 +7114,37 @@ def _render_download_buttons(reports: list, key_suffix: str = ""):
         and reports[0].get("_kdocs_download_url")
         and (reports[0].get("file_name") or "").lower().endswith(".docx")
     )
+
+    if not st.session_state.get(ready_key):
+        st.markdown("**📥 下载**")
+        st.caption(
+            "默认仅 **JSON / Markdown**（即时生成）。**Excel、PDF、Word、HTML** 与 **带批注 Word** 较慢，点按钮后再生成，避免浏览报告时页面反复卡住。"
+        )
+        q1, q2, q3 = st.columns([1, 1, 2])
+        with q1:
+            st.download_button(
+                "📥 JSON",
+                data=json.dumps(reports, ensure_ascii=False, indent=2),
+                file_name="audit_report.json",
+                mime="application/json",
+                key=f"dl_json_light_{ks}",
+            )
+        with q2:
+            st.download_button(
+                "📥 Markdown",
+                data=_reports_markdown_for_download(reports),
+                file_name="audit_report.md",
+                mime="text/markdown",
+                key=f"dl_md_light_{ks}",
+            )
+        with q3:
+            if st.button("📥 加载全部格式下载（Excel / PDF / Word / HTML 等，较慢）", key=f"_sess_audit_dl_show_{ks}"):
+                st.session_state[ready_key] = True
+                _streamlit_rerun()
+        return
+
     extra = 1 if (has_single_docx or has_kdocs_docx) else 0
     cols = st.columns(6 + extra)
-    ks = key_suffix
 
     with cols[0]:
         try:
@@ -5540,7 +7153,7 @@ def _render_download_buttons(reports: list, key_suffix: str = ""):
                 "📥 Excel", data=xlsx_bytes,
                 file_name="audit_report.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_xlsx{ks}",
+                key=f"dl_xlsx_{ks}",
             )
         except Exception as e:
             st.caption(f"Excel 生成失败: {e}")
@@ -5550,7 +7163,7 @@ def _render_download_buttons(reports: list, key_suffix: str = ""):
             st.download_button(
                 "📥 PDF", data=pdf_bytes,
                 file_name="audit_report.pdf", mime="application/pdf",
-                key=f"dl_pdf{ks}",
+                key=f"dl_pdf_{ks}",
             )
         except Exception as e:
             st.caption(f"PDF 生成失败: {e}")
@@ -5561,7 +7174,7 @@ def _render_download_buttons(reports: list, key_suffix: str = ""):
                 "📥 Word", data=docx_bytes,
                 file_name="audit_report.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key=f"dl_docx{ks}",
+                key=f"dl_docx_{ks}",
             )
         except Exception as e:
             st.caption(f"Word 生成失败: {e}")
@@ -5570,46 +7183,22 @@ def _render_download_buttons(reports: list, key_suffix: str = ""):
         st.download_button(
             "📥 HTML", data=html_data,
             file_name="audit_report.html", mime="text/html",
-            key=f"dl_html{ks}",
+            key=f"dl_html_{ks}",
         )
     with cols[4]:
         json_data = json.dumps(reports, ensure_ascii=False, indent=2)
         st.download_button(
             "📥 JSON", data=json_data,
             file_name="audit_report.json", mime="application/json",
-            key=f"dl_json{ks}",
+            key=f"dl_json_{ks}",
         )
     with cols[5]:
-        md_lines = []
-        for report in reports:
-            file_name = report.get("original_filename", report.get("file_name", ""))
-            md_lines.append(f"# 审核报告：{file_name}\n")
-            md_lines.append(f"**总结：** {report.get('summary', '')}\n")
-            md_lines.append(f"| 高风险 | 中风险 | 低风险 | 提示 |")
-            md_lines.append(f"|--------|--------|--------|------|")
-            md_lines.append(
-                f"| {report.get('high_count', 0)} | {report.get('medium_count', 0)} "
-                f"| {report.get('low_count', 0)} | {report.get('info_count', 0)} |\n"
-            )
-            for i, point in enumerate(report.get("audit_points", []), 1):
-                sev_label = {"high": "高", "medium": "中", "low": "低", "info": "提示"}.get((point.get("severity") or "").lower(), point.get("severity", ""))
-                md_lines.append(f"## [{sev_label}] 审核点 {i}：{point.get('category', '')}")
-                md_lines.append(f"- **位置：** {point.get('location', '')}")
-                md_lines.append(f"- **描述：** {point.get('description', '')}")
-                md_lines.append(f"- **法规依据：** {point.get('regulation_ref', '')}")
-                md_lines.append(f"- **建议：** {point.get('suggestion', '')}")
-                _docs = point.get("modify_docs") or []
-                if _docs:
-                    md_lines.append(f"- **需修改文档：** {'、'.join(d for d in _docs if d)}")
-                _action = point.get("action") or ""
-                if _action:
-                    md_lines.append(f"- **处理状态：** {_action}")
-                md_lines.append("")
-
         st.download_button(
-            "📥 Markdown", data="\n".join(md_lines),
-            file_name="audit_report.md", mime="text/markdown",
-            key=f"dl_md{ks}",
+            "📥 Markdown",
+            data=_reports_markdown_for_download(reports),
+            file_name="audit_report.md",
+            mime="text/markdown",
+            key=f"dl_md_{ks}",
         )
     if has_single_docx:
         with cols[6]:
@@ -5622,7 +7211,7 @@ def _render_download_buttons(reports: list, key_suffix: str = ""):
                     data=docx_with_comments,
                     file_name="audit_with_comments.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key=f"dl_docx_comments{ks}",
+                    key=f"dl_docx_comments_{ks}",
                     help="在原文档对应位置插入批注，可上传回金山文档或本地 Word 查看",
                 )
             except Exception as e:
@@ -5642,11 +7231,15 @@ def _render_download_buttons(reports: list, key_suffix: str = ""):
                     data=docx_with_comments,
                     file_name="audit_with_comments.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key=f"dl_kdocs_comments{ks}",
+                    key=f"dl_kdocs_comments_{ks}",
                     help="下载金山文档原文件并在对应位置插入批注，可上传回金山文档替换原文件",
                 )
             except Exception as e:
                 st.caption(f"带批注 Word 生成失败: {e}")
+
+    if st.button("收起慢速格式（恢复仅 JSON/Markdown，加快翻页）", key=f"_sess_audit_dl_hide_{ks}"):
+        st.session_state.pop(ready_key, None)
+        _streamlit_rerun()
 
 
 def render_knowledge_page():
@@ -5660,13 +7253,10 @@ def render_knowledge_page():
     agent = init_agent()
     collection = st.session_state.get("collection_name", "regulations")
 
-    tab_search, tab_browse = st.tabs(["🔍 语义检索", "📂 知识库文档浏览"])
-
-    with tab_search:
-        kb_target = st.radio(
+    def _kb_tab_search():
+        kb_target = _st_radio_compat(
             "查询目标",
             ["法规知识库（第一步）", "审核点知识库（第二步）"],
-            horizontal=True,
             key="kb_query_target",
         )
         use_checkpoints = "审核点" in kb_target
@@ -5685,7 +7275,7 @@ def render_knowledge_page():
                     with st.expander(f"📄 结果 {i} — 来源：{result['source']}", expanded=(i <= 3)):
                         st.markdown(result["content"])
 
-    with tab_browse:
+    def _kb_tab_browse():
         from src.core.db import get_knowledge_docs as _get_kd
         st.markdown("浏览所有已训练入库的文档块（数据存储于 MySQL，可按类型筛选）。")
         try:
@@ -5723,6 +7313,27 @@ def render_knowledge_page():
                 st.info("当前知识库尚无文档记录，或该类型下无数据。")
         except Exception as e:
             st.warning(f"加载知识库文档失败：{e}")
+
+    _kb_tab_labels = ["🔍 语义检索", "📂 知识库文档浏览"]
+    _st_run_tabs_or_pick(
+        _kb_tab_labels,
+        radio_label="知识库查询子功能",
+        session_key="kb_page_tabs",
+        tab_bodies=[_kb_tab_search, _kb_tab_browse],
+    )
+
+
+def _parse_translation_correction_manual_rules(raw: str):
+    """校正手工规则：每行「错误译文|正确译文|中文词条」，第三列可空（仅替换不写库）。"""
+    rules = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            rules.append((parts[0], parts[1], parts[2] if len(parts) > 2 else ""))
+    return rules
 
 
 def render_translation_page():
@@ -5822,10 +7433,9 @@ def render_translation_page():
     use_kb = st.checkbox("使用知识库（词条/法规/案例）作为术语与风格参考", value=True, key="translation_use_kb")
     col_name = collection if use_kb else None
 
-    trans_proj_mode = st.radio(
+    trans_proj_mode = _st_radio_compat(
         "翻译上下文（与第三步「文档审核」一致，用于知识库检索与术语对齐）",
         ["通用（仅按当前知识库检索）", "按项目（选用与审核相同的项目与注册维度）"],
-        horizontal=True,
         key="translation_proj_mode",
     )
     kb_query_extra = ""
@@ -5891,42 +7501,25 @@ def render_translation_page():
                 kb_query_extra = " ".join(p for p in hint_parts if p).strip()
     st.caption("同一批翻译任务内，相同原文只调用一次模型并复用译法，多文件与表格内术语更易保持一致。")
 
-    input_mode = st.radio("输入方式", ["上传文件", "本地路径"], horizontal=True, key="translation_input_mode")
-    input_path = None
-    uploaded_files = []
-
-    if input_mode == "上传文件":
-        uploaded_files = st.file_uploader(
-            "选择文件或 .zip",
-            type=["docx", "txt", "xlsx", "zip"],
-            accept_multiple_files=True,
-            key="translation_upload",
-        )
-        if not uploaded_files:
-            st.info("请上传至少一个 .docx / .txt / .xlsx 或一个 .zip。")
-            return
-    else:
-        input_path = st.text_input(
-            "输入文件或文件夹路径",
-            placeholder="例如：C:\\docs\\file.docx 或 D:\\project\\docs",
-            key="translation_path",
-        )
-        if not (input_path and input_path.strip()):
-            st.info("请填写要翻译的文件或文件夹路径。")
-            return
-        input_path = input_path.strip()
-
-    output_dir = st.text_input(
-        "输出目录（可选，留空则单文件为同目录、目录/zip 为 xxx_translated）",
-        placeholder="留空使用默认",
-        key="translation_output_dir",
-    )
-    output_dir = output_dir.strip() or None
-
     st.markdown("---")
     st.subheader("🛠️ 翻译校正（已翻译文件）")
     st.caption("自动修复：同词异译、截断词、数值表达模式（如 10-2 → 10^-2）等问题。")
-    corr_input_mode = st.radio("校正输入方式", ["上传文件", "本地路径"], horizontal=True, key="corr_input_mode")
+    st.caption(
+        "手工替换（可选）：每行「错误译文|正确译文|中文词条」；第三列可空则只替换、不写知识库。"
+        "示例：`through|pass|通过`。校正语言为英文/德文时，替换词会按原文词的大小写自动调整（如 Through→Pass、THROUGH→PASS）。"
+    )
+    corr_manual = st.text_area(
+        "手工替换与词条",
+        height=120,
+        placeholder="through|pass|通过",
+        key="corr_manual_rules",
+    )
+    corr_save_glossary = st.checkbox(
+        "将含中文词条的行写入当前知识库「词条」分类",
+        value=True,
+        key="corr_save_glossary",
+    )
+    corr_input_mode = _st_radio_compat("校正输入方式", ["上传文件", "本地路径"], key="corr_input_mode")
     corr_input_path = None
     corr_uploaded = []
     if corr_input_mode == "上传文件":
@@ -5951,11 +7544,15 @@ def render_translation_page():
     corr_lang_map = {"英文": "en", "德文": "de", "中文": "zh"}
     corr_use_kb = st.checkbox("校正补全时使用知识库（建议开启）", value=True, key="corr_use_kb")
     if st.button("开始校正", key="translation_correct_run"):
+        from src.translation.correction import save_glossary_correction_entries
         from src.translation.pipeline import correct_path
         from src.translation.models import SUPPORTED_EXTENSIONS
+
+        manual_rules = _parse_translation_correction_manual_rules(corr_manual)
         try:
             if corr_input_mode == "上传文件":
                 import tempfile
+
                 root = Path(tempfile.mkdtemp(prefix="aicheckword_correct_"))
                 to_process = []
                 for uf in corr_uploaded:
@@ -5981,17 +7578,45 @@ def render_translation_page():
                                 collection_name=(collection if corr_use_kb else None),
                                 use_kb=corr_use_kb,
                                 provider=st.session_state.get("current_provider"),
+                                manual_rules=manual_rules or None,
                             )
                             out_paths.extend(outs)
                             for k, v in (s or {}).items():
                                 summary[k] = summary.get(k, 0) + (v or 0)
                     if out_paths:
                         st.success(f"✅ 校正完成，共 **{len(out_paths)}** 个文件。")
-                        st.caption(f"修复统计：改动块 {summary.get('changed_blocks',0)}；同词统一 {summary.get('term_unified',0)}；截断词修复 {summary.get('truncation_fixed',0)}；数值表达修复 {summary.get('numeric_fixed',0)}")
+                        st.caption(
+                            f"修复统计：改动块 {summary.get('changed_blocks', 0)}；"
+                            f"手工替换命中 {summary.get('manual_replaced', 0)}；"
+                            f"同词统一 {summary.get('term_unified', 0)}；"
+                            f"截断词修复 {summary.get('truncation_fixed', 0)}；"
+                            f"数值表达修复 {summary.get('numeric_fixed', 0)}"
+                        )
+                        if corr_save_glossary and manual_rules:
+                            zh_to_r = {}
+                            for _w, r, zh in manual_rules:
+                                z = (zh or "").strip()
+                                if z:
+                                    zh_to_r[z] = (r or "").strip()
+                            gel = [(z, t) for z, t in zh_to_r.items() if t]
+                            if gel:
+                                try:
+                                    n = save_glossary_correction_entries(
+                                        collection, gel, corr_lang_map[corr_lang]
+                                    )
+                                    st.caption(f"词条知识库已写入 **{n}** 条（中文→目标语译法）。")
+                                except Exception as ex:
+                                    st.warning(f"写入词条知识库失败：{ex}")
                         for p in out_paths:
                             p_path = Path(p)
                             if p_path.is_file():
-                                st.download_button(f"📥 下载校正结果 {p_path.name}", data=p_path.read_bytes(), file_name=p_path.name, mime="application/octet-stream", key=f"dl_corr_{p_path.name}_{id(p)}")
+                                st.download_button(
+                                    f"📥 下载校正结果 {p_path.name}",
+                                    data=p_path.read_bytes(),
+                                    file_name=p_path.name,
+                                    mime="application/octet-stream",
+                                    key=f"dl_corr_{p_path.name}_{id(p)}",
+                                )
             else:
                 if not corr_input_path:
                     st.warning("请填写校正路径。")
@@ -6004,16 +7629,75 @@ def render_translation_page():
                             collection_name=(collection if corr_use_kb else None),
                             use_kb=corr_use_kb,
                             provider=st.session_state.get("current_provider"),
+                            manual_rules=manual_rules or None,
                         )
                     if out_paths:
                         st.success(f"✅ 校正完成，共 **{len(out_paths)}** 个文件。")
-                        st.caption(f"修复统计：改动块 {summary.get('changed_blocks',0)}；同词统一 {summary.get('term_unified',0)}；截断词修复 {summary.get('truncation_fixed',0)}；数值表达修复 {summary.get('numeric_fixed',0)}")
+                        st.caption(
+                            f"修复统计：改动块 {summary.get('changed_blocks', 0)}；"
+                            f"手工替换命中 {summary.get('manual_replaced', 0)}；"
+                            f"同词统一 {summary.get('term_unified', 0)}；"
+                            f"截断词修复 {summary.get('truncation_fixed', 0)}；"
+                            f"数值表达修复 {summary.get('numeric_fixed', 0)}"
+                        )
+                        if corr_save_glossary and manual_rules:
+                            zh_to_r = {}
+                            for _w, r, zh in manual_rules:
+                                z = (zh or "").strip()
+                                if z:
+                                    zh_to_r[z] = (r or "").strip()
+                            gel = [(z, t) for z, t in zh_to_r.items() if t]
+                            if gel:
+                                try:
+                                    n = save_glossary_correction_entries(
+                                        collection, gel, corr_lang_map[corr_lang]
+                                    )
+                                    st.caption(f"词条知识库已写入 **{n}** 条（中文→目标语译法）。")
+                                except Exception as ex:
+                                    st.warning(f"写入词条知识库失败：{ex}")
                         for p in out_paths:
                             st.code(p)
                     else:
                         st.warning("未找到可校正文件（支持 .docx / .txt / .xlsx）。")
         except Exception as e:
             st.error(f"❌ 校正失败：{e}")
+
+    st.markdown("---")
+    st.caption(
+        "同一页里的两步：**上面**改已译稿，**下面**把待译原稿交给「开始翻译」生成新译文文件（不覆盖原稿）。"
+    )
+
+    input_mode = _st_radio_compat("待译原稿 — 输入方式", ["上传文件", "本地路径"], key="translation_input_mode")
+    input_path = None
+    uploaded_files = []
+
+    if input_mode == "上传文件":
+        uploaded_files = st.file_uploader(
+            "选择文件或 .zip",
+            type=["docx", "txt", "xlsx", "zip"],
+            accept_multiple_files=True,
+            key="translation_upload",
+        )
+        if not uploaded_files:
+            st.info("请上传至少一个 .docx / .txt / .xlsx 或一个 .zip；若仅校正已译稿，可只使用上方「翻译校正」区。")
+    else:
+        input_path = st.text_input(
+            "输入文件或文件夹路径",
+            placeholder="例如：C:\\docs\\file.docx 或 D:\\project\\docs",
+            key="translation_path",
+        )
+        if not (input_path and input_path.strip()):
+            st.info("请填写要翻译的文件或文件夹路径；若仅校正已译稿，可只使用上方「翻译校正」区。")
+            input_path = None
+        else:
+            input_path = input_path.strip()
+
+    output_dir = st.text_input(
+        "输出目录（可选，留空则单文件为同目录、目录/zip 为 xxx_translated）",
+        placeholder="留空使用默认",
+        key="translation_output_dir",
+    )
+    output_dir = output_dir.strip() or None
 
     if st.button("开始翻译", key="translation_run"):
         from src.translation.pipeline import translate_path
@@ -6024,107 +7708,112 @@ def render_translation_page():
                 import tempfile
                 import shutil
                 root = Path(tempfile.mkdtemp(prefix="aicheckword_translate_"))
-                to_process = []
-                for uf in uploaded_files:
-                    ext = Path(uf.name).suffix.lower()
-                    if ext == ".zip":
-                        zpath = root / uf.name
-                        zpath.write_bytes(uf.getvalue())
-                        to_process.append(str(zpath))
-                    elif ext in SUPPORTED_EXTENSIONS:
-                        fpath = root / uf.name
-                        fpath.write_bytes(uf.getvalue())
-                        to_process.append(str(fpath))
-                if not to_process:
-                    st.error("未包含可翻译文件（支持 .docx / .txt / .xlsx）。")
-                    return
-                out_paths = []
-                out_dir = output_dir or str(root / "out")
-                with st.spinner("⏳ 正在翻译，请勿关闭或刷新页面…"):
-                    for idx, inp in enumerate(to_process):
-                        if len(to_process) > 1:
-                            st.caption(f"正在处理第 {idx + 1}/{len(to_process)} 个输入…")
-                        out_paths.extend(
-                            translate_path(
-                                inp,
-                                output_dir=out_dir,
-                                collection_name=col_name,
-                                use_kb=use_kb,
-                                provider=st.session_state.get("current_provider"),
-                                target_lang=target_lang,
-                                company_overrides=company_overrides,
-                                kb_query_extra=kb_query_extra or None,
-                            )
-                        )
-                if out_paths:
-                    st.success(f"✅ 翻译完成，共 **{len(out_paths)}** 个文件。请点击下方按钮下载（刷新页面后需重新翻译）。")
-                    if any(str(p).lower().endswith(".docx") for p in out_paths):
-                        st.info("📌 Word 文档中的图片、字体与版式已按原稿保留；图片未参与翻译。")
-                    for p in out_paths:
-                        p_path = Path(p)
-                        if p_path.is_file():
-                            data = p_path.read_bytes()
-                            st.download_button(
-                                f"📥 下载 {p_path.name}",
-                                data=data,
-                                file_name=p_path.name,
-                                mime="application/octet-stream",
-                                key=f"dl_trans_{p_path.name}_{id(p)}",
-                            )
-                    add_operation_log(
-                        op_type=OP_TYPE_TRANSLATION,
-                        collection=collection,
-                        file_name=f"上传 {len(out_paths)} 个文件",
-                        source="上传文件",
-                        extra={
-                            "count": len(out_paths),
-                            "out_paths": out_paths[:20],
-                            "use_kb": use_kb,
-                            "project_id": trans_project_id,
-                            "translation_context": "project" if trans_proj_mode.startswith("按项目") else "general",
-                        },
-                        model_info=get_current_model_info(),
-                    )
-                else:
-                    st.warning("未生成任何翻译文件，请检查输入。")
                 try:
-                    shutil.rmtree(root, ignore_errors=True)
-                except Exception:
-                    pass
+                    to_process = []
+                    for uf in uploaded_files or []:
+                        ext = Path(uf.name).suffix.lower()
+                        if ext == ".zip":
+                            zpath = root / uf.name
+                            zpath.write_bytes(uf.getvalue())
+                            to_process.append(str(zpath))
+                        elif ext in SUPPORTED_EXTENSIONS:
+                            fpath = root / uf.name
+                            fpath.write_bytes(uf.getvalue())
+                            to_process.append(str(fpath))
+                    if not to_process:
+                        st.error("未包含可翻译文件（支持 .docx / .txt / .xlsx）。请先上传源稿，或改用本地路径。")
+                    else:
+                        out_paths = []
+                        out_dir = output_dir or str(root / "out")
+                        with st.spinner("⏳ 正在翻译，请勿关闭或刷新页面…"):
+                            for idx, inp in enumerate(to_process):
+                                if len(to_process) > 1:
+                                    st.caption(f"正在处理第 {idx + 1}/{len(to_process)} 个输入…")
+                                out_paths.extend(
+                                    translate_path(
+                                        inp,
+                                        output_dir=out_dir,
+                                        collection_name=col_name,
+                                        use_kb=use_kb,
+                                        provider=st.session_state.get("current_provider"),
+                                        target_lang=target_lang,
+                                        company_overrides=company_overrides,
+                                        kb_query_extra=kb_query_extra or None,
+                                    )
+                                )
+                        if out_paths:
+                            st.success(f"✅ 翻译完成，共 **{len(out_paths)}** 个文件。请点击下方按钮下载（刷新页面后需重新翻译）。")
+                            if any(str(p).lower().endswith(".docx") for p in out_paths):
+                                st.info("📌 Word 文档中的图片、字体与版式已按原稿保留；图片未参与翻译。")
+                            for p in out_paths:
+                                p_path = Path(p)
+                                if p_path.is_file():
+                                    data = p_path.read_bytes()
+                                    st.download_button(
+                                        f"📥 下载 {p_path.name}",
+                                        data=data,
+                                        file_name=p_path.name,
+                                        mime="application/octet-stream",
+                                        key=f"dl_trans_{p_path.name}_{id(p)}",
+                                    )
+                            add_operation_log(
+                                op_type=OP_TYPE_TRANSLATION,
+                                collection=collection,
+                                file_name=f"上传 {len(out_paths)} 个文件",
+                                source="上传文件",
+                                extra={
+                                    "count": len(out_paths),
+                                    "out_paths": out_paths[:20],
+                                    "use_kb": use_kb,
+                                    "project_id": trans_project_id,
+                                    "translation_context": "project" if trans_proj_mode.startswith("按项目") else "general",
+                                },
+                                model_info=get_current_model_info(),
+                            )
+                        else:
+                            st.warning("未生成任何翻译文件，请检查输入。")
+                finally:
+                    try:
+                        shutil.rmtree(root, ignore_errors=True)
+                    except Exception:
+                        pass
             else:
-                with st.spinner("⏳ 正在翻译，请勿关闭或刷新页面…"):
-                    out_paths = translate_path(
-                        input_path,
-                        output_dir=output_dir,
-                        collection_name=col_name,
-                        use_kb=use_kb,
-                        provider=st.session_state.get("current_provider"),
-                        target_lang=target_lang,
-                        company_overrides=company_overrides,
-                        kb_query_extra=kb_query_extra or None,
-                    )
-                if out_paths:
-                    st.success(f"✅ 翻译完成，共 **{len(out_paths)}** 个文件，已保存到以下路径：")
-                    if any(str(p).lower().endswith(".docx") for p in out_paths):
-                        st.info("📌 Word 文档中的图片、字体与版式已按原稿保留；图片未参与翻译。")
-                    for p in out_paths:
-                        st.code(p)
-                    add_operation_log(
-                        op_type=OP_TYPE_TRANSLATION,
-                        collection=collection,
-                        file_name=Path(input_path).name if input_path else "",
-                        source=input_path or "",
-                        extra={
-                            "count": len(out_paths),
-                            "out_paths": out_paths[:20],
-                            "use_kb": use_kb,
-                            "project_id": trans_project_id,
-                            "translation_context": "project" if trans_proj_mode.startswith("按项目") else "general",
-                        },
-                        model_info=get_current_model_info(),
-                    )
+                if not input_path:
+                    st.warning("请填写要翻译的文件或文件夹路径，或改用上传文件。")
                 else:
-                    st.warning("未找到可翻译文件（支持 .docx / .txt / .xlsx）。")
+                    with st.spinner("⏳ 正在翻译，请勿关闭或刷新页面…"):
+                        out_paths = translate_path(
+                            input_path,
+                            output_dir=output_dir,
+                            collection_name=col_name,
+                            use_kb=use_kb,
+                            provider=st.session_state.get("current_provider"),
+                            target_lang=target_lang,
+                            company_overrides=company_overrides,
+                            kb_query_extra=kb_query_extra or None,
+                        )
+                    if out_paths:
+                        st.success(f"✅ 翻译完成，共 **{len(out_paths)}** 个文件，已保存到以下路径：")
+                        if any(str(p).lower().endswith(".docx") for p in out_paths):
+                            st.info("📌 Word 文档中的图片、字体与版式已按原稿保留；图片未参与翻译。")
+                        for p in out_paths:
+                            st.code(p)
+                        add_operation_log(
+                            op_type=OP_TYPE_TRANSLATION,
+                            collection=collection,
+                            file_name=Path(input_path).name if input_path else "",
+                            source=input_path or "",
+                            extra={
+                                "count": len(out_paths),
+                                "out_paths": out_paths[:20],
+                                "use_kb": use_kb,
+                                "project_id": trans_project_id,
+                                "translation_context": "project" if trans_proj_mode.startswith("按项目") else "general",
+                            },
+                            model_info=get_current_model_info(),
+                        )
+                    else:
+                        st.warning("未找到可翻译文件（支持 .docx / .txt / .xlsx）。")
         except FileNotFoundError as e:
             st.error(f"❌ 路径不存在：{e}")
             add_operation_log(
@@ -6147,7 +7836,6 @@ def render_translation_page():
                 extra={"error": str(e), "traceback": traceback.format_exc()},
                 model_info=get_current_model_info(),
             )
-
 
 def _op_type_label(op_type):
     """操作类型中文标签"""
@@ -6456,6 +8144,36 @@ def render_prompts_page():
                 st.markdown("---")
 
 
+_STREAMLIT_RECOMMENDED = (1, 28, 0)
+
+
+def _parse_streamlit_version_tuple() -> tuple:
+    import re
+
+    v = getattr(st, "__version__", "") or ""
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", str(v).strip())
+    if not m:
+        return (0, 0, 0)
+    return tuple(int(x) for x in m.groups())
+
+
+def _maybe_warn_streamlit_version() -> None:
+    """requirements.txt 要求 streamlit>=1.28；旧版仍能跑但功能/前端问题多，启动时提示一次。"""
+    if st.session_state.get("_streamlit_version_warn_done"):
+        return
+    st.session_state["_streamlit_version_warn_done"] = True
+    if _parse_streamlit_version_tuple() >= _STREAMLIT_RECOMMENDED:
+        return
+    ver = getattr(st, "__version__", "?")
+    st.warning(
+        f"当前环境 Streamlit **{ver}** 低于建议的 **{_STREAMLIT_RECOMMENDED[0]}.{_STREAMLIT_RECOMMENDED[1]}.{_STREAMLIT_RECOMMENDED[2]}**。"
+        " 可能出现：无原生标签页、无 `st.data_editor`、控制台与 resize/滚动相关的前端报错等。"
+        " **升级**：在可联网且 Python 足够新（建议 **3.10+**）的环境中执行 `pip install -U streamlit`。"
+        " 若出现 **No matching distribution**，多为 **Python 版本过低** 或 **内网 PyPI 未同步**；请升级 Python 或换官方源/完整镜像。"
+        " `requirements.txt` 中 Streamlit 未锁上限，以便旧环境仍能 `pip install -r requirements.txt`。"
+    )
+
+
 def main():
     st.set_page_config(
         page_title="注册文档审核工具",
@@ -6463,13 +8181,13 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    _maybe_warn_streamlit_version()
 
     render_sidebar()
 
     st.title("📋 注册文档审核工具")
 
-    page = st.radio(
-        "选择功能",
+    page = _st_main_page_nav(
         [
             "① 法规训练 & 生成审核点",
             "② 审核点管理 & 训练",
@@ -6480,8 +8198,8 @@ def main():
             "📋 操作记录",
             "⚙️ 系统配置",
         ],
-        horizontal=True,
-        key="main_function_nav_page",
+        state_key="main_function_nav_page",
+        title="选择功能",
     )
 
     # 仅在切换顶部功能页时短暂显示蒙层；避免编辑/纠正审核点时因任意控件重跑而反复出现「加载中」

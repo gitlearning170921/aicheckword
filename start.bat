@@ -13,5 +13,8 @@ if exist "venv\Scripts\activate.bat" (
     call venv\Scripts\activate.bat
 )
 
+:: 若已安装 protobuf 3.20.x 仍报 Descriptors 错误，可取消下一行（纯 Python 解析，略慢）
+:: set PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+
 streamlit run src/app.py
 pause

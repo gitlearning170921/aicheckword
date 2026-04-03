@@ -10,8 +10,7 @@ import tarfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from langchain.schema import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from .langchain_compat import Document, RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
     PyPDFLoader,
     Docx2txtLoader,
@@ -89,8 +88,69 @@ MAX_PDF_PAGES = 500
 MIN_PDF_TEXT_LEN = 20  # 提取文字少于此长度视为“图片版/扫描版”
 
 
+def _xlsx_cell_to_text(c) -> str:
+    """单元格转字符串：尽量保留文本型编号（避免无意义的小数尾）；数值型无法恢复 Excel 自定义显示格式中的前导零。"""
+    if c is None:
+        return ""
+    if isinstance(c, bool):
+        return str(c)
+    if isinstance(c, str):
+        return c.strip()
+    if isinstance(c, float):
+        if c == int(c) and abs(c) < 1e15:
+            return str(int(c))
+        return repr(c) if c != c else ""  # NaN
+    if isinstance(c, int):
+        return str(c)
+    return str(c).strip()
+
+
+def _excel_risk_sheet_content_hint(sheet_title: str) -> str:
+    """在风险类工作表摘录前加一句，引导模型按「风险需求」或英文 Risk demand 列取 CS 原文。"""
+    st = (sheet_title or "").strip()
+    snc = st.replace(" ", "").replace("\u3000", "")
+    sl = snc.lower()
+    zh = "风险" in snc and ("分析" in snc or "管理" in snc or "评估" in snc)
+    en = "risk" in sl and any(
+        k in sl for k in ("analysis", "analys", "management", "assessment", "mitigation", "control")
+    )
+    if zh or en:
+        return (
+            "【提示：CS 等措施编号常见列名为中文「风险需求」或英文「Risk demand (Measure) ID」/「Risk demand」等；"
+            "请按表头定位对应列并摘取单元格原文，勿改写或与其他列混淆。】\n"
+        )
+    return ""
+
+
+def _prioritize_excel_sheet_documents(docs: List[Document]) -> List[Document]:
+    """
+    将名称含「风险分析/风险管理」等（**含英文 Risk Analysis 等**）的工作表排在前面，
+    避免跨文档追溯时总字数截断把后面的风险分析表切没。
+    """
+    if not docs or len(docs) < 2:
+        return docs
+    scored = []
+    for i, d in enumerate(docs):
+        name = ((d.metadata or {}).get("sheet") or "").strip()
+        n = name.replace(" ", "").replace("\u3000", "")
+        nl = n.lower()
+        tier0_zh = "风险" in n and ("分析" in n or "评估" in n or "管理" in n)
+        tier0_en = "risk" in nl and any(
+            k in nl for k in ("analysis", "analys", "management", "assessment", "mitigation")
+        )
+        if tier0_zh or tier0_en:
+            tier = 0
+        elif "风险" in n or "risk" in nl:
+            tier = 1
+        else:
+            tier = 2
+        scored.append((tier, i, d))
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return [t[2] for t in scored]
+
+
 def _load_xlsx_with_openpyxl(path: Path) -> List[Document]:
-    """使用 openpyxl 读取 xlsx（当 UnstructuredExcelLoader 失败时备用），避免路径/格式兼容问题。"""
+    """使用 openpyxl 读取 xlsx **全部工作表**（每表一段文本，带表名标题）。审核/追溯须覆盖所有 sheet，勿依赖 Unstructured 默认仅前几表的行为。"""
     import openpyxl
     path = Path(path)
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
@@ -99,16 +159,51 @@ def _load_xlsx_with_openpyxl(path: Path) -> List[Document]:
         for sheet in wb.worksheets:
             rows = []
             for row in sheet.iter_rows(values_only=True):
-                rows.append("\t".join(str(c) if c is not None else "" for c in row))
+                rows.append("\t".join(_xlsx_cell_to_text(c) for c in row))
             text = "\n".join(rows).strip()
             if text:
+                hint = _excel_risk_sheet_content_hint(sheet.title)
+                block = f"【Excel 工作表：{sheet.title}】\n{hint}{text}"
                 docs.append(Document(
-                    page_content=text,
+                    page_content=block,
                     metadata={"source_file": path.name, "file_type": ".xlsx", "sheet": sheet.title},
                 ))
     finally:
         wb.close()
+    docs = _prioritize_excel_sheet_documents(docs)
     return docs if docs else [Document(page_content="(空表)", metadata={"source_file": path.name, "file_type": ".xlsx"})]
+
+
+def _load_xls_all_sheets_with_xlrd(path: Path) -> List[Document]:
+    """使用 xlrd 读取旧版 .xls 的**全部工作表**（每表带标题）。未安装 xlrd 时返回空列表。"""
+    path = Path(path)
+    try:
+        import xlrd
+    except ImportError:
+        return []
+    try:
+        book = xlrd.open_workbook(str(path))
+    except Exception:
+        return []
+    docs: List[Document] = []
+    for si in range(book.nsheets):
+        sh = book.sheet_by_index(si)
+        rows = []
+        for ri in range(sh.nrows):
+            rows.append(
+                "\t".join(_xlsx_cell_to_text(sh.cell_value(ri, ci)) for ci in range(sh.ncols))
+            )
+        text = "\n".join(rows).strip()
+        if text:
+            hint = _excel_risk_sheet_content_hint(sh.name)
+            block = f"【Excel 工作表：{sh.name}】\n{hint}{text}"
+            docs.append(
+                Document(
+                    page_content=block,
+                    metadata={"source_file": path.name, "file_type": ".xls", "sheet": sh.name},
+                )
+            )
+    return _prioritize_excel_sheet_documents(docs)
 
 
 def _find_soffice() -> Optional[str]:
@@ -465,6 +560,253 @@ def _append_docx_signoff_supplement(docs: List[Document], docx_path: Path) -> No
     first.page_content = f"{base}\n\n{sup}"
 
 
+# docx2txt 对复杂 Word 表格列（如 URS 编号）常漏字或错位；用 python-docx 按单元格再导出一遍
+_DOCX_TABLE_MAX_ROWS = 4000
+_DOCX_TABLE_MAX_CELL_CHARS = 4000
+
+
+def _docx_paragraph_ooxml_text(paragraph) -> str:
+    """
+    段落纯文本，近似 Word「最终状态」：**不采集** w:del / w:moveFrom 子树内的文字。
+    若把 w:delText（已删除的旧编号如 C201）与 w:ins 内新编号（CS02）一并拼接，会得到 C201CS02，
+    模型易误读为 CS012；审核应以**修订后**为准。
+    w:ins 与未删除 run 中的 w:t、w:instrText（域代码可见文本）仍保留。
+    """
+    try:
+        from docx.oxml.ns import qn
+
+        root = paragraph._p
+    except Exception:
+        return (getattr(paragraph, "text", None) or "").strip()
+    skip_roots = frozenset({qn("w:del"), qn("w:moveFrom")})
+
+    def walk(node) -> str:
+        if node.tag in skip_roots:
+            return ""
+        if node.tag == qn("w:t"):
+            return node.text or ""
+        if node.tag == qn("w:delText"):
+            return ""
+        if node.tag == qn("w:instrText"):
+            return node.text or ""
+        if node.tag == qn("w:tab"):
+            return "\t"
+        if node.tag in (qn("w:br"), qn("w:cr")):
+            return "\n"
+        return "".join(walk(ch) for ch in node)
+
+    raw = walk(root)
+    raw = raw.replace("\t", " ")
+    raw = " ".join(raw.split())
+    return raw.strip()
+
+
+# 无分隔符时「旧号+新号」粘连（含未开修订、纯粘贴导致）
+_REVISION_ID_COLLISION_PATTERNS = (
+    (re.compile(r"C(\d{3})CS(\d{1,4})\b", re.I), r"【以修订后为准】CS\2（已废止 C\1）"),
+    (re.compile(r"CE(\d{1,4})CS(\d{1,4})\b", re.I), r"【以修订后为准】CS\2（已废止 CE\1）"),
+    (re.compile(r"CS(\d{1,4})CS(\d{1,4})\b", re.I), r"【以修订后为准】CS\2（已取代 CS\1）"),
+)
+
+
+def _normalize_revision_id_collisions(text: str) -> str:
+    """将明显为「修订串联」的粘连编号标成以新号为准，供模型只审核最终编号。"""
+    if not text:
+        return text
+    s = text
+    for _ in range(8):
+        prev = s
+        for rx, repl in _REVISION_ID_COLLISION_PATTERNS:
+            s = rx.sub(repl, s)
+        if s == prev:
+            break
+    return s
+
+
+def _build_docx_final_revision_paragraphs_text(docx_path: Path) -> str:
+    """正文段落（不含表格），与表格结构化摘录分工；均使用跳过删除修订的 OOXML 规则。"""
+    try:
+        from docx import Document as DocxDocument
+    except Exception:
+        return ""
+    try:
+        doc = DocxDocument(str(docx_path))
+    except Exception:
+        return ""
+    parts: List[str] = []
+    for p in doc.paragraphs:
+        t = _docx_paragraph_ooxml_text(p)
+        if t:
+            parts.append(t)
+    return "\n\n".join(parts)
+
+
+def _try_replace_docx_body_with_final_revision_view(docs: List[Document], docx_path: Path) -> None:
+    """用「忽略删除修订」的段落文本替换 Docx2txt 首块，减少旧编号参与拼接。"""
+    if not docs:
+        return
+    raw = (docs[0].page_content or "").strip()
+    alt = _build_docx_final_revision_paragraphs_text(docx_path).strip()
+    if len(alt) < 40:
+        return
+    suspicious = bool(re.search(r"C\d{3}CS\d", raw, re.I)) or bool(
+        re.search(r"CS\d{1,4}CS\d{1,4}", raw, re.I)
+    )
+    if suspicious:
+        docs[0].page_content = alt
+        return
+    if len(alt) >= max(120, int(len(raw) * 0.18)):
+        docs[0].page_content = alt
+
+
+def _apply_revision_collision_normalize_to_docs(docs: List[Document]) -> None:
+    for d in docs or []:
+        if d.page_content:
+            d.page_content = _normalize_revision_id_collisions(d.page_content)
+
+
+def _docx_cell_plaintext(cell) -> str:
+    parts = []
+    for p in cell.paragraphs:
+        t = _docx_paragraph_ooxml_text(p)
+        if t:
+            parts.append(t)
+    s = " ".join(parts).strip()
+    if len(s) > _DOCX_TABLE_MAX_CELL_CHARS:
+        s = s[:_DOCX_TABLE_MAX_CELL_CHARS] + "…"
+    return s
+
+
+def _docx_row_cells_merged_aware(row) -> List[str]:
+    """
+    水平合并单元格在 python-docx 中会对每个网格列返回同一底层单元格（_tc 相同），
+    须按 _tc 去重；**禁止**按「文本相同」去重，否则两列恰好同字（如占位「/」、重复列名）
+    会被错误合并，导致后续列左移，出现 CE01→CS0、URS001→URS1 等错位误读。
+    """
+    out: List[str] = []
+    last_tc_id = None
+    for c in row.cells:
+        try:
+            tc_id = id(c._tc)
+        except Exception:
+            tc_id = id(c)
+        if last_tc_id is not None and tc_id == last_tc_id:
+            continue
+        last_tc_id = tc_id
+        out.append(_docx_cell_plaintext(c))
+    return out
+
+
+def _docx_table_to_tsv(table) -> str:
+    lines: List[str] = []
+    for ri, row in enumerate(table.rows):
+        if ri >= _DOCX_TABLE_MAX_ROWS:
+            lines.append(f"…（该表仅摘录前 {_DOCX_TABLE_MAX_ROWS} 行）…")
+            break
+        cells = _docx_row_cells_merged_aware(row)
+        lines.append("\t".join(cells))
+    return "\n".join(lines).strip()
+
+
+def _build_docx_tables_plaintext(docx_path: Path, max_total_chars: int = 450_000) -> str:
+    """
+    遍历 .docx 中全部表格（正文 + 各节页眉/页脚/首页页眉脚），按行导出为 TSV，
+    供审核/追溯使用；与 Docx2txtLoader 正文互补，减少「表格内 URS 未检索到」误报。
+    """
+    docx_path = Path(docx_path)
+    if not docx_path.is_file() or docx_path.suffix.lower() != ".docx":
+        return ""
+    try:
+        from docx import Document as DocxDocument
+    except Exception:
+        return ""
+    try:
+        doc = DocxDocument(str(docx_path))
+    except Exception:
+        return ""
+
+    seen_tbl_ids = set()
+    blocks: List[str] = []
+    n = 0
+
+    def emit_block(title: str, table) -> None:
+        nonlocal n
+        try:
+            tid = id(table._tbl)
+        except Exception:
+            tid = id(table)
+        if tid in seen_tbl_ids:
+            return
+        text = _docx_table_to_tsv(table)
+        if not text:
+            return
+        seen_tbl_ids.add(tid)
+        n += 1
+        blocks.append(f"{title} {n}】\n{text}")
+
+    for table in doc.tables:
+        emit_block("【Word 正文表格", table)
+
+    for si, sec in enumerate(doc.sections):
+        for hf_label, part_attr in (
+            ("页眉", "header"),
+            ("页脚", "footer"),
+        ):
+            try:
+                part = getattr(sec, part_attr)
+            except Exception:
+                continue
+            if part is None:
+                continue
+            try:
+                for table in part.tables:
+                    emit_block(f"【Word 第{si + 1}节{hf_label}内表格", table)
+            except Exception:
+                continue
+        if getattr(sec, "different_first_page_header_footer", False):
+            for hf_label, part_attr in (
+                ("首页页眉", "first_page_header"),
+                ("首页页脚", "first_page_footer"),
+            ):
+                try:
+                    part = getattr(sec, part_attr)
+                except Exception:
+                    continue
+                if part is None:
+                    continue
+                try:
+                    for table in part.tables:
+                        emit_block(f"【Word 第{si + 1}节{hf_label}内表格", table)
+                except Exception:
+                    continue
+
+    if not blocks:
+        return ""
+    intro = (
+        "【Word 表格结构化摘录（python-docx 按单元格提取；合并单元格已按网格去重，两列同字也会分栏保留，避免编号错位）】\n"
+    )
+    body = "\n\n".join(blocks)
+    full = intro + body
+    if len(full) > max_total_chars:
+        full = (
+            full[: max_total_chars - 100].rstrip()
+            + "\n\n……（表格摘录总长已达上限，后续表已省略）……"
+        )
+    return full
+
+
+def _append_docx_tables_plaintext(docs: List[Document], docx_path: Path) -> None:
+    """将结构化表格文本拼入首个 Document（与签批补充相同策略）。"""
+    if not docs:
+        return
+    extra = _build_docx_tables_plaintext(docx_path)
+    if not extra:
+        return
+    first = docs[0]
+    base = (first.page_content or "").rstrip()
+    first.page_content = f"{base}\n\n{extra}"
+
+
 def _append_signoff_block_to_first_doc(docs: List[Document], block: str) -> None:
     if not docs or not (block or "").strip():
         return
@@ -642,31 +984,54 @@ def load_single_file(file_path) -> List[Document]:
     loader_cls = LOADER_MAP[suffix]
     last_error = None
 
-    # Excel：先尝试 UnstructuredExcelLoader，失败则用 openpyxl 备用（兼容中文路径、复杂表等）
+    # Excel：xlsx **优先 openpyxl 全表**（Unstructured 常只解析部分 sheet）；失败再回退 Unstructured。
+    # .xls：优先 xlrd 全表；失败再 Unstructured。
     if suffix in (".xlsx", ".xls"):
         if suffix == ".xlsx":
+            docs = []
             try:
-                loader = loader_cls(str(path))
-                docs = loader.load()
+                docs = _load_xlsx_with_openpyxl(path)
             except Exception as e:
                 last_error = e
+                docs = []
+            total_chars = sum(len((d.page_content or "").replace("(空表)", "")) for d in docs)
+            if not docs or all("(空表)" in (d.page_content or "") for d in docs) or total_chars < 20:
                 try:
-                    docs = _load_xlsx_with_openpyxl(path)
+                    loader = loader_cls(str(path))
+                    docs = loader.load()
+                    for d in docs:
+                        st = (d.page_content or "").strip()
+                        if st and not st.startswith("【Excel 工作表："):
+                            sheet = (d.metadata or {}).get("sheet") or (d.metadata or {}).get("page_name") or ""
+                            prefix = f"【Excel 工作表：{sheet}】\n" if sheet else "【Excel 工作表】\n"
+                            d.page_content = prefix + st
                 except Exception as e2:
-                    err_msg = f"Excel 加载失败: {last_error!s}\n备用解析(openpyxl)也失败: {e2!s}"
-                    raise RuntimeError(err_msg) from last_error
-        else:
-            # .xls 仅用原 loader，无 openpyxl 备用
-            try:
-                loader = loader_cls(str(path))
-                docs = loader.load()
-            except Exception as e:
-                raise RuntimeError(f"xls 文件加载失败: {e!s}") from e
-        if suffix == ".xlsx":
+                    if not docs:
+                        err_msg = f"Excel(xlsx) 加载失败: openpyxl 未得到有效内容；Unstructured 也失败: {e2!s}"
+                        raise RuntimeError(err_msg) from (last_error if last_error is not None else e2)
+            docs = _prioritize_excel_sheet_documents(docs)
             try:
                 _append_signoff_block_to_first_doc(docs, _build_xlsx_signoff_image_supplement(path))
             except Exception:
                 pass
+        else:
+            docs = _load_xls_all_sheets_with_xlrd(path)
+            total_chars = sum(len(d.page_content or "") for d in docs) if docs else 0
+            if not docs or total_chars < 20:
+                try:
+                    loader = loader_cls(str(path))
+                    docs = loader.load()
+                    for d in docs:
+                        st = (d.page_content or "").strip()
+                        if st and not st.startswith("【Excel 工作表："):
+                            sheet = (d.metadata or {}).get("sheet") or (d.metadata or {}).get("page_name") or ""
+                            prefix = f"【Excel 工作表：{sheet}】\n" if sheet else "【Excel 工作表】\n"
+                            d.page_content = prefix + st
+                except Exception as e:
+                    raise RuntimeError(
+                        f"xls 文件加载失败（已尝试 xlrd 全表，仍失败；可 pip install xlrd）：{e!s}"
+                    ) from e
+            docs = _prioritize_excel_sheet_documents(docs)
     elif suffix == ".pdf":
         # PDF：用 lazy_load + 页数上限，避免大文件或复杂版式卡死；检测图片版/扫描版
         try:
@@ -746,7 +1111,19 @@ def load_single_file(file_path) -> List[Document]:
                     if not docs:
                         docs = [Document(page_content="(空)", metadata={"source_file": path.name, "file_type": ".doc"})]
                     try:
+                        _try_replace_docx_body_with_final_revision_view(docs, Path(docx_path))
+                    except Exception:
+                        pass
+                    try:
                         _append_docx_signoff_supplement(docs, Path(docx_path))
+                    except Exception:
+                        pass
+                    try:
+                        _append_docx_tables_plaintext(docs, Path(docx_path))
+                    except Exception:
+                        pass
+                    try:
+                        _apply_revision_collision_normalize_to_docs(docs)
                     except Exception:
                         pass
                 finally:
@@ -773,7 +1150,19 @@ def load_single_file(file_path) -> List[Document]:
                     ) from err_unstruct
         if suffix == ".docx":
             try:
+                _try_replace_docx_body_with_final_revision_view(docs, path)
+            except Exception:
+                pass
+            try:
                 _append_docx_signoff_supplement(docs, path)
+            except Exception:
+                pass
+            try:
+                _append_docx_tables_plaintext(docs, path)
+            except Exception:
+                pass
+            try:
+                _apply_revision_collision_normalize_to_docs(docs)
             except Exception:
                 pass
         for doc in docs:

@@ -1,12 +1,33 @@
 """MySQL 管理：保存配置（provider/模型）和所有操作记录，含使用的模型信息"""
 
+import copy
 import json
-from typing import Any, Dict, Optional
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import pymysql
 from pymysql.cursors import DictCursor
+from pymysql.err import InterfaceError, OperationalError
 
 from config import settings
+
+# 列表查询短 TTL 缓存（减轻历史报告列表反复查库）；写入报告后须 invalidate_audit_reports_list_cache
+_audit_reports_list_cache: Dict[Tuple[str, int, int], Tuple[float, list]] = {}
+_audit_reports_list_cache_lock = threading.Lock()
+_AUDIT_REPORTS_LIST_TTL_SEC = 12.0
+
+
+def invalidate_audit_reports_list_cache(collection: Optional[str] = None) -> None:
+    """使 get_audit_reports 的进程内缓存失效。collection 为 None 时清空全部。"""
+    with _audit_reports_list_cache_lock:
+        if collection is None:
+            _audit_reports_list_cache.clear()
+            return
+        c = collection or ""
+        for k in list(_audit_reports_list_cache.keys()):
+            if k[0] == c:
+                _audit_reports_list_cache.pop(k, None)
 
 
 def _get_conn():
@@ -19,7 +40,18 @@ def _get_conn():
         database=settings.mysql_database,
         charset=settings.mysql_charset,
         cursorclass=DictCursor,
+        connect_timeout=30,
+        read_timeout=300,
+        write_timeout=300,
+        autocommit=False,
     )
+
+
+def _rollback_quiet(conn) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        pass
 
 
 def _ensure_database():
@@ -45,220 +77,238 @@ def _ensure_database():
 def init_db() -> None:
     """初始化数据库与表结构"""
     _ensure_database()
-    conn = _get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS app_settings (
-                    id INT PRIMARY KEY DEFAULT 1,
-                    provider VARCHAR(32) DEFAULT 'ollama',
-                    openai_api_key VARCHAR(1024),
-                    openai_base_url VARCHAR(512),
-                    ollama_base_url VARCHAR(256) DEFAULT 'http://localhost:11434',
-                    cursor_api_key VARCHAR(512),
-                    cursor_api_base VARCHAR(512),
-                    cursor_repository VARCHAR(512),
-                    cursor_ref VARCHAR(64) DEFAULT 'main',
-                    cursor_embedding VARCHAR(32) DEFAULT 'ollama',
-                    llm_model VARCHAR(128),
-                    embedding_model VARCHAR(128),
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS operation_logs (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    op_type VARCHAR(64) NOT NULL,
-                    collection VARCHAR(128) DEFAULT '',
-                    file_name VARCHAR(512) DEFAULT '',
-                    source VARCHAR(1024) DEFAULT '',
-                    extra_json LONGTEXT,
-                    model_info VARCHAR(256) DEFAULT '',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_op_type (op_type),
-                    INDEX idx_collection (collection),
-                    INDEX idx_created_at (created_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS audit_reports (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    collection VARCHAR(128) DEFAULT '',
-                    file_name VARCHAR(512),
-                    report_json LONGTEXT NOT NULL,
-                    model_info VARCHAR(256) DEFAULT '',
-                    total_points INT DEFAULT 0,
-                    high_count INT DEFAULT 0,
-                    medium_count INT DEFAULT 0,
-                    low_count INT DEFAULT 0,
-                    info_count INT DEFAULT 0,
-                    summary TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_ar_collection (collection),
-                    INDEX idx_ar_created (created_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS knowledge_docs (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    collection VARCHAR(128) NOT NULL,
-                    file_name VARCHAR(512),
-                    chunk_index INT DEFAULT 0,
-                    content LONGTEXT NOT NULL,
-                    metadata_json LONGTEXT,
-                    category VARCHAR(32) DEFAULT 'regulation',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_kd_collection (collection),
-                    INDEX idx_kd_file (file_name),
-                    INDEX idx_kd_category (category)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS audit_corrections (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    report_id BIGINT NOT NULL,
-                    point_index INT NOT NULL,
-                    collection VARCHAR(128) DEFAULT '',
-                    file_name VARCHAR(512) DEFAULT '',
-                    original_json LONGTEXT,
-                    corrected_json LONGTEXT NOT NULL,
-                    fed_to_kb TINYINT DEFAULT 0,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_ac_report (report_id),
-                    INDEX idx_ac_collection (collection)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS audit_checklists (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    collection VARCHAR(128) DEFAULT '',
-                    name VARCHAR(256) NOT NULL DEFAULT '',
-                    checklist_json LONGTEXT NOT NULL,
-                    total_points INT DEFAULT 0,
-                    base_file VARCHAR(512) DEFAULT '',
-                    model_info VARCHAR(256) DEFAULT '',
-                    status VARCHAR(32) DEFAULT 'draft',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    INDEX idx_cl_collection (collection),
-                    INDEX idx_cl_status (status),
-                    INDEX idx_cl_created (created_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS dimension_options (
-                    id INT PRIMARY KEY DEFAULT 1,
-                    registration_countries LONGTEXT COMMENT 'JSON array, default ["中国","美国","欧盟"]',
-                    project_forms LONGTEXT COMMENT 'JSON array, default ["Web","APP","PC"]',
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS projects (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
-                    name VARCHAR(256) NOT NULL,
-                    registration_country VARCHAR(128) NOT NULL DEFAULT '',
-                    registration_type VARCHAR(128) NOT NULL DEFAULT '',
-                    registration_component VARCHAR(128) NOT NULL DEFAULT '',
-                    project_form VARCHAR(128) NOT NULL DEFAULT '',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    INDEX idx_proj_collection (collection)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS project_knowledge_docs (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    project_id BIGINT NOT NULL,
-                    collection VARCHAR(128) NOT NULL DEFAULT '',
-                    file_name VARCHAR(512) DEFAULT '',
-                    chunk_index INT DEFAULT 0,
-                    content LONGTEXT NOT NULL,
-                    metadata_json LONGTEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_pkd_project (project_id),
-                    INDEX idx_pkd_collection (collection)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS checkpoint_docs (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    collection VARCHAR(128) NOT NULL DEFAULT '',
-                    file_name VARCHAR(512) DEFAULT '',
-                    chunk_index INT DEFAULT 0,
-                    content LONGTEXT NOT NULL,
-                    metadata_json LONGTEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_cd_collection (collection),
-                    INDEX idx_cd_file (file_name)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS project_cases (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
-                    case_name VARCHAR(256) NOT NULL DEFAULT '',
-                    product_name VARCHAR(512) DEFAULT '',
-                    registration_country VARCHAR(128) DEFAULT '',
-                    registration_type VARCHAR(128) DEFAULT '',
-                    registration_component VARCHAR(128) DEFAULT '',
-                    project_form VARCHAR(128) DEFAULT '',
-                    scope_of_application TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_pc_collection (collection)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            _add_column_if_missing(cur, "project_cases", "case_name_en", "VARCHAR(512) DEFAULT '' COMMENT '案例名称英文'")
-            _add_column_if_missing(cur, "project_cases", "product_name_en", "VARCHAR(512) DEFAULT '' COMMENT '产品名称英文'")
-            _add_column_if_missing(cur, "project_cases", "registration_country_en", "VARCHAR(256) DEFAULT '' COMMENT '注册国家英文'")
-            _add_column_if_missing(cur, "project_cases", "document_language", "VARCHAR(32) DEFAULT 'zh' COMMENT '案例文档语言：zh中文版/en英文版/both中英文'")
-            _add_column_if_missing(cur, "project_cases", "project_key", "VARCHAR(256) DEFAULT '' COMMENT '关联项目标识：同一项目下多语言/多国家案例填相同值'")
-            _add_column_if_missing(cur, "operation_logs", "model_info", "VARCHAR(256) DEFAULT ''")
-            _add_column_if_missing(cur, "knowledge_docs", "category", "VARCHAR(32) DEFAULT 'regulation'")
-            _add_column_if_missing(cur, "knowledge_docs", "case_id", "BIGINT DEFAULT NULL COMMENT '关联 project_cases.id，仅 category=project_case 时有值'")
-            _add_column_if_missing(cur, "app_settings", "cursor_verify_ssl", "TINYINT(1) DEFAULT 1")
-            _add_column_if_missing(cur, "app_settings", "cursor_trust_env", "TINYINT(1) DEFAULT 1")
-            _add_column_if_missing(cur, "app_settings", "deepseek_api_key", "VARCHAR(1024) DEFAULT ''")
-            _add_column_if_missing(cur, "app_settings", "deepseek_base_url", "VARCHAR(512) DEFAULT ''")
-            _add_column_if_missing(cur, "app_settings", "lingyi_api_key", "VARCHAR(1024) DEFAULT ''")
-            _add_column_if_missing(cur, "app_settings", "lingyi_base_url", "VARCHAR(512) DEFAULT ''")
-            _add_column_if_missing(cur, "app_settings", "gemini_api_key", "VARCHAR(1024) DEFAULT ''")
-            _add_column_if_missing(cur, "app_settings", "dashscope_api_key", "VARCHAR(1024) DEFAULT ''")
-            _add_column_if_missing(cur, "app_settings", "qianfan_ak", "VARCHAR(512) DEFAULT ''")
-            _add_column_if_missing(cur, "app_settings", "qianfan_sk", "VARCHAR(512) DEFAULT ''")
-            _add_column_if_missing(cur, "projects", "basic_info_text", "TEXT COMMENT '从项目资料中提取的基本信息，审核时与待审文档一致性核对'")
-            _add_column_if_missing(cur, "projects", "system_functionality_text", "TEXT COMMENT '从安装包或URL识别的系统功能描述，审核时与待审文档一致性核对'")
-            _add_column_if_missing(cur, "projects", "system_functionality_source", "VARCHAR(64) DEFAULT '' COMMENT 'package|url|空'")
-            _add_column_if_missing(cur, "projects", "scope_of_application", "TEXT COMMENT '产品适用范围，审核时要求文档描述内容不超出此范围'")
-            _add_column_if_missing(cur, "projects", "product_name", "VARCHAR(512) DEFAULT '' COMMENT '产品名称，与项目名称一并加入审核点/一致性核对'")
-            _add_column_if_missing(cur, "projects", "name_en", "VARCHAR(256) DEFAULT '' COMMENT '项目名称英文'")
-            _add_column_if_missing(cur, "projects", "product_name_en", "VARCHAR(512) DEFAULT '' COMMENT '产品名称英文'")
-            _add_column_if_missing(cur, "projects", "model", "VARCHAR(512) DEFAULT '' COMMENT '型号'")
-            _add_column_if_missing(cur, "projects", "model_en", "VARCHAR(512) DEFAULT '' COMMENT '型号英文 Model'")
-            _add_column_if_missing(cur, "projects", "registration_country_en", "VARCHAR(128) DEFAULT '' COMMENT '注册国家英文'")
-            _add_column_if_missing(cur, "app_settings", "review_extra_instructions", "LONGTEXT COMMENT '自定义审核要求/提示词，会追加到审核上下文中'")
-            _add_column_if_missing(cur, "app_settings", "review_system_prompt", "LONGTEXT COMMENT '审核系统提示词，为空则使用内置默认'")
-            _add_column_if_missing(cur, "app_settings", "review_user_prompt", "LONGTEXT COMMENT '审核用户提示词模板，支持 {context} {file_name} {document_content}，为空则使用内置默认'")
-            _add_column_if_missing(cur, "app_settings", "checklist_generate_prompt", "LONGTEXT COMMENT '生成审核点提示词，为空则使用内置默认'")
-            _add_column_if_missing(cur, "app_settings", "checklist_optimize_prompt", "LONGTEXT COMMENT '优化审核点提示词，为空则使用内置默认'")
-            _add_column_if_missing(cur, "audit_checklists", "document_language", "VARCHAR(32) DEFAULT '' COMMENT '审核点适用文档语言：zh/en/both，空表示不限定'")
-            _add_column_if_missing(cur, "app_settings", "project_basic_info_prompt", "LONGTEXT COMMENT '项目基本信息提取提示词，为空则使用内置默认'")
-            _add_column_if_missing(cur, "app_settings", "review_summary_prompt", "LONGTEXT COMMENT '审核总结提示词，为空则使用内置默认'")
-            _add_column_if_missing(cur, "app_settings", "translation_target_lang", "VARCHAR(8) DEFAULT 'en' COMMENT '文档翻译目标语言：en/de/zh'")
-            _add_column_if_missing(cur, "app_settings", "translation_company_config", "LONGTEXT COMMENT 'JSON: 公司信息翻译配置 company_name/address/contact/phone 等'")
-            _add_column_if_missing(
-                cur,
-                "app_settings",
-                "runtime_settings_json",
-                "LONGTEXT COMMENT 'JSON 全量运行时配置（除首次连库外主要从库恢复，减少迁移工作量）'",
-            )
-            _add_column_if_missing(cur, "dimension_options", "country_extra_keywords", "LONGTEXT COMMENT 'JSON: 国家(以页面选择为准)->法规关键词，用于知识库检索与扩大审核面，如 {\"欧盟\":[\"MDR\"]}'")
-            _init_dimension_options(cur)
-        conn.commit()
-    finally:
-        conn.close()
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        conn = None
+        try:
+            conn = _get_conn()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS app_settings (
+                        id INT PRIMARY KEY DEFAULT 1,
+                        provider VARCHAR(32) DEFAULT 'ollama',
+                        openai_api_key VARCHAR(1024),
+                        openai_base_url VARCHAR(512),
+                        ollama_base_url VARCHAR(256) DEFAULT 'http://localhost:11434',
+                        cursor_api_key VARCHAR(512),
+                        cursor_api_base VARCHAR(512),
+                        cursor_repository VARCHAR(512),
+                        cursor_ref VARCHAR(64) DEFAULT 'main',
+                        cursor_embedding VARCHAR(32) DEFAULT 'ollama',
+                        llm_model VARCHAR(128),
+                        embedding_model VARCHAR(128),
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS operation_logs (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        op_type VARCHAR(64) NOT NULL,
+                        collection VARCHAR(128) DEFAULT '',
+                        file_name VARCHAR(512) DEFAULT '',
+                        source VARCHAR(1024) DEFAULT '',
+                        extra_json LONGTEXT,
+                        model_info VARCHAR(256) DEFAULT '',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_op_type (op_type),
+                        INDEX idx_collection (collection),
+                        INDEX idx_created_at (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS audit_reports (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) DEFAULT '',
+                        file_name VARCHAR(512),
+                        report_json LONGTEXT NOT NULL,
+                        model_info VARCHAR(256) DEFAULT '',
+                        total_points INT DEFAULT 0,
+                        high_count INT DEFAULT 0,
+                        medium_count INT DEFAULT 0,
+                        low_count INT DEFAULT 0,
+                        info_count INT DEFAULT 0,
+                        summary TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_ar_collection (collection),
+                        INDEX idx_ar_created (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS knowledge_docs (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL,
+                        file_name VARCHAR(512),
+                        chunk_index INT DEFAULT 0,
+                        content LONGTEXT NOT NULL,
+                        metadata_json LONGTEXT,
+                        category VARCHAR(32) DEFAULT 'regulation',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_kd_collection (collection),
+                        INDEX idx_kd_file (file_name),
+                        INDEX idx_kd_category (category)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS audit_corrections (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        report_id BIGINT NOT NULL,
+                        point_index INT NOT NULL,
+                        collection VARCHAR(128) DEFAULT '',
+                        file_name VARCHAR(512) DEFAULT '',
+                        original_json LONGTEXT,
+                        corrected_json LONGTEXT NOT NULL,
+                        fed_to_kb TINYINT DEFAULT 0,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_ac_report (report_id),
+                        INDEX idx_ac_collection (collection)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS audit_checklists (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) DEFAULT '',
+                        name VARCHAR(256) NOT NULL DEFAULT '',
+                        checklist_json LONGTEXT NOT NULL,
+                        total_points INT DEFAULT 0,
+                        base_file VARCHAR(512) DEFAULT '',
+                        model_info VARCHAR(256) DEFAULT '',
+                        status VARCHAR(32) DEFAULT 'draft',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_cl_collection (collection),
+                        INDEX idx_cl_status (status),
+                        INDEX idx_cl_created (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS dimension_options (
+                        id INT PRIMARY KEY DEFAULT 1,
+                        registration_countries LONGTEXT COMMENT 'JSON array, default ["中国","美国","欧盟"]',
+                        project_forms LONGTEXT COMMENT 'JSON array, default ["Web","APP","PC"]',
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS projects (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        name VARCHAR(256) NOT NULL,
+                        registration_country VARCHAR(128) NOT NULL DEFAULT '',
+                        registration_type VARCHAR(128) NOT NULL DEFAULT '',
+                        registration_component VARCHAR(128) NOT NULL DEFAULT '',
+                        project_form VARCHAR(128) NOT NULL DEFAULT '',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_proj_collection (collection)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS project_knowledge_docs (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        project_id BIGINT NOT NULL,
+                        collection VARCHAR(128) NOT NULL DEFAULT '',
+                        file_name VARCHAR(512) DEFAULT '',
+                        chunk_index INT DEFAULT 0,
+                        content LONGTEXT NOT NULL,
+                        metadata_json LONGTEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_pkd_project (project_id),
+                        INDEX idx_pkd_collection (collection)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS checkpoint_docs (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT '',
+                        file_name VARCHAR(512) DEFAULT '',
+                        chunk_index INT DEFAULT 0,
+                        content LONGTEXT NOT NULL,
+                        metadata_json LONGTEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_cd_collection (collection),
+                        INDEX idx_cd_file (file_name)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS project_cases (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        case_name VARCHAR(256) NOT NULL DEFAULT '',
+                        product_name VARCHAR(512) DEFAULT '',
+                        registration_country VARCHAR(128) DEFAULT '',
+                        registration_type VARCHAR(128) DEFAULT '',
+                        registration_component VARCHAR(128) DEFAULT '',
+                        project_form VARCHAR(128) DEFAULT '',
+                        scope_of_application TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_pc_collection (collection)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                _add_column_if_missing(cur, "project_cases", "case_name_en", "VARCHAR(512) DEFAULT '' COMMENT '案例名称英文'")
+                _add_column_if_missing(cur, "project_cases", "product_name_en", "VARCHAR(512) DEFAULT '' COMMENT '产品名称英文'")
+                _add_column_if_missing(cur, "project_cases", "registration_country_en", "VARCHAR(256) DEFAULT '' COMMENT '注册国家英文'")
+                _add_column_if_missing(cur, "project_cases", "document_language", "VARCHAR(32) DEFAULT 'zh' COMMENT '案例文档语言：zh中文版/en英文版/both中英文'")
+                _add_column_if_missing(cur, "project_cases", "project_key", "VARCHAR(256) DEFAULT '' COMMENT '关联项目标识：同一项目下多语言/多国家案例填相同值'")
+                _add_column_if_missing(cur, "operation_logs", "model_info", "VARCHAR(256) DEFAULT ''")
+                _add_column_if_missing(cur, "knowledge_docs", "category", "VARCHAR(32) DEFAULT 'regulation'")
+                _add_column_if_missing(cur, "knowledge_docs", "case_id", "BIGINT DEFAULT NULL COMMENT '关联 project_cases.id，仅 category=project_case 时有值'")
+                _add_column_if_missing(cur, "app_settings", "cursor_verify_ssl", "TINYINT(1) DEFAULT 1")
+                _add_column_if_missing(cur, "app_settings", "cursor_trust_env", "TINYINT(1) DEFAULT 1")
+                _add_column_if_missing(cur, "app_settings", "deepseek_api_key", "VARCHAR(1024) DEFAULT ''")
+                _add_column_if_missing(cur, "app_settings", "deepseek_base_url", "VARCHAR(512) DEFAULT ''")
+                _add_column_if_missing(cur, "app_settings", "lingyi_api_key", "VARCHAR(1024) DEFAULT ''")
+                _add_column_if_missing(cur, "app_settings", "lingyi_base_url", "VARCHAR(512) DEFAULT ''")
+                _add_column_if_missing(cur, "app_settings", "gemini_api_key", "VARCHAR(1024) DEFAULT ''")
+                _add_column_if_missing(cur, "app_settings", "dashscope_api_key", "VARCHAR(1024) DEFAULT ''")
+                _add_column_if_missing(cur, "app_settings", "qianfan_ak", "VARCHAR(512) DEFAULT ''")
+                _add_column_if_missing(cur, "app_settings", "qianfan_sk", "VARCHAR(512) DEFAULT ''")
+                _add_column_if_missing(cur, "projects", "basic_info_text", "TEXT COMMENT '从项目资料中提取的基本信息，审核时与待审文档一致性核对'")
+                _add_column_if_missing(cur, "projects", "system_functionality_text", "TEXT COMMENT '从安装包或URL识别的系统功能描述，审核时与待审文档一致性核对'")
+                _add_column_if_missing(cur, "projects", "system_functionality_source", "VARCHAR(64) DEFAULT '' COMMENT 'package|url|空'")
+                _add_column_if_missing(cur, "projects", "scope_of_application", "TEXT COMMENT '产品适用范围，审核时要求文档描述内容不超出此范围'")
+                _add_column_if_missing(cur, "projects", "product_name", "VARCHAR(512) DEFAULT '' COMMENT '产品名称，与项目名称一并加入审核点/一致性核对'")
+                _add_column_if_missing(cur, "projects", "name_en", "VARCHAR(256) DEFAULT '' COMMENT '项目名称英文'")
+                _add_column_if_missing(cur, "projects", "product_name_en", "VARCHAR(512) DEFAULT '' COMMENT '产品名称英文'")
+                _add_column_if_missing(cur, "projects", "model", "VARCHAR(512) DEFAULT '' COMMENT '型号'")
+                _add_column_if_missing(cur, "projects", "model_en", "VARCHAR(512) DEFAULT '' COMMENT '型号英文 Model'")
+                _add_column_if_missing(cur, "projects", "registration_country_en", "VARCHAR(128) DEFAULT '' COMMENT '注册国家英文'")
+                _add_column_if_missing(cur, "app_settings", "review_extra_instructions", "LONGTEXT COMMENT '自定义审核要求/提示词，会追加到审核上下文中'")
+                _add_column_if_missing(cur, "app_settings", "review_system_prompt", "LONGTEXT COMMENT '审核系统提示词，为空则使用内置默认'")
+                _add_column_if_missing(cur, "app_settings", "review_user_prompt", "LONGTEXT COMMENT '审核用户提示词模板，支持 {context} {file_name} {document_content}，为空则使用内置默认'")
+                _add_column_if_missing(cur, "app_settings", "checklist_generate_prompt", "LONGTEXT COMMENT '生成审核点提示词，为空则使用内置默认'")
+                _add_column_if_missing(cur, "app_settings", "checklist_optimize_prompt", "LONGTEXT COMMENT '优化审核点提示词，为空则使用内置默认'")
+                _add_column_if_missing(cur, "audit_checklists", "document_language", "VARCHAR(32) DEFAULT '' COMMENT '审核点适用文档语言：zh/en/both，空表示不限定'")
+                _add_column_if_missing(cur, "app_settings", "project_basic_info_prompt", "LONGTEXT COMMENT '项目基本信息提取提示词，为空则使用内置默认'")
+                _add_column_if_missing(cur, "app_settings", "review_summary_prompt", "LONGTEXT COMMENT '审核总结提示词，为空则使用内置默认'")
+                _add_column_if_missing(cur, "app_settings", "translation_target_lang", "VARCHAR(8) DEFAULT 'en' COMMENT '文档翻译目标语言：en/de/zh'")
+                _add_column_if_missing(cur, "app_settings", "translation_company_config", "LONGTEXT COMMENT 'JSON: 公司信息翻译配置 company_name/address/contact/phone 等'")
+                _add_column_if_missing(
+                    cur,
+                    "app_settings",
+                    "runtime_settings_json",
+                    "LONGTEXT COMMENT 'JSON 全量运行时配置（除首次连库外主要从库恢复，减少迁移工作量）'",
+                )
+                _add_column_if_missing(cur, "dimension_options", "country_extra_keywords", "LONGTEXT COMMENT 'JSON: 国家(以页面选择为准)->法规关键词，用于知识库检索与扩大审核面，如 {\"欧盟\":[\"MDR\"]}'")
+                _init_dimension_options(cur)
+            try:
+                conn.ping(reconnect=True)
+            except Exception:
+                pass
+            conn.commit()
+            return
+        except (InterfaceError, OperationalError, OSError):
+            if conn is not None:
+                _rollback_quiet(conn)
+            if attempt >= max_attempts - 1:
+                raise
+            time.sleep(0.15 * (attempt + 1))
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 
 def _add_column_if_missing(cur, table: str, column: str, definition: str):
@@ -270,7 +320,10 @@ def _add_column_if_missing(cur, table: str, column: str, definition: str):
         if cur.fetchone()["n"] == 0:
             cur.execute(f"ALTER TABLE `{table}` ADD COLUMN `{column}` {definition}")
     except Exception:
-        pass
+        try:
+            _rollback_quiet(cur.connection)
+        except Exception:
+            pass
 
 
 def _init_dimension_options(cur):
@@ -287,7 +340,10 @@ def _init_dimension_options(cur):
             json.dumps(["Web", "APP", "PC"], ensure_ascii=False),
         ))
     except Exception:
-        pass
+        try:
+            _rollback_quiet(cur.connection)
+        except Exception:
+            pass
 
 
 def load_app_settings() -> Optional[Dict[str, Any]]:
@@ -751,6 +807,7 @@ def save_audit_report(
             ))
             report_id = cur.lastrowid
         conn.commit()
+        invalidate_audit_reports_list_cache(collection)
         return report_id
     finally:
         conn.close()
@@ -761,6 +818,13 @@ def get_audit_reports(
     limit: int = 50,
     offset: int = 0,
 ) -> list:
+    ck = (collection or "", int(limit), int(offset))
+    now = time.monotonic()
+    with _audit_reports_list_cache_lock:
+        ent = _audit_reports_list_cache.get(ck)
+        if ent and (now - ent[0]) < _AUDIT_REPORTS_LIST_TTL_SEC:
+            return copy.deepcopy(ent[1])
+
     init_db()
     conn = _get_conn()
     try:
@@ -785,6 +849,8 @@ def get_audit_reports(
             else:
                 r["report"] = {}
             result.append(r)
+        with _audit_reports_list_cache_lock:
+            _audit_reports_list_cache[ck] = (now, copy.deepcopy(result))
         return result
     finally:
         conn.close()
@@ -873,6 +939,40 @@ def save_knowledge_docs(
                 meta = doc.metadata if hasattr(doc, "metadata") else {}
                 rows.append((
                     collection, file_name, idx,
+                    content,
+                    json.dumps(meta, ensure_ascii=False),
+                    category,
+                ))
+            cur.executemany("""
+                INSERT INTO knowledge_docs (collection, file_name, chunk_index, content, metadata_json, category)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, rows)
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def append_knowledge_docs(
+    collection: str,
+    file_name: str,
+    start_chunk_index: int,
+    chunks: list,
+    category: str = "regulation",
+) -> int:
+    """在 knowledge_docs 中追加块（chunk_index 从 start_chunk_index 递增）。用于分段向量化时与 Chroma 分批写入对齐。"""
+    init_db()
+    if not chunks:
+        return 0
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            rows = []
+            for j, doc in enumerate(chunks):
+                content = doc.page_content if hasattr(doc, "page_content") else str(doc)
+                meta = doc.metadata if hasattr(doc, "metadata") else {}
+                rows.append((
+                    collection, file_name, start_chunk_index + j,
                     content,
                     json.dumps(meta, ensure_ascii=False),
                     category,
@@ -1074,6 +1174,7 @@ def update_audit_report(report_id: int, report: Dict[str, Any]) -> None:
                 report_id,
             ))
         conn.commit()
+        invalidate_audit_reports_list_cache()
     finally:
         conn.close()
 

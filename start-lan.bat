@@ -21,5 +21,8 @@ if exist "venv\Scripts\activate.bat" (
     call venv\Scripts\activate.bat
 )
 
+:: 若 protobuf 与 Streamlit 冲突仍报错，可取消下一行
+:: set PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+
 streamlit run src/app.py --server.address=0.0.0.0
 pause

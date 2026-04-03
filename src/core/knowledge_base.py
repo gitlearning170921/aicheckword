@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
-from langchain.schema import Document
+from .langchain_compat import Document
 from langchain_community.vectorstores import Chroma
 
 from config import settings
@@ -26,6 +26,22 @@ from .db import (
     delete_checkpoint_docs_by_file,
     delete_knowledge_docs_by_file,
 )
+
+
+def annotate_main_knowledge_documents(
+    documents: List[Document],
+    file_name: str,
+    category: str = "regulation",
+    case_id: Optional[int] = None,
+) -> None:
+    """主法规知识库写入前填充 metadata（与 add_documents / add_documents_with_progress 行为一致）。"""
+    for doc in documents:
+        if not hasattr(doc, "metadata") or doc.metadata is None:
+            doc.metadata = {}
+        doc.metadata["source_file"] = file_name or ""
+        doc.metadata["category"] = category
+        if category == "project_case" and case_id is not None:
+            doc.metadata["case_id"] = case_id
 
 
 def _add_batch_with_retry(vectorstore: Chroma, batch: List[Document]) -> None:

@@ -8,13 +8,17 @@
 maxUploadSize = 200
 # 最大请求体大小（MB）
 maxMessageSize = 200
-# 断连后会话保留时间（秒），便于多设备切换时重连
-# disconnectedSessionTTL = 120
+# 部分旧版 Streamlit 曾有 server.disconnectedSessionTTL（断线后会话保留秒数）；新版本可能已移除或改名。
+# 若 streamlit config show 报错「不是有效配置项」，请删除本段自定义。切标签导致重连属浏览器+WebSocket 常见行为，见 docs/review-quality.md。
 
 [browser]
 # 不自动打开浏览器（在 Cursor 内运行时无需）
 gatherUsageStats = false
 
 [runner]
-# 立即响应 rerun 请求，多会话时更流畅（每个浏览器/设备独立会话，可同时操作）
-fastReruns = true
+# false：降低「整页重跑」频率，查看/编辑审核报告时不易因连锁 rerun 丢失焦点或中断操作。
+# true：交互更跟手，但在大量 widget（报告内多行 text_area）时易出现频繁重刷感。
+fastReruns = false
+# 浏览器控制台若大量报错：Cannot read properties of undefined (reading 'firstElementChild')（与 addResizeListener/滚动、
+# WebSocket 增量更新有关，多见于 st.data_editor）：可在启动前设置环境变量 AICHECKWORD_DISABLE_DATA_EDITOR=1，
+# 历史报告审核点改为分页表单；或升级 Streamlit / 换 Chrome 正式版并关闭冲突扩展。

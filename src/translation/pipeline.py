@@ -5,13 +5,13 @@
 import re
 import shutil
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .models import TextBlock, SUPPORTED_EXTENSIONS
 from .parser import parse_document
 from .segment import blocks_to_sentences, apply_translations_to_blocks
 from .translator import translate_sentences
-from .correction import correct_text, CorrectionStats
+from .correction import correct_text, CorrectionStats, apply_manual_replacements
 
 _HAS_CJK = re.compile(r"[\u4e00-\u9fff]")
 
@@ -430,6 +430,7 @@ def correct_file(
     kb_query_extra: Optional[str] = None,
     translation_cache: Optional[dict] = None,
     running_glossary: Optional[dict] = None,
+    manual_rules: Optional[List[Tuple[str, str, str]]] = None,
 ) -> tuple:
     """
     校正已翻译文件（docx/txt/xlsx）：同词异译、截断词、数值表达模式等。
@@ -451,11 +452,20 @@ def correct_file(
     stats = CorrectionStats(total_blocks=len(blocks))
     doc_all = "\n".join((b.original_text or "") for b in blocks if getattr(b, "block_type", "") in ("paragraph", "table_cell", "line", "header", "footer"))
 
+    pairs: List[Tuple[str, str]] = []
+    if manual_rules:
+        for w, r, _zh in manual_rules:
+            if (w or "").strip() and (r or "").strip():
+                pairs.append((w.strip(), r.strip()))
+
     for b in blocks:
         src = b.original_text or ""
+        if pairs:
+            src, n_man = apply_manual_replacements(src, pairs, target_lang)
+            stats.manual_replaced += n_man
         fixed, d = correct_text(src, target_lang=target_lang, doc_all_text=doc_all)
         b.translated_text = fixed
-        if fixed != src:
+        if fixed != (b.original_text or ""):
             stats.changed_blocks += 1
         stats.term_unified += d.get("term_unified", 0)
         stats.truncation_fixed += d.get("truncation_fixed", 0)
@@ -501,6 +511,7 @@ def correct_path(
     use_kb: bool = True,
     provider: Optional[str] = None,
     kb_query_extra: Optional[str] = None,
+    manual_rules: Optional[List[Tuple[str, str, str]]] = None,
 ) -> tuple:
     """
     批量校正：单文件、目录或 zip。
@@ -559,6 +570,7 @@ def correct_path(
             kb_query_extra=kb_query_extra,
             translation_cache=shared_translation_cache,
             running_glossary=shared_running_glossary,
+            manual_rules=manual_rules,
         )
         out_paths.append(out)
         summary.total_blocks += st.total_blocks
@@ -566,6 +578,7 @@ def correct_path(
         summary.term_unified += st.term_unified
         summary.truncation_fixed += st.truncation_fixed
         summary.numeric_fixed += st.numeric_fixed
+        summary.manual_replaced += st.manual_replaced
 
     for d in temp_dirs:
         try:
@@ -578,4 +591,5 @@ def correct_path(
         "term_unified": summary.term_unified,
         "truncation_fixed": summary.truncation_fixed,
         "numeric_fixed": summary.numeric_fixed,
+        "manual_replaced": summary.manual_replaced,
     }

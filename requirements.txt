@@ -1,4 +1,7 @@
 langchain>=0.3.0
+# 与 LangChain 0.3+ 配套；单独拷贝项目到新机器时务必安装，避免仍引用已移除的 langchain.schema
+langchain-core>=0.3.0,<1.0.0
+langchain-text-splitters>=0.3.0,<1.0.0
 langchain-community>=0.3.0
 langchain-openai>=0.2.0
 langchain-ollama>=0.2.0
@@ -9,7 +12,12 @@ qianfan>=0.3.0
 ollama>=0.4.0
 chromadb>=0.4.0,<1.0.0
 openai>=1.50.0
+# 不锁版本：内网镜像/旧 Python 可能装不上 streamlit>=1.28。若环境允许，建议手动 pip install -U "streamlit>=1.28"（一般需 Python 3.8+，推荐 3.10+）。
+# 极旧 Streamlit 下界面会用按钮模拟标签页、历史审核点走分页表单，前端也更容易报错。
 streamlit
+# Streamlit 旧版 _pb2 与 protobuf 4+/5+ 不兼容；须锁 3.20.x（见 google protobuf 2022-05 说明）
+protobuf>=3.20.0,<=3.20.3
+pandas>=2.0.0
 altair<5
 fastapi>=0.115.0
 uvicorn>=0.30.0
@@ -18,6 +26,8 @@ pypdf>=5.0.0
 python-docx>=1.2.0
 docx2txt>=0.8
 openpyxl>=3.1.0
+# .xls 多工作表解析（与 openpyxl 的 xlsx 分工）
+xlrd>=2.0.1
 markdown>=3.0
 networkx>=2.0
 unstructured>=0.15.0

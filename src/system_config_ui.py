@@ -48,6 +48,8 @@ CHROMA_CHUNK_KEYS = [
     "embedding_retry_delay_sec",
     "embedding_large_file_threshold",
     "embedding_large_file_batch_size",
+    "embedding_streamlit_chunk_threshold",
+    "embedding_streamlit_batches_per_rerun",
 ]
 
 REVIEW_STABILITY_KEYS = [
@@ -57,6 +59,8 @@ REVIEW_STABILITY_KEYS = [
     "review_batch_skip_llm_summary",
     "review_batch_inter_doc_sleep_sec",
     "review_deepseek_inter_doc_sleep_sec",
+    "audit_perf_log",
+    "async_correction_kb_feed",
 ]
 
 API_DIR_KEYS = [
@@ -237,12 +241,16 @@ FIELD_LABELS: Dict[str, str] = {
     "embedding_retry_delay_sec": "嵌入重试间隔（秒）",
     "embedding_large_file_threshold": "大文件块数阈值",
     "embedding_large_file_batch_size": "大文件每批块数",
+    "embedding_streamlit_chunk_threshold": "Streamlit 分段训练分块阈值（超此块数则多轮刷新防断连）",
+    "embedding_streamlit_batches_per_rerun": "每轮页面刷新嵌入批次数（默认 1 最稳）",
     "review_llm_min_interval_sec": "审核 LLM 最小间隔（秒）",
     "review_deepseek_chroma_fetch_cap": "DeepSeek Chroma 取回上限",
     "review_deepseek_target_cap": "DeepSeek 审核点参考条数上限",
     "review_batch_skip_llm_summary": "批量审核跳过 LLM 总结",
     "review_batch_inter_doc_sleep_sec": "批量审核文件间间隔·全模型（秒）",
     "review_deepseek_inter_doc_sleep_sec": "批量审核文件间间隔·DeepSeek 额外（秒）",
+    "audit_perf_log": "审核报告性能分段日志（或环境变量 AUDIT_PERF_LOG=1）",
+    "async_correction_kb_feed": "纠正写入知识库：后台线程异步嵌入（关闭则同步阻塞保存）",
     "api_host": "FastAPI 监听地址",
     "api_port": "FastAPI 端口",
     "training_docs_dir": "训练文档目录",
@@ -484,22 +492,56 @@ def render_system_config_body() -> None:
             st.session_state.pop("_sys_cfg_provider_form_snap", None)
             streamlit_rerun()
 
-    # 不用 st.tabs：重跑时 tabs 会回到第一项；用带 key 的 radio 保持当前分区
+    # 不用 st.tabs：优先横向 radio；无 horizontal / label_visibility 时不用纵向长列表，改横向按钮（与旧版 Streamlit 1.9 等兼容）
+    _sec_key = "sys_cfg_section_radio"
+    if _sec_key not in st.session_state:
+        _leg = st.session_state.get("sys_cfg_section_choice")
+        if _leg in SYSTEM_CONFIG_TAB_LABELS:
+            st.session_state[_sec_key] = _leg
+    section = None
     try:
         section = st.radio(
             "配置分区",
             SYSTEM_CONFIG_TAB_LABELS,
             horizontal=True,
-            key="sys_cfg_section_radio",
+            key=_sec_key,
             label_visibility="collapsed",
         )
-    except Exception:
-        section = st.radio(
-            "配置分区",
-            SYSTEM_CONFIG_TAB_LABELS,
-            horizontal=True,
-            key="sys_cfg_section_radio",
-        )
+    except TypeError:
+        try:
+            section = st.radio(
+                "配置分区",
+                SYSTEM_CONFIG_TAB_LABELS,
+                horizontal=True,
+                key=_sec_key,
+            )
+        except TypeError:
+            section = None
+    if section is None:
+        st.caption("配置分区（当前 Streamlit 无横向单选，已用按钮行模拟）")
+        if _sec_key not in st.session_state or st.session_state[_sec_key] not in SYSTEM_CONFIG_TAB_LABELS:
+            st.session_state[_sec_key] = SYSTEM_CONFIG_TAB_LABELS[0]
+        row1, row2 = SYSTEM_CONFIG_TAB_LABELS[:4], SYSTEM_CONFIG_TAB_LABELS[4:]
+        c1 = st.columns(len(row1))
+        for i, lab in enumerate(row1):
+            with c1[i]:
+                try:
+                    hit = st.button(lab, key=f"sys_cfg_sec_btn_{i}", use_container_width=True)
+                except TypeError:
+                    hit = st.button(lab, key=f"sys_cfg_sec_btn_{i}")
+                if hit:
+                    st.session_state[_sec_key] = lab
+        if row2:
+            c2 = st.columns(len(row2))
+            for j, lab in enumerate(row2):
+                with c2[j]:
+                    try:
+                        hit = st.button(lab, key=f"sys_cfg_sec_btn_{j + len(row1)}", use_container_width=True)
+                    except TypeError:
+                        hit = st.button(lab, key=f"sys_cfg_sec_btn_{j + len(row1)}")
+                    if hit:
+                        st.session_state[_sec_key] = lab
+        section = st.session_state[_sec_key]
 
     if section == "MySQL":
         _render_static_keys("MySQL（新机器请至少在 .env 中配置此项以首次连库）", MYSQL_KEYS)

@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     # 大文件训练：块数超过阈值时自动缩小每批数量，减少单次请求超时/断连
     embedding_large_file_threshold: int = 60
     embedding_large_file_batch_size: int = 12
+    # 单文件分块数超过此阈值时，按多轮 Streamlit 重跑分段向量化，减轻长时间阻塞导致的浏览器 WebSocket 断开/「训练自动取消」
+    embedding_streamlit_chunk_threshold: int = 48
+    # 每一轮 Streamlit 脚本执行最多完成多少个「嵌入批次」（每批 chunk 数见 embedding_large_file_*）；默认 1 最稳
+    embedding_streamlit_batches_per_rerun: int = 1
 
     # ─── 文档审核稳定性（DeepSeek 等云端 API，多文件时降低 Chroma/内存与重复 LLM 调用）───
     # 两次 LLM（Chat）请求最小间隔（秒）。仅对 provider=deepseek 生效；0=使用内置默认约 0.9；-1=关闭
@@ -80,6 +84,11 @@ class Settings(BaseSettings):
     review_deepseek_inter_doc_sleep_sec: float = 0.0
     # 批量审核（≥2 文件）时，任意提供方在「下一文件」前的最小间隔（秒），减轻网关限流与叠峰导致的断连；0=关闭
     review_batch_inter_doc_sleep_sec: float = 0.35
+
+    # 审核报告：性能与体验（环境变量 AUDIT_PERF_LOG=1 可强制开启分段日志）
+    audit_perf_log: bool = False
+    # 纠正入库写入反馈向量库时是否在后台线程执行（True=先返回 UI，向量异步写入）
+    async_correction_kb_feed: bool = True
 
     # API 服务
     api_host: str = "0.0.0.0"

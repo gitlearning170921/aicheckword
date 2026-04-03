@@ -4,8 +4,7 @@ import json
 import re
 from typing import List, Dict, Any, Optional
 
-from langchain.schema import Document
-from langchain.prompts import ChatPromptTemplate
+from .langchain_compat import Document, ChatPromptTemplate
 
 from config import settings
 from .db import get_prompt_by_key, update_prompt_by_key, get_dimension_options
