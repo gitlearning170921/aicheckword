@@ -25,6 +25,8 @@ from .db import (
     clear_checkpoint_docs,
     delete_checkpoint_docs_by_file,
     delete_knowledge_docs_by_file,
+    delete_knowledge_docs_by_case_id,
+    get_project_case_file_names,
 )
 
 
@@ -247,7 +249,7 @@ class KnowledgeBase:
         elif self.is_checkpoint:
             save_checkpoint_docs(self.base_collection, file_name, documents)
         else:
-            save_knowledge_docs(self.collection_name, file_name, documents, category=category)
+            save_knowledge_docs(self.collection_name, file_name, documents, category=category, case_id=case_id)
         return len(documents)
 
     def add_documents_with_progress(
@@ -285,7 +287,7 @@ class KnowledgeBase:
         elif self.is_checkpoint:
             save_checkpoint_docs(self.base_collection, file_name, documents)
         else:
-            save_knowledge_docs(self.collection_name, file_name, documents, category=category)
+            save_knowledge_docs(self.collection_name, file_name, documents, category=category, case_id=case_id)
         return total
 
     def train_from_file(self, file_path, category: str = "regulation") -> int:
@@ -367,3 +369,15 @@ class KnowledgeBase:
             delete_checkpoint_docs_by_file(self.base_collection, file_name)
         else:
             delete_knowledge_docs_by_file(self.collection_name, file_name, case_id=case_id)
+
+    def delete_documents_by_case_id(self, case_id: int) -> None:
+        """删除主知识库中某项目案例（project_cases）下的全部向量与 MySQL 块。仅用于 category=project_case 的入库数据。"""
+        if self.project_id or self.is_checkpoint:
+            raise RuntimeError("delete_documents_by_case_id 仅适用于主法规/案例知识库")
+        cid = int(case_id)
+        names = get_project_case_file_names(self.collection_name, cid) or []
+        for fn in names:
+            if fn:
+                self.delete_documents_by_file_name(fn, case_id=cid)
+        # 兜底：清除仍带 case_id 的残留行
+        delete_knowledge_docs_by_case_id(self.collection_name, cid)

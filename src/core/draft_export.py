@@ -1,0 +1,1357 @@
+"""
+文档初稿生成：输出产物导出（同格式）+ 修订记录写入。
+
+说明：
+- 目标：在“基础文件（Base）”上生成后，输出一个与基础文件同后缀的可下载文件。
+- 默认以“保留基础文件格式”为最高优先级：不重建整份文档内容，避免样式/版式被打乱。
+- 当前策略：复制基础文件 → 在原文件末尾追加“修订记录” + “自动生成内容（附录）”。
+  这样可以最大限度保持注册递交所需的原模板格式；正文的精确段落/表格级修改依赖
+  可定位的结构化 patch（由模型对照参考与基础差异生成），可按模板规则扩展。
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import random
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Dict, Optional, Tuple, Any, List
+
+
+def _now_str() -> str:
+    return _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _new_revision_id() -> str:
+    return str(random.randint(100000, 99999999))
+
+
+def _enable_track_revisions(doc) -> None:
+    """在 settings 中打开「跟踪修订」，便于 Word 以修订视图显示插入/删除。"""
+    try:
+        el = doc.settings.element
+    except Exception:
+        return
+    try:
+        from docx.oxml.ns import qn
+
+        for child in list(el):
+            if child.tag == qn("w:trackRevisions"):
+                return
+        from docx.oxml import OxmlElement
+
+        el.append(OxmlElement("w:trackRevisions"))
+    except Exception:
+        pass
+
+
+def _replace_paragraph_with_track_changes(p, before: str, after: str, author: str = "aicheckword") -> None:
+    """
+    将段落改为「删除旧全文 + 插入新全文」的修订结构（w:del / w:ins），保留段落样式对象 p 不变。
+    """
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    iso = _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    b = before or ""
+    a = after or ""
+
+    # 清空原有子节点（runs 等）
+    p_el = p._p
+    for child in list(p_el):
+        p_el.remove(child)
+
+    # w:del
+    del_el = OxmlElement("w:del")
+    del_el.set(qn("w:id"), _new_revision_id())
+    del_el.set(qn("w:author"), author)
+    del_el.set(qn("w:date"), iso)
+    r0 = OxmlElement("w:r")
+    dt = OxmlElement("w:delText")
+    try:
+        dt.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    except Exception:
+        pass
+    dt.text = b
+    r0.append(dt)
+    del_el.append(r0)
+    p_el.append(del_el)
+
+    # w:ins
+    ins_el = OxmlElement("w:ins")
+    ins_el.set(qn("w:id"), _new_revision_id())
+    ins_el.set(qn("w:author"), author)
+    ins_el.set(qn("w:date"), iso)
+    r1 = OxmlElement("w:r")
+    t = OxmlElement("w:t")
+    try:
+        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    except Exception:
+        pass
+    t.text = a
+    r1.append(t)
+    ins_el.append(r1)
+    p_el.append(ins_el)
+
+
+def _delete_paragraph_with_track_changes(p, before: str, author: str = "aicheckword") -> None:
+    """仅删除（w:del），不插入新文本。"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    iso = _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    b = before or ""
+
+    p_el = p._p
+    for child in list(p_el):
+        p_el.remove(child)
+
+    del_el = OxmlElement("w:del")
+    del_el.set(qn("w:id"), _new_revision_id())
+    del_el.set(qn("w:author"), author)
+    del_el.set(qn("w:date"), iso)
+    r0 = OxmlElement("w:r")
+    dt = OxmlElement("w:delText")
+    try:
+        dt.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    except Exception:
+        pass
+    dt.text = b
+    r0.append(dt)
+    del_el.append(r0)
+    p_el.append(del_el)
+
+
+def _replace_table_cell_with_track_changes(cell, before: str, after: str, author: str = "aicheckword") -> None:
+    """
+    在表格单元格内写入修订：删除旧文本 + 插入新文本（尽量保留单元格本身结构，不重建表格）。
+    """
+    # python-docx 对 cell.text 的赋值会重建段落并丢失 runs；这里直接在第一个段落写入 w:del/w:ins
+    try:
+        paras = list(getattr(cell, "paragraphs", []) or [])
+    except Exception:
+        paras = []
+    if not paras:
+        try:
+            p = cell.add_paragraph("")
+            paras = [p]
+        except Exception:
+            return
+
+    p0 = paras[0]
+    # 清理多余段落，避免旧内容残留
+    try:
+        tc = cell._tc  # type: ignore[attr-defined]
+        for p in paras[1:]:
+            try:
+                tc.remove(p._p)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    _replace_paragraph_with_track_changes(p0, before or "", after or "", author=author)
+
+
+def _insert_paragraph_with_track_changes(p, text: str, author: str = "aicheckword") -> None:
+    """
+    将段落内容写为“插入修订”。
+    部分 Word 版本对“仅 w:ins、无 w:del”的插入在修订气泡/窗格中展示不稳定；
+    这里用“零宽字符占位删除 + 全文插入”形成成对修订，便于与正文替换类修订一致展示。
+    """
+    if not (text or "").strip():
+        try:
+            p_el = p._p
+            for child in list(p_el):
+                p_el.remove(child)
+        except Exception:
+            pass
+        return
+    _replace_paragraph_with_track_changes(p, "\u200b", text or "", author=author)
+
+
+def _render_modules_diagram_png(*, title: str, modules: List[str], out_path: str) -> str:
+    """
+    生成一个“正式文档风格”的模块框图 PNG（不追求与原图一模一样，但保证清晰、可审阅、一致性强）。
+    仅依赖 Pillow。
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    mods = [m.strip() for m in (modules or []) if str(m or "").strip()]
+    if not mods:
+        mods = ["(No modules)"]
+
+    # 基础参数
+    W = 1400
+    margin = 60
+    title_h = 90
+    box_h = 90
+    gap_y = 28
+    cols = 2 if len(mods) >= 6 else 1
+    col_gap = 60
+    rows = (len(mods) + cols - 1) // cols
+    H = margin + title_h + rows * box_h + (rows - 1) * gap_y + margin
+    img = Image.new("RGB", (W, H), "white")
+    dr = ImageDraw.Draw(img)
+
+    # 字体：优先用系统字体（Windows 常见）
+    def _load_font(size: int):
+        for fp in [
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\calibri.ttf",
+            r"C:\Windows\Fonts\msyh.ttc",  # 微软雅黑（中英文）
+        ]:
+            try:
+                return ImageFont.truetype(fp, size=size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    font_title = _load_font(32)
+    font_box = _load_font(26)
+
+    # 标题
+    t = (title or "").strip() or "Logical Structure / Module Overview"
+    dr.text((margin, margin), t, fill=(0, 0, 0), font=font_title)
+    y0 = margin + title_h
+
+    # 计算列宽
+    box_w = (W - margin * 2 - (col_gap if cols == 2 else 0)) // cols
+
+    # 画框
+    for idx, m in enumerate(mods):
+        r = idx // cols
+        c = idx % cols
+        x1 = margin + c * (box_w + (col_gap if cols == 2 else 0))
+        y1 = y0 + r * (box_h + gap_y)
+        x2 = x1 + box_w
+        y2 = y1 + box_h
+        dr.rounded_rectangle([x1, y1, x2, y2], radius=14, outline=(0, 0, 0), width=3, fill=(255, 255, 255))
+        # 文本居中，过长则自动换行（简化实现：按宽度切）
+        text = str(m)
+        # 简单断行：按字符宽度估算
+        max_w = box_w - 30
+        lines = []
+        cur = ""
+        for ch in text:
+            test = (cur + ch).strip()
+            tw = dr.textlength(test, font=font_box)
+            if tw <= max_w or not cur:
+                cur = test
+            else:
+                lines.append(cur)
+                cur = ch
+        if cur:
+            lines.append(cur)
+        if len(lines) > 2:
+            lines = lines[:2]
+            # 末行加省略
+            lines[-1] = (lines[-1][: max(0, len(lines[-1]) - 1)] + "…") if lines[-1] else "…"
+
+        total_h = len(lines) * 32
+        ty = y1 + (box_h - total_h) / 2
+        for li in lines:
+            tw = dr.textlength(li, font=font_box)
+            tx = x1 + (box_w - tw) / 2
+            dr.text((tx, ty), li, fill=(0, 0, 0), font=font_box)
+            ty += 32
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path, format="PNG")
+    return out_path
+
+
+def _docx_replace_or_insert_image_after_paragraph(doc, *, anchor_p_idx: int, image_path: str, width_inches: float = 6.5) -> bool:
+    """在指定段落之后替换最近的图片段落，找不到则插入一张图片段落。"""
+    from docx.shared import Inches
+
+    # 在 anchor 后找一个“图片段落”
+    try:
+        for j in range(anchor_p_idx + 1, min(anchor_p_idx + 12, len(doc.paragraphs))):
+            p2 = doc.paragraphs[j]
+            xml = p2._p.xml
+            if "w:drawing" in xml or "w:pict" in xml:
+                # 清空该段落并插入新图
+                for r in list(p2.runs):
+                    try:
+                        r.text = ""
+                    except Exception:
+                        pass
+                try:
+                    for child in list(p2._p):
+                        p2._p.remove(child)
+                except Exception:
+                    pass
+                run = p2.add_run()
+                run.add_picture(image_path, width=Inches(width_inches))
+                return True
+    except Exception:
+        pass
+
+    # 插入新段落图片
+    try:
+        p = doc.paragraphs[anchor_p_idx]
+        new_p = p.insert_paragraph_after("")  # type: ignore[attr-defined]
+    except Exception:
+        # fallback：在末尾加
+        new_p = doc.add_paragraph("")
+    try:
+        run = new_p.add_run()
+        run.add_picture(image_path, width=Inches(width_inches))
+        return True
+    except Exception:
+        return False
+
+def _rev_table_rows(meta: Dict) -> Tuple[list, str]:
+    """
+    返回 (rows, version_tag)
+    rows: list[list[str]] 用于写入修订记录表格/工作表
+    """
+    ts = _now_str()
+    version_tag = (meta.get("version_tag") or "").strip() or _dt.datetime.now().strftime("draft-%Y%m%d%H%M%S")
+    rows = [
+        ["日期", "版本", "修订内容", "生成方式/来源"],
+        [
+            ts,
+            version_tag,
+            (meta.get("change_summary") or "基于基础文件按规则补写/修订生成").strip(),
+            (meta.get("generated_by") or "aicheckword 文档初稿生成").strip(),
+        ],
+    ]
+    return rows, version_tag
+
+
+def _revision_entry_fields(meta: Dict) -> Dict[str, str]:
+    """
+    修订记录行语义字段（与具体表头列顺序无关，由表头映射决定落列）。
+    """
+    m = meta or {}
+    version_tag = (m.get("version_tag") or "").strip() or _dt.datetime.now().strftime("draft-%Y%m%d%H%M%S")
+    # 日期：支持模板常见格式（Excel 多用 2024.10.24，Word 多用 2024/10/24）
+    date_fmt = (m.get("revision_date_format") or "slash").strip().lower()
+    now = _dt.datetime.now()
+    if date_fmt in ("dot", "excel", "xlsx"):
+        date_str = now.strftime("%Y.%m.%d")
+    else:
+        date_str = now.strftime("%Y/%m/%d")
+    return {
+        "version": version_tag,
+        "date": date_str,
+        "author": (m.get("revision_author") or m.get("author") or "aicheckword").strip(),
+        "change_no": (m.get("revision_change_no") or m.get("change_no") or "NA").strip(),
+        "change_content": (m.get("change_summary") or "基于基础文件按规则补写/修订生成").strip(),
+        "source": (m.get("generated_by") or "aicheckword 文档初稿生成").strip(),
+    }
+
+
+def _header_cell_norm(s: str) -> str:
+    t = (s or "").replace("\n", " ").replace("\r", " ").strip().lower()
+    while "  " in t:
+        t = t.replace("  ", " ")
+    return t
+
+
+def _header_to_slot(header_text: str) -> Optional[str]:
+    """
+    将表头单元格文本映射到语义槽：version / date / author / change_no / change_content / source
+    """
+    h = _header_cell_norm(header_text)
+    if not h:
+        return None
+
+    # 变更号 / CR（优先于泛泛的 change）
+    if any(
+        k in h
+        for k in [
+            "change no",
+            "change no.",
+            "change#",
+            "change number",
+            "cr no",
+            "变更编号",
+            "变更号",
+            "变更单号",
+            "ecr",
+        ]
+    ):
+        return "change_no"
+    # 日期
+    if any(
+        k in h
+        for k in [
+            "change date",
+            "revision date",
+            "rev date",
+            "date",
+            "日期",
+            "变更日期",
+            "修订日期",
+            "发布日期",
+        ]
+    ) and "content" not in h:
+        return "date"
+    # 版本
+    if any(k in h for k in ["version", "ver", "版本", "版次", "版 本"]):
+        return "version"
+    # 作者
+    if any(
+        k in h
+        for k in [
+            "author",
+            "prepared",
+            "responsible",
+            "编制",
+            "编制人",
+            "修订人",
+            "审核人",
+            "作者",
+            "责任人",
+        ]
+    ):
+        return "author"
+    # 变更内容 / 说明
+    if any(
+        k in h
+        for k in [
+            "change content",
+            "revision content",
+            "description of change",
+            "description",
+            "修订内容",
+            "变更内容",
+            "变更说明",
+            "说明",
+            "摘要",
+            "remarks",
+        ]
+    ):
+        return "change_content"
+    # 来源 / 生成方式
+    if any(k in h for k in ["source", "生成方式", "来源", "generated", "tool"]):
+        return "source"
+    # 宽泛匹配（放最后，避免误判）
+    if h == "change" or h.startswith("change ") and "content" not in h and "date" not in h:
+        return "change_no"
+    if "content" in h and "change" in h:
+        return "change_content"
+    return None
+
+
+def _build_header_slot_to_col(headers: List[str]) -> Dict[str, int]:
+    """slot -> 0-based column index（每个槽只取第一次命中）。"""
+    out: Dict[str, int] = {}
+    for i, raw in enumerate(headers):
+        slot = _header_to_slot(str(raw or ""))
+        if slot and slot not in out:
+            out[slot] = i
+    return out
+
+
+def _revision_values_by_header(headers: List[str], fields: Dict[str, str]) -> List[str]:
+    """按表头列数生成一行值，未识别列留空。"""
+    n = len(headers)
+    row = [""] * n
+    slot_map = _build_header_slot_to_col(headers)
+    for slot, col in slot_map.items():
+        if 0 <= col < n:
+            row[col] = str(fields.get(slot) or "")
+    # 若表头完全未映射（老模板），按列数退回简单顺序：version,date,author,change_no,change_content 或 4 列旧顺序
+    if not slot_map and n > 0:
+        legacy = [
+            fields.get("date", ""),
+            fields.get("version", ""),
+            fields.get("change_content", ""),
+            fields.get("source", ""),
+        ]
+        for i in range(min(n, len(legacy))):
+            row[i] = legacy[i]
+    return row
+
+
+def _docx_find_revision_history_table(doc) -> Any:
+    """
+    在 docx 中寻找“修订记录/Revision History/Change Record”表格。
+    规则：
+    - 优先找表头行包含典型列名关键字的表（中文/英文均可）
+    """
+    # 严格定位：优先寻找“修订记录/Revision History/Change Record”等标题段落之后紧跟的第一张表
+    # 标题关键字（中英文都可能出现）
+    title_kws = [
+        "修订记录",
+        "变更记录",
+        "版本变更记录",
+        "revision record",
+        "revision history",
+        "change record",
+        "change history",
+        "change-record",
+    ]
+    try:
+        from docx.oxml.ns import qn
+        from docx.table import Table
+    except Exception:
+        qn = None
+        Table = None
+
+    try:
+        body = doc.element.body  # type: ignore[attr-defined]
+        children = list(body.iterchildren())
+        for i, el in enumerate(children):
+            try:
+                if qn and el.tag != qn("w:p"):
+                    continue
+            except Exception:
+                # 兜底：用字符串判断
+                if not str(getattr(el, "tag", "")).endswith("}p"):
+                    continue
+            # 段落文本
+            try:
+                p_text = "".join([t.text or "" for t in el.iter() if getattr(t, "text", None) is not None]).strip()
+            except Exception:
+                p_text = ""
+            if not p_text:
+                continue
+            if any(k in p_text.lower() for k in [x.lower() for x in title_kws]):
+                # 往后找第一张表
+                for j in range(i + 1, min(i + 25, len(children))):
+                    el2 = children[j]
+                    try:
+                        if qn and el2.tag != qn("w:tbl"):
+                            continue
+                    except Exception:
+                        if not str(getattr(el2, "tag", "")).endswith("}tbl"):
+                            continue
+                    if Table is not None:
+                        return Table(el2, doc)
+                    return None
+    except Exception:
+        pass
+
+    # 兜底：再按表头关键字匹配（可能误中，但仅用于没有标题结构的模板）
+    header_kws = ["修订", "变更", "版本", "日期", "revision", "change", "version", "date", "history", "record"]
+    try:
+        for tbl in list(getattr(doc, "tables", []) or []):
+            try:
+                if not tbl.rows:
+                    continue
+                hdr_cells = tbl.rows[0].cells
+                hdr_text = " | ".join([(c.text or "").strip() for c in hdr_cells])
+                if any(k in (hdr_text or "").lower() for k in header_kws):
+                    return tbl
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _xlsx_append_revision_row(wb, meta: Dict) -> bool:
+    """
+    在 Excel 的“修订记录”工作表里追加一行（不新建工作表）。
+    严格定位：优先找包含“修订记录/Revision History/Change Record”的标题单元格，下方的表头行再追加。
+    写入时按表头语义映射列（中英文），避免列顺序不同导致“插乱”。
+    """
+    # Excel 模板常见日期为 2024.09.26；Word 常见为 2024/10/24
+    fields = _revision_entry_fields({**(meta or {}), "revision_date_format": "dot"})
+    rows, _ = _rev_table_rows(meta or {})
+    if not rows or len(rows) < 2:
+        return False
+    title_kws = [
+        "修订记录",
+        "变更记录",
+        "版本变更记录",
+        "revision record",
+        "revision history",
+        "change record",
+        "change history",
+        "change-record",
+    ]
+    header_kws = [
+        "version",
+        "date",
+        "author",
+        "change",
+        "content",
+        "revision",
+        "日期",
+        "版本",
+        "编制",
+        "变更",
+        "内容",
+        "说明",
+    ]
+
+    def _find_revision_sheet():
+        # 1) 先按 sheet 名称猜测（中英文）
+        name_kws = [
+            "修订记录",
+            "变更记录",
+            "revision record",
+            "revision history",
+            "change record",
+            "change history",
+        ]
+        try:
+            for sn in list(getattr(wb, "sheetnames", []) or []):
+                s0 = (sn or "").strip().lower()
+                if not s0:
+                    continue
+                if any(k in s0 for k in [x.lower() for x in name_kws]):
+                    return wb[sn]
+        except Exception:
+            pass
+        # 2) 再扫每个 sheet 的前若干单元格找标题
+        try:
+            for ws0 in list(getattr(wb, "worksheets", []) or []):
+                max_r = min((ws0.max_row or 0), 80) or 80
+                max_c = min((ws0.max_column or 0), 20) or 20
+                for r in range(1, max_r + 1):
+                    for c in range(1, max_c + 1):
+                        v = ws0.cell(row=r, column=c).value
+                        s = "" if v is None else str(v).strip()
+                        if not s:
+                            continue
+                        if any(k in s.lower() for k in [x.lower() for x in title_kws]):
+                            return ws0
+        except Exception:
+            pass
+        return None
+
+    ws = _find_revision_sheet()
+    if ws is None:
+        return False
+
+    title_row = None
+    title_col = None
+    try:
+        for r in range(1, min((ws.max_row or 0) + 1, 200)):
+            for c in range(1, min((ws.max_column or 0) + 1, 30)):
+                v = ws.cell(row=r, column=c).value
+                s = "" if v is None else str(v).strip()
+                if not s:
+                    continue
+                if any(k in s.lower() for k in [x.lower() for x in title_kws]):
+                    title_row, title_col = r, c
+                    break
+            if title_row:
+                break
+    except Exception:
+        title_row = None
+
+    header_row = None
+    if title_row:
+        # 标题下方 1~8 行内找表头
+        for r in range(title_row + 1, min(title_row + 9, (ws.max_row or 0) + 1)):
+            row_text = " | ".join(
+                [str(ws.cell(row=r, column=c).value or "").strip() for c in range(1, min((ws.max_column or 0) + 1, 30))]
+            ).lower()
+            if any(k in row_text for k in [x.lower() for x in header_kws]):
+                header_row = r
+                break
+
+    # 兜底：在前 30 行找表头
+    if header_row is None:
+        for r in range(1, min((ws.max_row or 0) + 1, 30)):
+            row_text = " | ".join(
+                [str(ws.cell(row=r, column=c).value or "").strip() for c in range(1, min((ws.max_column or 0) + 1, 30))]
+            ).lower()
+            if any(k in row_text for k in [x.lower() for x in header_kws]):
+                header_row = r
+                break
+
+    # 若表为空：写默认表头 + 一行数据（无表头可映射时的兜底）
+    if (ws.max_row or 0) < 1:
+        for ci, v in enumerate(rows[0], 1):
+            ws.cell(row=1, column=ci, value=str(v or ""))
+        for ci, v in enumerate(rows[1], 1):
+            ws.cell(row=2, column=ci, value=str(v or ""))
+        return True
+
+    max_c_scan = min((ws.max_column or 0) + 1, 40)
+    if header_row is None:
+        header_row = 1
+    headers = [
+        str(ws.cell(row=header_row, column=c).value or "").strip() for c in range(1, max_c_scan)
+    ]
+    # 去掉尾部连续空表头，保留中间空列（合并单元格可能导致空串）
+    while headers and not (headers[-1] or "").strip():
+        headers.pop()
+    if not headers:
+        headers = [str(x) for x in rows[0]]
+    data_row = _revision_values_by_header(headers, fields)
+
+    # 计算追加行：从 header_row 起向下找最后一行有内容的记录（按表头列宽扫描）
+    last = header_row
+    ncols = max(len(headers), 1)
+    for r in range(header_row + 1, (ws.max_row or 0) + 1):
+        has_any = False
+        for c in range(1, ncols + 1):
+            v = ws.cell(row=r, column=c).value
+            if str(v or "").strip():
+                has_any = True
+                break
+        if has_any:
+            last = r
+    target_row = last + 1
+    for ci, v in enumerate(data_row, 1):
+        ws.cell(row=target_row, column=ci, value=str(v or ""))
+    return True
+
+
+def _docx_append_revision_row(doc, meta: Dict, *, track_changes: bool = True) -> bool:
+    """
+    向基础文档已有的修订记录表追加一行（不新建章节/表）。
+    按第一行表头语义映射列；可选对单元格写入跟踪修订（w:del/w:ins），便于在 Word 修订记录中看到插入。
+    找不到修订记录表则返回 False。
+    """
+    if track_changes:
+        _enable_track_revisions(doc)
+    fields = _revision_entry_fields(meta or {})
+    rows, _version_tag = _rev_table_rows(meta or {})
+    if not rows or len(rows) < 2:
+        return False
+    tbl = _docx_find_revision_history_table(doc)
+    if tbl is None:
+        return False
+    try:
+        if not tbl.rows:
+            return False
+        hdr_cells = tbl.rows[0].cells
+        headers = [(c.text or "").strip() for c in hdr_cells]
+        data_row = _revision_values_by_header(headers, fields)
+        r = tbl.add_row()
+        n_cell = min(len(r.cells), len(data_row))
+        for ci in range(n_cell):
+            try:
+                cell = r.cells[ci]
+                val = str(data_row[ci] or "")
+                if track_changes and val.strip():
+                    _replace_table_cell_with_track_changes(cell, "", val)
+                else:
+                    cell.text = val
+            except Exception:
+                continue
+        return True
+    except Exception:
+        return False
+
+
+def export_like_base(
+    *,
+    base_file_path: str,
+    out_path: str,
+    title: str,
+    content_text: str,
+    meta: Optional[Dict] = None,
+) -> str:
+    """
+    按基础文件后缀导出同格式文件，并写入修订记录。
+    返回 out_path。
+    """
+    meta = meta or {}
+    base = Path(base_file_path)
+    suffix = base.suffix.lower()
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rows, version_tag = _rev_table_rows(meta)
+
+    if suffix == ".docx":
+        from docx import Document
+
+        # 以 base 为主：最大化保留原有格式/页眉页脚/表格/样式
+        shutil.copyfile(str(base), str(out))
+        doc = Document(str(out))
+
+        # 修订记录：基础文档通常已自带修订记录章节/表。
+        # 这里不新建“修订记录”章节，只在已有修订记录表中追加一行；找不到则跳过。
+        try:
+            _docx_append_revision_row(doc, meta)
+        except Exception:
+            pass
+
+        doc.add_paragraph("")
+        doc.add_heading("自动生成内容（附录）", level=1)
+        doc.add_paragraph(f"标题：{title or out.stem}")
+        doc.add_paragraph(f"版本：{version_tag}")
+        doc.add_paragraph("")
+        for line in (content_text or "").splitlines():
+            # 附录按行写入，避免破坏原模板段落样式
+            doc.add_paragraph(line)
+
+        doc.save(str(out))
+        return str(out)
+
+    if suffix in (".xlsx", ".xls"):
+        import openpyxl
+
+        # 以 base 为主：复制原表格文件，避免格式/公式/样式丢失
+        shutil.copyfile(str(base), str(out))
+        wb = openpyxl.load_workbook(str(out))
+
+        # 修订记录：不新建工作表。严格定位到“修订记录标题下的那张表”并追加一行；找不到则跳过。
+        try:
+            _xlsx_append_revision_row(wb, meta)
+        except Exception:
+            pass
+
+        # 附录：写入自动生成内容（避免破坏原工作表）
+        appendix_name = "自动生成内容"
+        if appendix_name in wb.sheetnames:
+            ws = wb[appendix_name]
+            ws.delete_rows(1, ws.max_row or 1)
+        else:
+            ws = wb.create_sheet(appendix_name)
+        ws.cell(row=1, column=1, value=title or out.stem)
+        ws.cell(row=2, column=1, value=f"版本：{version_tag}")
+        for i, line in enumerate((content_text or "").splitlines(), start=4):
+            ws.cell(row=i, column=1, value=line)
+
+        wb.save(str(out))
+        return str(out)
+
+    if suffix == ".pdf":
+        # PDF 受限于“可编辑内容流/字体/版面”的复杂度：不重建，直接复制 base，
+        # 并额外输出同名的 .draft.txt 供核对。
+        shutil.copyfile(str(base), str(out))
+        sidecar = out.with_suffix(out.suffix + ".draft.txt")
+        sidecar.write_text((content_text or ""), encoding="utf-8")
+        return str(out)
+
+    # 其他格式：降级为 txt（仍保证可下载）
+    out_txt = out.with_suffix(out.suffix + ".txt") if out.suffix else out.with_suffix(".txt")
+    out_txt.write_text((content_text or ""), encoding="utf-8")
+    return str(out_txt)
+
+
+def export_docx_inplace_patch(
+    *,
+    base_file_path: str,
+    out_path: str,
+    patch_json: str,
+    meta: Optional[Dict] = None,
+    track_changes: bool = True,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    对 docx 按结构化 patch 做可定位修改（不整篇重建文档）：
+    - 复制 base 到 out
+    - 按 patch_json 中的 operations 定位并替换/插入/删除段落或表格单元格文本
+    - 追加修订记录
+
+    返回 (out_path, report)
+    """
+    meta = meta or {}
+    base = Path(base_file_path)
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    from docx import Document
+
+    shutil.copyfile(str(base), str(out))
+    doc = Document(str(out))
+    if track_changes:
+        _enable_track_revisions(doc)
+
+    report: Dict[str, Any] = {"applied": [], "skipped": [], "errors": [], "changes": []}
+
+    try:
+        patch_obj = json.loads(patch_json or "{}")
+    except Exception as e:
+        report["errors"].append({"error": f"patch_json 解析失败：{e}"})
+        # 解析失败：不做任何正文替换，也不新增修订记录
+        try:
+            doc.save(str(out))
+        except Exception:
+            pass
+        return str(out), report
+
+    ops: List[Dict[str, Any]] = list(patch_obj.get("operations") or [])
+
+    def _para_heading_context(p_idx: int) -> str:
+        # 粗定位“章节标题”：向上找最近的标题样式段落
+        try:
+            for j in range(p_idx, -1, -1):
+                p = doc.paragraphs[j]
+                name = ""
+                try:
+                    name = (p.style.name or "")
+                except Exception:
+                    name = ""
+                if name and ("Heading" in name or "标题" in name):
+                    return (p.text or "").strip()[:200]
+        except Exception:
+            pass
+        return ""
+
+    def _replace_paragraph(p, new_text: str) -> None:
+        # 保留段落样式，只替换文本 runs
+        for r in list(p.runs):
+            try:
+                r.text = ""
+            except Exception:
+                pass
+        if p.runs:
+            p.runs[0].text = new_text or ""
+        else:
+            p.add_run(new_text or "")
+
+    def _insert_paragraph_after(p, text: str) -> Any:
+        """
+        在段落 p 后插入一个新段落，返回新段落对象。
+        python-docx 没有公开 API，这里用底层 XML 插入，尽量保留邻近结构与样式。
+        """
+        from docx.oxml import OxmlElement
+        from docx.text.paragraph import Paragraph
+
+        new_p = OxmlElement("w:p")
+        p._p.addnext(new_p)
+        new_para = Paragraph(new_p, p._parent)
+        if text:
+            new_para.add_run(text)
+        return new_para
+
+    def _find_paragraphs_containing(anchor: str):
+        a = (anchor or "").strip()
+        if not a:
+            return []
+        hits = []
+        for idx, p in enumerate(doc.paragraphs):
+            if a in (p.text or ""):
+                hits.append((idx, p))
+        return hits
+
+    def _find_table_cells_containing(anchor: str):
+        a = (anchor or "").strip()
+        if not a:
+            return []
+        hits = []
+        for t in doc.tables:
+            for row in t.rows:
+                for cell in row.cells:
+                    if a in (cell.text or ""):
+                        hits.append(cell)
+        return hits
+
+    def _find_table_rows_containing(anchor: str):
+        a = (anchor or "").strip()
+        if not a:
+            return []
+        hits = []
+        for t in doc.tables:
+            for r_idx, row in enumerate(t.rows):
+                for cell in row.cells:
+                    if a in (cell.text or ""):
+                        hits.append((t, r_idx, row))
+                        break
+        return hits
+
+    for op in ops:
+        try:
+            t = (op.get("type") or "").strip()
+            anchor = (op.get("anchor") or "").strip()
+            new_text = op.get("new_text")
+            if new_text is None:
+                new_text = ""
+            new_text = str(new_text)
+            require_unique = op.get("require_unique")
+            if require_unique is None:
+                require_unique = True
+            require_unique = bool(require_unique)
+
+            if not t or not anchor:
+                report["skipped"].append({"op": op, "reason": "缺少 type 或 anchor"})
+                continue
+
+            if t == "replace_paragraph_contains":
+                hits = _find_paragraphs_containing(anchor)
+                if not hits:
+                    report["skipped"].append({"op": op, "reason": "未命中段落"})
+                    continue
+                if require_unique and len(hits) != 1:
+                    report["skipped"].append({"op": op, "reason": f"段落命中不唯一：{len(hits)}"})
+                    continue
+                for p_idx, p in hits:
+                    before = (p.text or "")
+                    if (before or "").strip() == (new_text or "").strip():
+                        report["skipped"].append({"op": op, "reason": "no-op：新旧文本一致（段落无需修改）"})
+                        continue
+                    if track_changes:
+                        _replace_paragraph_with_track_changes(p, before, new_text)
+                    else:
+                        _replace_paragraph(p, new_text)
+                    # 使用 track changes 时，python-docx 的 p.text 可能读不到 w:ins 文本，导致 after 为空
+                    after = new_text if track_changes else (p.text or "")
+                    report["changes"].append(
+                        {
+                            "type": t,
+                            "anchor": anchor,
+                            "heading": _para_heading_context(p_idx),
+                            "paragraph_index": p_idx,
+                            "before": before,
+                            "after": after,
+                        }
+                    )
+                report["applied"].append({"op": op, "hits": len(hits)})
+                continue
+
+            if t == "delete_paragraph_contains":
+                hits = _find_paragraphs_containing(anchor)
+                if not hits:
+                    report["skipped"].append({"op": op, "reason": "未命中段落（用于删除）"})
+                    continue
+                if require_unique and len(hits) != 1:
+                    report["skipped"].append({"op": op, "reason": f"删除锚点命中不唯一：{len(hits)}"})
+                    continue
+                for p_idx, p in hits:
+                    before = (p.text or "")
+                    if track_changes:
+                        _delete_paragraph_with_track_changes(p, before)
+                    else:
+                        _replace_paragraph(p, "")
+                    after = "" if track_changes else (p.text or "")
+                    report["changes"].append(
+                        {
+                            "type": t,
+                            "anchor": anchor,
+                            "heading": _para_heading_context(p_idx),
+                            "paragraph_index": p_idx,
+                            "before": before,
+                            "after": after,
+                        }
+                    )
+                report["applied"].append({"op": op, "hits": len(hits)})
+                continue
+
+            if t == "replace_table_cell_contains":
+                hits = _find_table_cells_containing(anchor)
+                if not hits:
+                    report["skipped"].append({"op": op, "reason": "未命中表格单元格"})
+                    continue
+                if require_unique and len(hits) != 1:
+                    report["skipped"].append({"op": op, "reason": f"单元格命中不唯一：{len(hits)}"})
+                    continue
+                for c in hits:
+                    before = (c.text or "")
+                    if (before or "").strip() == (new_text or "").strip():
+                        report["skipped"].append({"op": op, "reason": "no-op：新旧文本一致（单元格无需修改）"})
+                        continue
+                    if track_changes:
+                        _replace_table_cell_with_track_changes(c, before, new_text)
+                    else:
+                        c.text = new_text
+                    # 同理：track changes 下 cell.text 可能为空，改为使用 new_text 作为 after 展示
+                    after = new_text if track_changes else (c.text or "")
+                    report["changes"].append(
+                        {
+                            "type": t,
+                            "anchor": anchor,
+                            "before": before,
+                            "after": after,
+                        }
+                    )
+                report["applied"].append({"op": op, "hits": len(hits)})
+                continue
+
+            if t == "insert_paragraph_after_contains":
+                hits = _find_paragraphs_containing(anchor)
+                if not hits:
+                    report["skipped"].append({"op": op, "reason": "未命中段落（用于插入）"})
+                    continue
+                if require_unique and len(hits) != 1:
+                    report["skipped"].append({"op": op, "reason": f"插入锚点命中不唯一：{len(hits)}"})
+                    continue
+                for p_idx, p in hits:
+                    new_p = _insert_paragraph_after(p, new_text)
+                    # 样式与段落格式：尽量跟随锚点段落，符合正式文档格式
+                    try:
+                        new_p.style = p.style
+                    except Exception:
+                        pass
+                    try:
+                        pf_src = getattr(p, "paragraph_format", None)
+                        pf_dst = getattr(new_p, "paragraph_format", None)
+                        if pf_src and pf_dst:
+                            pf_dst.alignment = pf_src.alignment
+                            pf_dst.left_indent = pf_src.left_indent
+                            pf_dst.right_indent = pf_src.right_indent
+                            pf_dst.first_line_indent = pf_src.first_line_indent
+                            pf_dst.space_before = pf_src.space_before
+                            pf_dst.space_after = pf_src.space_after
+                            pf_dst.line_spacing = pf_src.line_spacing
+                    except Exception:
+                        pass
+                    # 跟踪修订：插入段落也要以 w:ins 记录（否则“修订记录”只看到删除）
+                    if track_changes:
+                        try:
+                            _insert_paragraph_with_track_changes(new_p, new_text)
+                        except Exception:
+                            pass
+                    after_text = new_text if track_changes else (new_p.text or "")
+                    report["changes"].append(
+                        {
+                            "type": t,
+                            "anchor": anchor,
+                            "heading": _para_heading_context(p_idx),
+                            "paragraph_index": p_idx,
+                            "before": "",
+                            "after": after_text,
+                        }
+                    )
+                report["applied"].append({"op": op, "hits": len(hits)})
+                continue
+
+            if t == "insert_table_row_after_contains":
+                hits = _find_table_rows_containing(anchor)
+                if not hits:
+                    report["skipped"].append({"op": op, "reason": "未命中表格行（用于插入）"})
+                    continue
+                if require_unique and len(hits) != 1:
+                    report["skipped"].append({"op": op, "reason": f"插入表格行锚点命中不唯一：{len(hits)}"})
+                    continue
+                for tbl, r_idx, row in hits:
+                    try:
+                        col_n = len(row.cells)
+                        vals = [x for x in (new_text or "").split("\t")]
+                        # 插入新行：用 add_row + XML 移动到目标位置之后
+                        new_row = tbl.add_row()
+                        for ci in range(col_n):
+                            v = vals[ci] if ci < len(vals) else ""
+                            if track_changes:
+                                _replace_table_cell_with_track_changes(new_row.cells[ci], "", v)
+                            else:
+                                new_row.cells[ci].text = v
+                        # 将新行移动到 r_idx 后
+                        row._tr.addnext(new_row._tr)
+                        report["changes"].append(
+                            {
+                                "type": t,
+                                "anchor": anchor,
+                                "table_row_index": r_idx,
+                                "before": "",
+                                "after": "\t".join(c.text for c in new_row.cells),
+                            }
+                        )
+                    except Exception as _ie:
+                        report["errors"].append({"op": op, "error": f"插入表格行失败：{_ie}"})
+                report["applied"].append({"op": op, "hits": len(hits)})
+                continue
+
+            if t == "replace_diagram_after_paragraph_contains":
+                # 以 anchor 定位到“图题/图注/逻辑结构”附近段落，然后替换/插入一张模块框图
+                hits = _find_paragraphs_containing(anchor)
+                if not hits:
+                    report["skipped"].append({"op": op, "reason": "未命中段落（用于替换图示）"})
+                    continue
+                if require_unique and len(hits) != 1:
+                    report["skipped"].append({"op": op, "reason": f"图示锚点命中不唯一：{len(hits)}"})
+                    continue
+                mods = [x.strip() for x in (new_text or "").replace("\n", ",").split(",") if x.strip()]
+                if not mods:
+                    report["skipped"].append({"op": op, "reason": "缺少模块列表 new_text（用于生成图示）"})
+                    continue
+                try:
+                    tmp_png = Path(tempfile.mkdtemp(prefix="aicheckword_diagram_")) / "diagram.png"
+                    _render_modules_diagram_png(title="Logical structure", modules=mods, out_path=str(tmp_png))
+                    p_idx, _p = hits[0]
+                    ok = _docx_replace_or_insert_image_after_paragraph(doc, anchor_p_idx=p_idx, image_path=str(tmp_png))
+                    if not ok:
+                        report["skipped"].append({"op": op, "reason": "图示替换/插入失败（未找到可写入位置）"})
+                        continue
+                    report["changes"].append(
+                        {"type": t, "anchor": anchor, "heading": _para_heading_context(p_idx), "before": "", "after": f"[diagram modules={len(mods)}]"}
+                    )
+                    report["applied"].append({"op": op, "hits": 1})
+                except Exception as e:
+                    report["errors"].append({"op": op, "error": f"生成/插入图示失败：{e}"})
+                continue
+
+            report["skipped"].append({"op": op, "reason": f"不支持的 type：{t}"})
+        except Exception as e:
+            report["errors"].append({"op": op, "error": str(e)})
+
+    # 修订记录：基础文档通常已自带修订记录章节/表。
+    # 仅当本次确实写入了修改时，向基础文档已有修订记录表追加一行；不新建章节/表。
+    try:
+        if (len(report.get("applied") or []) > 0) or (len(report.get("changes") or []) > 0):
+            _ok = _docx_append_revision_row(doc, meta, track_changes=bool(track_changes))
+            if not _ok:
+                report["skipped"].append({"reason": "未找到基础文档中的修订记录表，已跳过写入修订记录。"})
+    except Exception as e:
+        report["errors"].append({"error": f"写入修订记录失败：{e}"})
+
+    doc.save(str(out))
+    return str(out), report
+
+
+def export_xlsx_inplace_patch(
+    *,
+    base_file_path: str,
+    out_path: str,
+    patch_json: str,
+    meta: Optional[Dict] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    对 xlsx/xls 按结构化 patch 做可定位修改（openpyxl，不整表重建）：
+    - 复制 base 到 out（保留格式/公式尽量不动）
+    - 按 patch_json 定位并替换单元格、插入行
+    - 写入“修订记录”工作表（复用 export_like_base 的表格格式）
+
+    注：Excel 本身的“修订/跟踪更改”能力与 docx 不同，这里提供可审计的变更报告与修订记录表。
+    """
+    meta = meta or {}
+    base = Path(base_file_path)
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    report: Dict[str, Any] = {"applied": [], "skipped": [], "errors": [], "changes": []}
+    try:
+        patch_obj = json.loads(patch_json or "{}")
+    except Exception as e:
+        report["errors"].append({"error": f"patch_json 解析失败：{e}"})
+        # 解析失败：仅复制基础文件，不新增修订记录
+        shutil.copyfile(str(base), str(out))
+        return str(out), report
+
+    import openpyxl
+
+    shutil.copyfile(str(base), str(out))
+    wb = openpyxl.load_workbook(str(out))
+
+    ops: List[Dict[str, Any]] = list((patch_obj or {}).get("operations") or [])
+
+    def _iter_cells():
+        for ws in wb.worksheets:
+            # 跳过我们自己写入的附录/修订表，避免二次匹配
+            if ws.title in ("修订记录", "自动生成内容"):
+                continue
+            for row in ws.iter_rows():
+                for cell in row:
+                    yield ws, cell
+
+    def _find_cells_containing(anchor: str):
+        a = (anchor or "").strip()
+        if not a:
+            return []
+        hits = []
+        for ws, cell in _iter_cells():
+            try:
+                v = cell.value
+            except Exception:
+                v = None
+            s = "" if v is None else str(v)
+            if a in s:
+                hits.append((ws, cell, s))
+        return hits
+
+    def _find_rows_containing(anchor: str):
+        a = (anchor or "").strip()
+        if not a:
+            return []
+        hits = []
+        for ws in wb.worksheets:
+            if ws.title in ("修订记录", "自动生成内容"):
+                continue
+            for r_idx, row in enumerate(ws.iter_rows(values_only=False), start=1):
+                found = False
+                for cell in row:
+                    try:
+                        v = cell.value
+                    except Exception:
+                        v = None
+                    s = "" if v is None else str(v)
+                    if a in s:
+                        found = True
+                        break
+                if found:
+                    hits.append((ws, r_idx))
+        return hits
+
+    for op in ops:
+        try:
+            t = (op.get("type") or "").strip()
+            anchor = (op.get("anchor") or "").strip()
+            new_text = op.get("new_text")
+            if new_text is None:
+                new_text = ""
+            new_text = str(new_text)
+            require_unique = op.get("require_unique")
+            if require_unique is None:
+                require_unique = True
+            require_unique = bool(require_unique)
+
+            if not t or not anchor:
+                report["skipped"].append({"op": op, "reason": "缺少 type 或 anchor"})
+                continue
+
+            if t == "replace_table_cell_contains":
+                hits = _find_cells_containing(anchor)
+                if not hits:
+                    report["skipped"].append({"op": op, "reason": "未命中单元格"})
+                    continue
+                if require_unique and len(hits) != 1:
+                    report["skipped"].append({"op": op, "reason": f"单元格命中不唯一：{len(hits)}"})
+                    continue
+                for ws, cell, before in hits:
+                    if (str(before or "")).strip() == (new_text or "").strip():
+                        report["skipped"].append({"op": op, "reason": "no-op：新旧文本一致（单元格无需修改）"})
+                        continue
+                    cell.value = new_text
+                    report["changes"].append(
+                        {
+                            "type": t,
+                            "anchor": anchor,
+                            "sheet": ws.title,
+                            "cell": cell.coordinate,
+                            "before": before,
+                            "after": new_text,
+                        }
+                    )
+                report["applied"].append({"op": op, "hits": len(hits)})
+                continue
+
+            if t == "insert_table_row_after_contains":
+                hits = _find_rows_containing(anchor)
+                if not hits:
+                    report["skipped"].append({"op": op, "reason": "未命中表格行（用于插入）"})
+                    continue
+                if require_unique and len(hits) != 1:
+                    report["skipped"].append({"op": op, "reason": f"插入行锚点命中不唯一：{len(hits)}"})
+                    continue
+                ws, r_idx = hits[0]
+                ws.insert_rows(r_idx + 1)
+                vals = [x for x in (new_text or "").split("\t")]
+                for ci, v in enumerate(vals, start=1):
+                    ws.cell(row=r_idx + 1, column=ci, value=v)
+                report["changes"].append(
+                    {
+                        "type": t,
+                        "anchor": anchor,
+                        "sheet": ws.title,
+                        "row_index": r_idx,
+                        "before": "",
+                        "after": new_text,
+                    }
+                )
+                report["applied"].append({"op": op, "hits": 1})
+                continue
+
+            report["skipped"].append({"op": op, "reason": f"不支持的 type：{t}"})
+        except Exception as e:
+            report["errors"].append({"op": op, "error": str(e)})
+
+    # 修订记录：仅当本次确实写入了修改时，向已有“修订记录”工作表追加一行；不新建工作表。
+    try:
+        if (len(report.get("applied") or []) > 0) or (len(report.get("changes") or []) > 0):
+            if not _xlsx_append_revision_row(wb, meta):
+                report["skipped"].append({"reason": "未找到基础文件中的“修订记录”工作表/表格区域，已跳过写入修订记录。"})
+    except Exception as e:
+        report["errors"].append({"error": f"写入修订记录失败：{e}"})
+
+    wb.save(str(out))
+    try:
+        wb.close()
+    except Exception:
+        pass
+    return str(out), report
+

@@ -43,6 +43,7 @@ logging.getLogger("chromadb").setLevel(logging.WARNING)
 import streamlit as st
 import pandas as pd
 
+from src.core.cursor_skills_rules_updater import apply_patch_updates
 
 def _st_button_compat(label: str, *, key: str, **kwargs) -> bool:
     """兼容旧版 Streamlit：无 use_container_width 等参数时自动降级。"""
@@ -138,6 +139,7 @@ def _st_run_tabs_or_pick(labels: list, *, radio_label: str, session_key: str, ta
 
 from config import settings
 from src.core.agent import ReviewAgent
+from src.core.document_draft_generator import DocumentDraftGenerator
 from src.core.document_loader import (
     load_single_file,
     split_documents,
@@ -195,6 +197,9 @@ from src.core.db import (
     update_project_case,
     update_knowledge_docs_case_id,
     get_knowledge_docs_by_case_id,
+    upsert_draft_file_skills_rules,
+    get_draft_file_skills_rules,
+    delete_draft_file_skills_rules,
     get_review_extra_instructions,
     update_review_extra_instructions,
     get_review_system_prompt,
@@ -222,6 +227,7 @@ from src.core.db import (
     OP_TYPE_TRANSLATION_ERROR,
 )
 from src.core.report_export import report_to_html, report_to_docx, report_to_pdf, report_to_excel, report_to_docx_with_comments, report_todo_to_csv, report_todo_to_pdf, report_todo_to_docx, report_todo_to_excel
+from src.core.draft_export import export_like_base
 from src.streamlit_compat import streamlit_divider, streamlit_rerun
 from src.system_config_ui import render_system_config_page
 
@@ -540,33 +546,33 @@ def render_sidebar():
                 pass
         st.session_state["_llm_config_key"] = _cfg_key
 
-        # 下拉刚切换时立即 rerun，使当前 run 的 index 与选中一致，避免需点两次才看到切换
-        if _cur != _provider:
-            _rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
-            if callable(_rerun):
-                _rerun()
+        # 不再强制二次 rerun：否则 Streamlit 可能复用旧组件位置，导致未保存时显示错位。
 
         if is_cursor:
             cursor_api_key = st.text_input(
                 "Cursor API Key",
                 value=settings.cursor_api_key,
                 type="password",
+                key=f"sidebar_api_key_{_provider}",
                 help="Cursor Dashboard → Integrations 创建",
             )
             cursor_repo = st.text_input(
                 "GitHub 仓库地址",
                 value=settings.cursor_repository,
+                key=f"sidebar_cursor_repo_{_provider}",
                 help="必填，如 https://github.com/your-org/your-repo（Agent 会基于该仓库运行）",
             )
             cursor_ref = st.text_input(
                 "分支/标签",
                 value=settings.cursor_ref,
+                key=f"sidebar_cursor_ref_{_provider}",
                 help="默认 main",
             )
             cursor_embed = st.selectbox(
                 "向量化使用",
                 ["ollama", "openai"],
                 index=0 if (settings.cursor_embedding or "ollama").lower() == "ollama" else 1,
+                key=f"sidebar_cursor_embed_{_provider}",
                 help="知识库向量化仍需要 Ollama 或 OpenAI",
             )
             llm_model = settings.llm_model
@@ -575,16 +581,19 @@ def render_sidebar():
             ollama_url = st.text_input(
                 "Ollama 地址",
                 value=settings.ollama_base_url,
+                key=f"sidebar_base_url_{_provider}",
                 help="默认 http://localhost:11434，通常不用改",
             )
             llm_model = st.text_input(
                 "审核模型",
                 value=settings.llm_model,
+                key=f"sidebar_llm_model_{_provider}",
                 help="推荐 qwen2.5（中文好）、llama3.1、mistral 等",
             )
             embed_model = st.text_input(
                 "向量化模型",
                 value=settings.embedding_model,
+                key=f"sidebar_embed_model_{_provider}",
                 help="推荐 nomic-embed-text、bge-m3 等",
             )
         elif is_openai_form:
@@ -628,16 +637,46 @@ def render_sidebar():
             )
         elif _provider == "gemini":
             st.caption("密钥请配置环境变量 GEMINI_API_KEY 或 GOOGLE_API_KEY（.env）。")
-            llm_model = st.text_input("审核模型", value=settings.llm_model or "gemini-1.5-flash", help="如 gemini-1.5-flash、gemini-1.5-pro")
-            embed_model = st.text_input("向量化模型", value=settings.embedding_model, help="向量建议仍用 Ollama 或 OpenAI Embedding")
+            llm_model = st.text_input(
+                "审核模型",
+                value=settings.llm_model or "gemini-1.5-flash",
+                help="如 gemini-1.5-flash、gemini-1.5-pro",
+                key=f"sidebar_llm_model_{_provider}",
+            )
+            embed_model = st.text_input(
+                "向量化模型",
+                value=settings.embedding_model,
+                help="向量建议仍用 Ollama 或 OpenAI Embedding",
+                key=f"sidebar_embed_model_{_provider}",
+            )
         elif _provider == "tongyi":
             st.caption("密钥请配置 DASHSCOPE_API_KEY（.env 或系统环境变量）。")
-            llm_model = st.text_input("审核模型", value=settings.llm_model or "qwen-plus", help="如 qwen-plus、qwen-max")
-            embed_model = st.text_input("向量化模型", value=settings.embedding_model, help="通义向量可用 text-embedding-v3，需单独接 Embedding API；当前可先 Ollama")
+            llm_model = st.text_input(
+                "审核模型",
+                value=settings.llm_model or "qwen-plus",
+                help="如 qwen-plus、qwen-max",
+                key=f"sidebar_llm_model_{_provider}",
+            )
+            embed_model = st.text_input(
+                "向量化模型",
+                value=settings.embedding_model,
+                help="通义向量可用 text-embedding-v3，需单独接 Embedding API；当前可先 Ollama",
+                key=f"sidebar_embed_model_{_provider}",
+            )
         elif _provider == "baidu":
             st.caption("密钥请配置 QIANFAN_AK、QIANFAN_SK（.env）。")
-            llm_model = st.text_input("审核模型", value=settings.llm_model or "ERNIE-Bot-4", help="千帆模型名")
-            embed_model = st.text_input("向量化模型", value=settings.embedding_model, help="向量可继续用 Ollama/OpenAI")
+            llm_model = st.text_input(
+                "审核模型",
+                value=settings.llm_model or "ERNIE-Bot-4",
+                help="千帆模型名",
+                key=f"sidebar_llm_model_{_provider}",
+            )
+            embed_model = st.text_input(
+                "向量化模型",
+                value=settings.embedding_model,
+                help="向量可继续用 Ollama/OpenAI",
+                key=f"sidebar_embed_model_{_provider}",
+            )
 
         if st.button("💾 保存配置"):
             from config.cursor_overrides import _cursor_overrides as _co
@@ -660,13 +699,9 @@ def render_sidebar():
                 if _provider == "deepseek":
                     settings.deepseek_api_key = api_key
                     settings.deepseek_base_url = base_url
-                    settings.openai_api_key = api_key
-                    settings.openai_base_url = base_url
                 elif _provider == "lingyi":
                     settings.lingyi_api_key = api_key
                     settings.lingyi_base_url = base_url
-                    settings.openai_api_key = api_key
-                    settings.openai_base_url = base_url
                 else:
                     settings.openai_api_key = api_key
                     settings.openai_base_url = base_url
@@ -1541,13 +1576,38 @@ def render_step1_page():
                     if st.button("📋 创建本案例的其他国家/语言版本", key="btn_variant_upload", help="切换到新建案例并预填本案例信息，仅改注册国家、文档语言即可创建新版本"):
                         st.session_state["_pending_variant_upload_case_id"] = case["id"]
                         _streamlit_rerun()
-                    if st.button("🗑️ 删除此案例", key="del_case_upload"):
+                    _pending_del_u = st.session_state.get("train_del_case_upload_id")
+                    if _pending_del_u == case["id"]:
+                        _nf = len(_case_files or [])
+                        st.warning(
+                            f"**确认删除模板案例？** 当前案例下共有 **{_nf}** 个已入库文件；"
+                            f"确认后将**永久删除**案例记录，并清空知识库中该案例关联的全部文档块与向量，**不可恢复**。"
+                        )
                         if _case_files:
-                            st.warning("该案例下已有入库文件，不能删除。请先删除关联文件后再试。")
-                        else:
-                            delete_project_case(case["id"])
-                            st.success("已删除案例")
-                            st.experimental_rerun()
+                            _pv = ", ".join(_case_files[:15]) + ("…" if len(_case_files) > 15 else "")
+                            st.caption(f"文件清单（节选）：{_pv}")
+                        _c1, _c2 = st.columns(2)
+                        with _c1:
+                            if st.button("✅ 确认删除", key=f"confirm_del_case_u_{case['id']}"):
+                                try:
+                                    from src.core.knowledge_base import KnowledgeBase
+
+                                    KnowledgeBase(collection).delete_documents_by_case_id(int(case["id"]))
+                                except Exception as _ex:
+                                    st.error(f"清理知识库失败：{_ex}")
+                                else:
+                                    delete_project_case(int(case["id"]))
+                                    st.session_state.pop("train_del_case_upload_id", None)
+                                    _cached_list_project_cases.clear()
+                                    st.success("已删除案例及其全部入库文件")
+                                    _streamlit_rerun()
+                        with _c2:
+                            if st.button("取消", key=f"cancel_del_case_u_{case['id']}"):
+                                st.session_state.pop("train_del_case_upload_id", None)
+                                _streamlit_rerun()
+                    elif st.button("🗑️ 删除此案例", key="del_case_upload"):
+                        st.session_state["train_del_case_upload_id"] = case["id"]
+                        _streamlit_rerun()
                 except Exception:
                     pass
         uploaded_files = st.file_uploader(
@@ -2139,13 +2199,38 @@ def render_step1_page():
                     if st.button("📋 创建本案例的其他国家/语言版本", key="btn_variant_dir", help="切换到新建案例并预填本案例信息，仅改注册国家、文档语言即可创建新版本"):
                         st.session_state["_pending_variant_dir_case_id"] = case_dir["id"]
                         _streamlit_rerun()
-                    if st.button("🗑️ 删除此案例", key="del_case_dir"):
+                    _pending_del_d = st.session_state.get("train_del_case_dir_id")
+                    if _pending_del_d == case_dir["id"]:
+                        _nf_d = len(_case_files_dir or [])
+                        st.warning(
+                            f"**确认删除模板案例？** 当前案例下共有 **{_nf_d}** 个已入库文件；"
+                            f"确认后将**永久删除**案例记录，并清空知识库中该案例关联的全部文档块与向量，**不可恢复**。"
+                        )
                         if _case_files_dir:
-                            st.warning("该案例下已有入库文件，不能删除。请先删除关联文件后再试。")
-                        else:
-                            delete_project_case(case_dir["id"])
-                            st.success("已删除案例")
-                            st.experimental_rerun()
+                            _pv_d = ", ".join(_case_files_dir[:15]) + ("…" if len(_case_files_dir) > 15 else "")
+                            st.caption(f"文件清单（节选）：{_pv_d}")
+                        _d1, _d2 = st.columns(2)
+                        with _d1:
+                            if st.button("✅ 确认删除", key=f"confirm_del_case_d_{case_dir['id']}"):
+                                try:
+                                    from src.core.knowledge_base import KnowledgeBase
+
+                                    KnowledgeBase(collection_dir).delete_documents_by_case_id(int(case_dir["id"]))
+                                except Exception as _exd:
+                                    st.error(f"清理知识库失败：{_exd}")
+                                else:
+                                    delete_project_case(int(case_dir["id"]))
+                                    st.session_state.pop("train_del_case_dir_id", None)
+                                    _cached_list_project_cases.clear()
+                                    st.success("已删除案例及其全部入库文件")
+                                    _streamlit_rerun()
+                        with _d2:
+                            if st.button("取消", key=f"cancel_del_case_d_{case_dir['id']}"):
+                                st.session_state.pop("train_del_case_dir_id", None)
+                                _streamlit_rerun()
+                    elif st.button("🗑️ 删除此案例", key="del_case_dir"):
+                        st.session_state["train_del_case_dir_id"] = case_dir["id"]
+                        _streamlit_rerun()
                 except Exception:
                     pass
         dir_path = st.text_input(
@@ -2784,6 +2869,7 @@ def _render_projects_tab(agent, collection: str):
         st.subheader("新建项目")
         with st.form("new_project_form"):
             p_name = st.text_input("项目名称", key="np_name")
+            p_code = st.text_input("项目编号（可选）", placeholder="例如：OXGWIS（用于文件名等前缀替换）", key="np_project_code")
             p_name_en = st.text_input("项目名称（英文）", placeholder="Project name in English", key="np_name_en")
             p_product = st.text_input("产品名称（可选）", placeholder="与项目名称一并加入审核点、一致性核对", key="np_product")
             p_product_en = st.text_input("产品名称（英文）", placeholder="Product name in English", key="np_product_en")
@@ -2806,6 +2892,7 @@ def _render_projects_tab(agent, collection: str):
                         registration_country_en=(p_country_en or "").strip(),
                         model=(p_model or "").strip(),
                         model_en=(p_model_en or "").strip(),
+                        project_code=(p_code or "").strip(),
                     )
                     st.session_state["projects_success_message"] = f"✅ 已创建项目「{p_name.strip()}」，ID: {pid}"
                     st.experimental_rerun()
@@ -2831,11 +2918,14 @@ def _render_projects_tab(agent, collection: str):
             st.caption(f"产品名称：{proj.get('product_name') or '—'} / {proj.get('product_name_en') or '—'}（已加入审核点/一致性核对）")
         if proj.get("model") or proj.get("model_en"):
             st.caption(f"型号（Model）：{proj.get('model') or '—'} / {proj.get('model_en') or '—'}（字段名称不区分大小写，取值区分大小写、精确匹配含空格）")
+        if proj.get("project_code"):
+            st.caption(f"项目编号：{proj.get('project_code') or '—'}")
 
         _idx_proj = lambda opts, val: opts.index(val) if (val and val in opts) else 0
         with st.expander("✏️ 编辑项目（支持中/英文）", expanded=False):
             with st.form(f"edit_proj_{pid}"):
                 e_name = st.text_input("项目名称", value=proj.get("name") or "", key=f"ep_name_{pid}")
+                e_code = st.text_input("项目编号（可选）", value=proj.get("project_code") or "", placeholder="例如：OXGWIS（用于文件名等前缀替换）", key=f"ep_project_code_{pid}")
                 e_name_en = st.text_input("项目名称（英文）", value=proj.get("name_en") or "", placeholder="Project name in English", key=f"ep_name_en_{pid}")
                 e_product = st.text_input("产品名称（可选）", value=proj.get("product_name") or "", placeholder="与项目名称一并加入审核点、一致性核对", key=f"ep_product_{pid}")
                 e_product_en = st.text_input("产品名称（英文）", value=proj.get("product_name_en") or "", placeholder="Product name in English", key=f"ep_product_en_{pid}")
@@ -2861,6 +2951,7 @@ def _render_projects_tab(agent, collection: str):
                         project_form=e_form,
                         scope_of_application=e_scope.strip() if e_scope else "",
                         product_name=e_product.strip() if e_product else "",
+                        project_code=e_code.strip() if e_code else "",
                         name_en=e_name_en.strip() if e_name_en else "",
                         product_name_en=e_product_en.strip() if e_product_en else "",
                         registration_country_en=e_country_en.strip() if e_country_en else "",
@@ -3439,6 +3530,8 @@ def render_step3_page():
                                 _invalidate_audit_history_cache()
                             except Exception:
                                 pass
+                            # 自动沉淀：同报告内重复错误追加到 skills/rules
+                            _auto_append_repeated_errors_to_skills_rules(report)
                             st.session_state.review_reports = [report]
                             st.session_state.review_kdocs_view_url = view_url or None
                             st.success("审核完成！结果已返回系统，请在下方查看。")
@@ -5823,6 +5916,94 @@ def _streamlit_rerun():
         st.experimental_rerun()
 
 
+def _auto_append_repeated_errors_to_skills_rules(report: dict) -> None:
+    """
+    将“同一份审核报告内重复出现的错误”自动沉淀到 skills/rules（追加去重）。
+    目的：减少后续生成/审核中的重复错误与重复点位输出。
+    """
+    try:
+        points = report.get("audit_points") or []
+        if not points:
+            return
+        import re as _re
+
+        def _norm(s: str) -> str:
+            t = (s or "").strip().lower()
+            t = _re.sub(r"\s+", " ", t)
+            return t
+
+        counts = {}
+        examples = {}
+        for p in points:
+            cat = _norm(p.get("category") or "")
+            desc = _norm(p.get("description") or "")
+            if not desc:
+                continue
+            k = (cat, desc)
+            counts[k] = counts.get(k, 0) + 1
+            if k not in examples:
+                examples[k] = {
+                    "category": (p.get("category") or "").strip(),
+                    "description": (p.get("description") or "").strip(),
+                    "suggestion": (p.get("suggestion") or "").strip(),
+                    "regulation_ref": (p.get("regulation_ref") or "").strip(),
+                }
+
+        repeated = [(k, c) for k, c in counts.items() if c >= 2]
+        if not repeated:
+            return
+
+        # 避免一次报告重复写入多次（页面 rerun 会触发）
+        ss = st.session_state.setdefault("_auto_sr_added_keys", set())
+        new_items = []
+        for (cat, desc), c in sorted(repeated, key=lambda x: -x[1]):
+            key = f"{cat}|{desc}"
+            if key in ss:
+                continue
+            ss.add(key)
+            new_items.append((examples[(cat, desc)], c))
+
+        if not new_items:
+            return
+
+        lines = []
+        for ex, c in new_items[:12]:
+            desc0 = ex.get("description") or ""
+            sug0 = ex.get("suggestion") or ""
+            reg0 = ex.get("regulation_ref") or ""
+            cat0 = ex.get("category") or ""
+            lines.append(f"- 【重复出现 {c} 次】{cat0}：{desc0}")
+            if sug0:
+                lines.append(f"  - 建议：{sug0}")
+            if reg0:
+                lines.append(f"  - 依据：{reg0}")
+        block = "\n".join(lines).strip()
+        if not block:
+            return
+
+        skills_patch_text = (
+            "### FILE: .cursor/skills/rewrite-to-pass-audit-no-ai-tone/SKILL.md\n\n"
+            "## 自动沉淀：重复审核错误（系统追加）\n"
+            "以下条目来自近期审核报告中“同类问题重复出现”的自动汇总，用于后续生成/改写时优先修正。\n\n"
+            f"{block}\n"
+        )
+        rules_patch_text = (
+            "### FILE: .cursor/rules/document-authoring-and-audit.mdc\n\n"
+            "## 自动沉淀：重复审核错误（系统追加）\n"
+            "当同类问题在同一份报告内多次出现时，后续生成/改写应优先在文档中定位并一次性修正，避免重复遗漏。\n\n"
+            f"{block}\n"
+        )
+
+        apply_patch_updates(
+            skills_patch_text=skills_patch_text,
+            rules_patch_text=rules_patch_text,
+            workspace_root=_root,
+        )
+    except Exception:
+        # 自动沉淀不应阻塞主流程
+        return
+
+
 def _invalidate_audit_history_cache():
     """写入历史报告/纠正后调用，下次再读列表时重新查库。"""
     st.session_state["_audit_hist_reload"] = True
@@ -7066,6 +7247,1531 @@ def render_reports(reports: list):
     _render_download_buttons(reports)
 
 
+def render_draft_page():
+    """文档初稿生成：复用项目案例模板，按输入文档补齐系统功能差异，并写入 projects/project_cases 与 knowledge base。"""
+    st.header("✍️ 文档初稿生成")
+
+    if not _require_provider():
+        return
+
+    import shutil
+    import tempfile
+    import re
+
+    collection = st.session_state.get("collection_name", "regulations")
+    projects = _cached_list_projects(collection)
+
+    def _safe_out_path(*, base_path: str, out_path: Path) -> Path:
+        """
+        避免导出路径与 base 文件路径相同导致 SameFileError。
+        若冲突则在文件名中追加时间戳+短随机串。
+        """
+        try:
+            bp = Path(base_path).resolve()
+            op = out_path.resolve()
+            if str(bp).lower() == str(op).lower():
+                stem = out_path.stem
+                suf = out_path.suffix
+                tag = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                return out_path.with_name(f"{stem}_{tag}{suf}")
+        except Exception:
+            pass
+        return out_path
+
+    def _draft_show_patch_skipped_errors(patch_report, *, key_prefix: str = "") -> None:
+        """
+        就地 patch 导出后展示 skipped / errors。
+        注意：Streamlit 不允许 expander 嵌套，因此这里用 checkbox 做“默认收起、点击展开”。
+        """
+        if not isinstance(patch_report, dict):
+            return
+        applied = patch_report.get("applied") or []
+        changes = patch_report.get("changes") or []
+        skipped = patch_report.get("skipped") or []
+        errors = patch_report.get("errors") or []
+
+        # 基础文件未发生任何实际修改：给出明确提示
+        try:
+            _no_change = (len(applied) == 0) and (len(changes) == 0)
+        except Exception:
+            _no_change = False
+        if _no_change and (isinstance(skipped, list) and skipped) and not (isinstance(errors, list) and errors):
+            st.info("基础文件未做任何修改：本次 patch 的操作均未命中/被跳过（可展开 skipped 查看原因）。")
+        elif _no_change and not (isinstance(errors, list) and errors):
+            st.info("基础文件未做任何修改：本次未产生可执行的修改操作。")
+
+        # 概览行（高信噪）
+        if any([applied, changes, skipped, errors]):
+            try:
+                st.caption(
+                    f"patch 概览：applied={len(applied)} | changes={len(changes)} | skipped={len(skipped)} | errors={len(errors)}"
+                )
+            except Exception:
+                pass
+
+        if isinstance(skipped, list) and skipped:
+            if st.checkbox(
+                f"展开 skipped（未命中/跳过，共 {len(skipped)} 条）",
+                value=False,
+                key=f"{key_prefix}show_skipped",
+            ):
+                try:
+                    st.code(json.dumps(skipped, ensure_ascii=False, indent=2), language="json")
+                except Exception:
+                    st.json(skipped)
+
+        if isinstance(errors, list) and errors:
+            if st.checkbox(
+                f"展开 errors（执行错误，共 {len(errors)} 条）",
+                value=False,
+                key=f"{key_prefix}show_errors",
+            ):
+                try:
+                    st.code(json.dumps(errors, ensure_ascii=False, indent=2), language="json")
+                except Exception:
+                    st.json(errors)
+
+    def _render_draft_history() -> None:
+        st.markdown("---")
+        st.subheader("📜 历史生成记录（可下载 / 可重新生成）")
+        _notice = st.session_state.get("_draft_regen_notice")
+        if _notice:
+            st.info(_notice)
+        try:
+            draft_logs = get_operation_logs(op_type="draft_generate", collection=collection, limit=30)
+        except Exception:
+            draft_logs = []
+        if not draft_logs:
+            st.caption("暂无生成记录。")
+            return
+
+        for idx, rec in enumerate(draft_logs):
+            extra = rec.get("extra") or {}
+            out_files = extra.get("out_files") or []
+            fns = extra.get("generated_file_names") or list((extra.get("out_files_by_target") or {}).keys())
+            fn_line = "、".join(fns) if fns else "（无）"
+            # 标题中展示全部文件名（过长截断），避免只看到第一个文件名
+            _title_fn = fn_line if len(fn_line) <= 160 else (fn_line[:157] + "…")
+            title = f"{rec.get('created_at','')} | project_id={extra.get('project_id','')} | 生成文件：{_title_fn}"
+            with st.expander(title, expanded=(idx < 1)):
+                st.caption(extra.get("summary") or "")
+                st.caption(f"生成文件名：{fn_line}")
+                mid = (rec.get("model_info") or "").strip()
+                if mid:
+                    st.caption(f"调用模型：{mid}")
+                cols = st.columns([1, 3])
+                with cols[0]:
+                    if st.button("重新生成", key=f"draft_regen_{rec.get('id')}_{idx}"):
+                        # Streamlit 点击按钮本身就会触发 rerun；这里仅写入 session_state 作为“指令”。
+                        st.session_state["draft_regen_extra"] = dict(extra)
+                        st.session_state["_draft_regen_notice"] = (
+                            f"已触发历史记录重新生成：{rec.get('created_at','')} | project_id={extra.get('project_id','')}"
+                        )
+                with cols[1]:
+                    for of in out_files:
+                        p = Path(of)
+                        if p.is_file():
+                            st.download_button(
+                                f"下载：{p.name}",
+                                data=p.read_bytes(),
+                                file_name=p.name,
+                                mime="application/octet-stream",
+                                key=f"draft_hist_dl_{rec.get('id')}_{p.name}",
+                            )
+                        else:
+                            st.caption(f"文件不存在：{of}")
+
+                # 修改日志：有 changes 只展示 changes；没有 changes 则提示并展示 skipped（帮助定位未命中原因）
+                chg = extra.get("change_logs_by_file") or {}
+                skip_map = extra.get("patch_skipped_by_file") or {}
+                err_map = extra.get("patch_errors_by_file") or {}
+                if isinstance(skip_map, dict) and skip_map:
+                    st.caption("未命中/跳过的 patch 操作（skipped，按文件）")
+                    try:
+                        st.code(json.dumps(skip_map, ensure_ascii=False, indent=2), language="json")
+                    except Exception:
+                        st.json(skip_map)
+                if isinstance(err_map, dict) and err_map:
+                    st.caption("patch 执行错误（errors，按文件）")
+                    try:
+                        st.code(json.dumps(err_map, ensure_ascii=False, indent=2), language="json")
+                    except Exception:
+                        st.json(err_map)
+                if isinstance(chg, dict) and chg:
+                    st.caption("修改日志（就地修改，按文件；改前/改后）")
+                    try:
+                        st.code(json.dumps(chg, ensure_ascii=False, indent=2), language="json")
+                    except Exception:
+                        st.json(chg)
+                else:
+                    rep_candidates = [x for x in out_files if isinstance(x, str) and x.endswith(".patch.report.json")]
+                    if rep_candidates:
+                        st.caption("修改日志（就地修改执行报告）")
+                        for rp in rep_candidates[:5]:
+                            try:
+                                data = Path(rp).read_text(encoding="utf-8")
+                                obj = json.loads(data)
+                                if not isinstance(obj, dict):
+                                    continue
+                                changes = obj.get("changes") or []
+                                skipped = obj.get("skipped") or []
+                                if not (changes or skipped):
+                                    continue
+                                st.markdown(f"**{Path(rp).name}**")
+                                if isinstance(changes, list) and changes:
+                                    st.caption(f"changes：{len(changes)} 条")
+                                    st.code(json.dumps(changes, ensure_ascii=False, indent=2), language="json")
+                                else:
+                                    st.caption("changes：0 条（本次没有实际写入变更）。将展示 skipped 供定位原因。")
+                                    if isinstance(skipped, list) and skipped:
+                                        st.caption(f"skipped：{len(skipped)} 条")
+                                        st.code(json.dumps(skipped, ensure_ascii=False, indent=2), language="json")
+                            except Exception:
+                                continue
+
+    st.markdown(
+        "依据训练知识库中的“项目案例文档”生成新项目初稿："
+        "以模板案例的章节/编号/法规部分为底，"
+        "仅在系统功能相关章节按输入文档自动替换/补全。"
+    )
+
+    with st.expander("1) Skills / Rules 增量补丁（可选）", expanded=False):
+        st.caption("文件块格式：每个块以 `### FILE: <相对路径> [@replace]` 开头；下一个 `### FILE:` 之前为内容。")
+        st.caption("默认合并去重（按段落）；可用 `@replace` 覆盖同一路径文件。")
+        skills_patch_text = st.text_area(
+            "skills_patch_text",
+            height=160,
+            placeholder="### FILE: .cursor/skills/project-grounded-doc-writing/SKILL.md\n（粘贴新增/替换内容）",
+            key="draft_skills_patch",
+        )
+        rules_patch_text = st.text_area(
+            "rules_patch_text",
+            height=160,
+            placeholder="### FILE: .cursor/rules/document-authoring-and-audit.mdc\n（粘贴新增/替换内容）",
+            key="draft_rules_patch",
+        )
+
+    st.markdown("---")
+    st.subheader("🛠️ 生成设置")
+    draft_strategy_label = st.selectbox(
+        "生成策略（新项目复用 vs 注册变更）",
+        [
+            "注册变更：对照参考在基础文件上自动识别新增/细化/删除（保留版式与未涉及原文）",
+            "新项目复用：按参考文件全量更新内容（保留格式章节不变）",
+        ],
+        index=0,
+        key="draft_strategy",
+        help="注册变更：以基础文件为底稿，对照参考逐项判断需增补、改写或删除的内容，并生成可定位修改；不以“改动越少越好”为目标，但避免无关的整篇替换。新项目复用：可变内容整体对齐参考，避免只改一小段仍残留旧项目表述。",
+    )
+    draft_strategy = "change" if draft_strategy_label.startswith("注册变更") else "reuse"
+
+    _draft_author_role_labels = [
+        "（未指定）通用技术编写",
+        "产品经理",
+        "项目经理",
+        "风险经理",
+        "研发经理",
+        "UI设计师",
+        "测试工程师",
+        "配置管理员",
+        "注册工程师",
+        "生产专员",
+    ]
+    _draft_author_role_keys = ["", "pm", "pjm", "rm", "rdm", "ui", "qa", "cm", "ra", "prod"]
+    _draft_ar_i = st.selectbox(
+        "编写人员身份（自动调整提示词视角与侧重点）",
+        list(range(len(_draft_author_role_labels))),
+        format_func=lambda i: _draft_author_role_labels[int(i)],
+        index=0,
+        key="draft_author_role_idx",
+        help="选择后会在生成提示词中注入对应身份的写作要求；不替代 skills/rules 与项目维度硬约束。",
+    )
+    draft_author_role = _draft_author_role_keys[int(_draft_ar_i)]
+    # 多文件按目标身份：先初始化，等 2.1 目标文件名确定后再渲染配置区
+    author_role_map = {}
+
+    cases = _cached_list_project_cases(collection)
+    if not cases:
+        st.warning("当前知识库下没有项目案例。请先在「① 法规训练 & 生成审核点」→ 上传项目案例。")
+        _render_draft_history()
+        return
+
+    # 模板选择
+    case_labels = []
+    case_by_idx = []
+    for c in cases:
+        cid = int(c.get("id"))
+        case_labels.append(f"ID:{cid} | {_format_case_option(c)}")
+        case_by_idx.append((cid, c))
+    base_case_idx = st.selectbox(
+        "2) 选择模板项目案例（用于生成格式/法规部分）",
+        list(range(len(case_by_idx))),
+        format_func=lambda i: case_labels[int(i)],
+        key="draft_base_case_idx",
+    )
+    base_case_id, base_case = case_by_idx[int(base_case_idx)]
+
+    # 案例文件名列表：支持搜索下拉选择（可多选）
+    try:
+        case_file_names = get_project_case_file_names(collection, base_case_id) or []
+    except Exception:
+        case_file_names = []
+    if case_file_names:
+        selected_template_files = st.multiselect(
+            "2.1) 选择要生成的文件名称（可搜索，多选；留空=生成该案例下全部文件）",
+            options=case_file_names,
+            default=[],
+            key="draft_template_files",
+        )
+    else:
+        selected_template_files = []
+        st.caption("该案例在知识库中尚未关联到具体文件名（可能未完成训练或 case_id 未写入）。将尝试生成全部可用内容。")
+
+    # 多文件：允许为每个目标文件选择不同身份（同一套参考文件，共同属于同一 project_id 文件集）
+    _targets_for_role = list(selected_template_files) if selected_template_files else list(case_file_names or [])
+    if _targets_for_role:
+        with st.expander("按目标文件设置编写人员身份（可选）", expanded=False):
+            st.caption("未单独设置的目标文件将使用上方的「编写人员身份」默认值。")
+            import hashlib as _hashlib
+
+            for _fn in _targets_for_role:
+                if _fn not in (case_file_names or []):
+                    continue
+                _hk = _hashlib.md5((_fn + "role").encode("utf-8")).hexdigest()[:12]
+                _i = st.selectbox(
+                    f"{_fn} → 编写人员身份",
+                    list(range(len(_draft_author_role_labels))),
+                    format_func=lambda i: _draft_author_role_labels[int(i)],
+                    index=int(st.session_state.get(f"draft_role_pf_{_hk}", 0) or 0),
+                    key=f"draft_role_pf_{_hk}",
+                )
+                rk = _draft_author_role_keys[int(_i)] if int(_i) < len(_draft_author_role_keys) else ""
+                if rk:
+                    author_role_map[_fn] = rk
+
+    _cfg_for_per_file = list(selected_template_files) if selected_template_files else list(case_file_names or [])
+    if case_file_names and _cfg_for_per_file:
+        with st.expander("2.2) 按生成文件配置 Skills / Rules（可选，保存到数据库）", expanded=False):
+            st.caption(
+                "为每个「待生成文件名」单独配置；绑定当前 **2）模板案例** 与 **知识库**。"
+                "生成时与「1) 全局 Skills/Rules 增量补丁」叠加注入提示词。"
+                "此处保存**仅写入数据库**，不会自动修改仓库里的 `.cursor/skills` / `.cursor/rules` 文件（除非你在 1) 中使用 `### FILE:` 块显式落盘）。"
+            )
+            import hashlib as _hashlib
+
+            for _fn in _cfg_for_per_file:
+                if _fn not in (case_file_names or []):
+                    continue
+                st.markdown(f"**{_fn}**")
+                _row_pf = None
+                try:
+                    _row_pf = get_draft_file_skills_rules(collection, base_case_id, _fn)
+                except Exception:
+                    _row_pf = None
+                _sk0 = (_row_pf or {}).get("skills_patch") or ""
+                _ru0 = (_row_pf or {}).get("rules_patch") or ""
+                _hk = _hashlib.md5(_fn.encode("utf-8")).hexdigest()[:12]
+                _psk = st.text_area(
+                    "本文件 skills（可写要点说明，或 `### FILE:` 块；仅注入本文件生成提示词）",
+                    value=_sk0,
+                    height=120,
+                    key=f"draft_pfs_sk_{base_case_id}_{_hk}",
+                )
+                _pru = st.text_area(
+                    "本文件 rules",
+                    value=_ru0,
+                    height=120,
+                    key=f"draft_pfs_ru_{base_case_id}_{_hk}",
+                )
+                _bc1, _bc2 = st.columns(2)
+                with _bc1:
+                    if st.button("保存本文件配置", key=f"draft_pfs_save_{base_case_id}_{_hk}"):
+                        try:
+                            upsert_draft_file_skills_rules(collection, int(base_case_id), _fn, _psk, _pru)
+                            st.success(f"已保存：{_fn}")
+                            _streamlit_rerun()
+                        except Exception as _e:
+                            st.error(f"保存失败：{_e}")
+                with _bc2:
+                    if st.button("清除本文件配置", key=f"draft_pfs_del_{base_case_id}_{_hk}"):
+                        try:
+                            delete_draft_file_skills_rules(collection, int(base_case_id), _fn)
+                            st.session_state.pop(f"draft_pfs_sk_{base_case_id}_{_hk}", None)
+                            st.session_state.pop(f"draft_pfs_ru_{base_case_id}_{_hk}", None)
+                            st.success("已清除")
+                            _streamlit_rerun()
+                        except Exception as _e:
+                            st.error(f"清除失败：{_e}")
+                st.markdown("---")
+
+    # 语言
+    base_lang_val = (base_case.get("document_language") or "").strip()
+    base_lang_label = DOC_LANG_VALUE_TO_LABEL.get(base_lang_val, "不指定")
+    doc_lang_val = DOC_LANG_LABEL_TO_VALUE.get(
+        st.selectbox(
+            "3) 生成文档语言",
+            DOC_LANG_OPTIONS,
+            index=DOC_LANG_OPTIONS.index(base_lang_label) if base_lang_label in DOC_LANG_OPTIONS else 0,
+            key="draft_document_lang",
+        ),
+        base_lang_val,
+    )
+
+    dims = _cached_dimension_options()
+    countries = dims.get("registration_countries", ["中国", "美国", "欧盟"]) or ["中国", "美国", "欧盟"]
+    forms = dims.get("project_forms", ["Web", "APP", "PC"]) or ["Web", "APP", "PC"]
+
+    registration_country_default = base_case.get("registration_country") or (countries[0] if countries else "")
+    registration_country = st.selectbox(
+        "4) 注册国家",
+        countries,
+        index=countries.index(registration_country_default) if registration_country_default in countries else 0,
+        key="draft_reg_country",
+    )
+
+    registration_type_default = base_case.get("registration_type") or (REGISTRATION_TYPES[0] if REGISTRATION_TYPES else "")
+    registration_type = st.selectbox(
+        "5) 注册类别",
+        REGISTRATION_TYPES,
+        index=REGISTRATION_TYPES.index(registration_type_default) if registration_type_default in REGISTRATION_TYPES else 0,
+        key="draft_reg_type",
+    )
+
+    registration_component_default = base_case.get("registration_component") or (REGISTRATION_COMPONENTS[0] if REGISTRATION_COMPONENTS else "")
+    registration_component = st.selectbox(
+        "6) 注册组成",
+        REGISTRATION_COMPONENTS,
+        index=REGISTRATION_COMPONENTS.index(registration_component_default) if registration_component_default in REGISTRATION_COMPONENTS else 0,
+        key="draft_reg_component",
+    )
+
+    project_form_default = base_case.get("project_form") or (forms[0] if forms else "")
+    project_form = st.selectbox(
+        "7) 项目形态",
+        forms,
+        index=forms.index(project_form_default) if project_form_default in forms else 0,
+        key="draft_project_form",
+    )
+
+    st.caption(f"适用范围（scope_of_application）：{(base_case.get('scope_of_application') or '').strip() or '（模板为空/将按生成过程保持空或尽量保持）'}")
+
+    input_files = st.file_uploader(
+        "8) 上传输入/参考文件（用于提炼系统功能与基本信息，同时作为生成参考；支持 Word/Excel/PDF，多文件）",
+        type=["docx", "doc", "pdf", "xlsx", "xls"],
+        accept_multiple_files=True,
+        key="draft_input_upload",
+    )
+
+    # 可选：上传已有文件作为基底（继续编写）
+    st.markdown("---")
+    st.subheader("📎 上传已有文件（多文件）")
+    st.caption(
+        "基础文件（Base）：作为对应目标文档的基底修改；可多份上传。"
+        "开启「自动分配」后，由 AI 判断每个目标模板使用哪份 Base、以及各参考文件内容主要写入哪份文档；"
+        "关闭则需手动将每份 Base 绑定到目标文件名。"
+    )
+
+    base_target_options = selected_template_files or []
+    if not base_target_options and case_file_names:
+        base_target_options = case_file_names[:]
+
+    base_files = st.file_uploader(
+        "基础文件（Base，可多选）",
+        type=["docx", "doc", "pdf", "xlsx", "xls", "txt", "md"],
+        accept_multiple_files=True,
+        key="draft_existing_base_files",
+    )
+    multi_base_auto = st.checkbox(
+        "多份基础/多份参考时由 AI 自动分配（推荐：自动匹配改哪几份 Base、参考内容如何拆分）",
+        value=True,
+        key="draft_multi_base_auto",
+        help="开启：无需逐份绑定；系统会为每个待生成目标选择基础文件并拆分参考摘要。关闭：使用下方手动绑定。",
+    )
+    docx_track_changes = st.checkbox(
+        "就地修改导出 Word 时使用修订标记（插入/删除，便于在 Word 中审阅修订）",
+        value=True,
+        key="draft_docx_track_changes",
+        help="仅对就地 patch 且输出为 .docx 时生效；表格内替换等仍可能为直接改写。",
+    )
+    inplace_mode = st.checkbox(
+        "✅ 就地修改（保留基础文件格式，推荐用于注册递交版式）",
+        value=True,
+        key="draft_inplace_mode",
+        help="开启后：若目标绑定了 Base（Word/Excel），AI 输出可执行 patch，在原文档上按锚点执行替换/插入/删除，尽量保留样式与结构；修改范围由“参考 vs 基础”的差异决定，而非刻意压少改动量。",
+    )
+
+    base_bindings = {}
+    if base_files and not multi_base_auto:
+        if not base_target_options:
+            st.warning("请先在上方选择要生成的目标文件名（2.1 多选），再绑定基础文件。")
+        else:
+            st.markdown("**基础文件绑定（Base → 目标文件名）**")
+            for i, bf in enumerate(base_files):
+                # 尝试按文件名自动匹配（精确匹配），失败则默认第一个
+                default_target = base_target_options[0]
+                if bf and bf.name in base_target_options:
+                    default_target = bf.name
+                sel = st.selectbox(
+                    f"基础文件：{bf.name} 绑定到目标文件名",
+                    options=base_target_options,
+                    index=base_target_options.index(default_target) if default_target in base_target_options else 0,
+                    key=f"draft_base_bind_{i}_{bf.name}",
+                )
+                if sel:
+                    if sel in base_bindings:
+                        st.warning(f"目标「{sel}」已绑定过基础文件，将被本次「{bf.name}」覆盖（以后者为准）。")
+                    base_bindings[sel] = bf
+    elif base_files and multi_base_auto:
+        st.caption(f"已上传 {len(base_files)} 份基础文件，将走自动分配（无需逐项绑定）。")
+
+    st.markdown("---")
+    st.subheader("🧾 项目选择（可选：用已有项目 / 新建项目）")
+    proj_mode = st.radio(
+        "项目模式",
+        ["使用已有项目（不新建）", "新建项目"],
+        index=0 if projects else 1,
+        key="draft_project_mode",
+        horizontal=True,
+    )
+    _draft_mode_track = "_draft_proj_mode_track"
+    if st.session_state.get(_draft_mode_track) != proj_mode:
+        st.session_state["draft_persist_project_fields"] = False if proj_mode.startswith("使用已有") else True
+        st.session_state[_draft_mode_track] = proj_mode
+    elif "draft_persist_project_fields" not in st.session_state:
+        st.session_state["draft_persist_project_fields"] = False if proj_mode.startswith("使用已有") else True
+    persist_project_fields = st.checkbox(
+        "将本页填写的项目字段写回项目（保持与②数据互通）",
+        key="draft_persist_project_fields",
+    )
+
+    selected_project_id = None
+    selected_project = None
+    if proj_mode.startswith("使用已有"):
+        if not projects:
+            st.warning("当前知识库下暂无项目，请先在「② 项目与专属资料」创建项目，或切换为「新建项目」。")
+        else:
+            proj_names = [p["name"] for p in projects]
+            sel_name = st.selectbox("选择已有项目", proj_names, key="draft_existing_proj_name")
+            selected_project = next((p for p in projects if p.get("name") == sel_name), None)
+            if selected_project:
+                selected_project_id = int(selected_project["id"])
+    st.caption("项目字段与「② 项目与专属资料」一致；本处可临时修改用于本次生成。")
+
+    # 案例库写入策略：已有项目=默认不写入案例库，避免把“待做项目”混入“已完成案例项目”
+    save_as_case_default = False if proj_mode.startswith("使用已有") else True
+    save_as_case = st.checkbox(
+        "将本次生成结果写入案例库（project_cases）",
+        value=save_as_case_default,
+        key="draft_save_as_case",
+        help="建议：仅当该项目文档已达到可作为模板复用的“完成态”时再勾选；日常编写/迭代请勿写入案例库。",
+    )
+
+    # 字段默认值：已有项目优先，否则空/模板范围
+    _d = selected_project or {}
+    p_name = st.text_input("项目名称", value=_d.get("name", "") or "", key="draft_proj_name")
+    p_code = st.text_input("项目编号（可选）", value=_d.get("project_code", "") or "", placeholder="例如：OXGWIS（用于文件名等前缀替换）", key="draft_proj_code")
+    p_name_en = st.text_input("项目名称（英文）", value=_d.get("name_en", "") or "", placeholder="Project name in English", key="draft_proj_name_en")
+    p_product = st.text_input("产品名称（可选）", value=_d.get("product_name", "") or "", placeholder="与项目名称一并加入审核点、一致性核对", key="draft_proj_product")
+    p_product_en = st.text_input("产品名称（英文）", value=_d.get("product_name_en", "") or "", placeholder="Product name in English", key="draft_proj_product_en")
+    p_model = st.text_input("型号（可选，Model）", value=_d.get("model", "") or "", placeholder="中英文均可；字段名称不区分大小写，取值区分大小写、精确匹配（含空格）", key="draft_proj_model")
+    p_model_en = st.text_input("型号（英文，可选）", value=_d.get("model_en", "") or "", placeholder="Model in English", key="draft_proj_model_en")
+    p_country_en = st.text_input("注册国家（英文）", value=_d.get("registration_country_en", "") or "", placeholder="e.g. China, USA", key="draft_proj_country_en")
+    p_scope_default = (_d.get("scope_of_application") or "").strip() if _d else (base_case.get("scope_of_application") or "").strip()
+    p_scope = st.text_area(
+        "产品适用范围（可选）",
+        value=p_scope_default,
+        placeholder="审核时要求文档描述内容不超出此范围；默认带入模板案例或已有项目的适用范围，可修改",
+        height=80,
+        key="draft_proj_scope",
+    )
+
+    st.markdown("---")
+    new_case_name = st.text_input("新案例名称（可选，留空则用模板案例名或提取结果拼接）", value="", key="draft_new_case_name")
+    project_key = st.text_input("project_key（可选，留空沿用模板）", value="", key="draft_project_key")
+
+    def _replace_prefix_for_key(name: str, new_code: str) -> str:
+        fn = (name or "").strip()
+        code = (new_code or "").strip()
+        if not fn or not code:
+            return fn
+        m = re.match(r"^([A-Za-z0-9]+)-([A-Za-z]{2,10}-\d{3}.*)$", fn)
+        if not m:
+            return fn
+        return f"{code}-{m.group(2)}"
+
+    st.markdown("---")
+    start = st.button("🚀 开始生成文档初稿（写入 DB 与 knowledge base）", key="draft_run")
+    generator = DocumentDraftGenerator(collection)
+
+    # ─────────────────────────────────────────────────────────────
+    # 后台生成任务：避免页面控件变化导致任务被 rerun 中断
+    # ─────────────────────────────────────────────────────────────
+    def _get_draft_executor():
+        import concurrent.futures
+
+        ex = st.session_state.get("_draft_executor")
+        if ex is None:
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            st.session_state["_draft_executor"] = ex
+        return ex
+
+    def _draft_job_state():
+        st.session_state.setdefault(
+            "_draft_job",
+            {
+                "running": False,
+                "done": False,
+                "error": "",
+                "progress": 0.0,
+                "progress_msg": "",
+                "future": None,
+                "tmp_dir": "",
+                "result_payload": None,
+            },
+        )
+        return st.session_state["_draft_job"]
+
+    def _submit_draft_job(payload: dict) -> None:
+        import concurrent.futures
+        import threading
+        import traceback
+
+        job = _draft_job_state()
+        if job.get("running"):
+            return
+        lock = threading.Lock()
+        job["lock"] = lock
+        job["running"] = True
+        job["done"] = False
+        job["error"] = ""
+        job["progress"] = 0.0
+        job["progress_msg"] = "准备开始…"
+        job["result_payload"] = None
+        job["traceback"] = ""
+        job["job_id"] = uuid.uuid4().hex[:12]
+        job["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 写入操作记录：后台任务已提交
+        try:
+            add_operation_log(
+                op_type="draft_generate_job",
+                collection=collection,
+                file_name="",
+                source="draft_page_submit",
+                extra={
+                    "job_id": job.get("job_id"),
+                    "started_at": job.get("started_at"),
+                    "payload": {
+                        "project_id": payload.get("project_id"),
+                        "base_case_id": payload.get("base_case_id"),
+                        "template_file_names": payload.get("template_file_names"),
+                        "inplace_patch": payload.get("inplace_patch"),
+                        "draft_strategy": payload.get("draft_strategy"),
+                        "document_language": payload.get("document_language"),
+                        "registration_country": payload.get("registration_country"),
+                        "registration_type": payload.get("registration_type"),
+                        "registration_component": payload.get("registration_component"),
+                        "project_form": payload.get("project_form"),
+                    },
+                },
+                model_info=get_current_model_info(),
+            )
+        except Exception:
+            pass
+
+        def _run() -> dict:
+            # 在后台线程运行：不要调用 streamlit UI API
+            def _on_progress(msg: str, frac: float) -> None:
+                try:
+                    f = float(frac)
+                except Exception:
+                    f = 0.0
+                f = max(0.0, min(1.0, f))
+                with lock:
+                    job["progress"] = f
+                    job["progress_msg"] = str(msg or "")
+
+            res = generator.generate(**payload, progress_cb=_on_progress)
+
+            # 仅返回必要信息，供主线程渲染下载/历史
+            return {"res": res, "payload": payload}
+
+        ex = _get_draft_executor()
+        fut = ex.submit(_run)
+        job["future"] = fut
+
+    # 若已有后台任务：展示进度，并在完成后回填结果
+    job = _draft_job_state()
+    fut = job.get("future")
+    if fut is not None and job.get("running"):
+        import concurrent.futures
+
+        with st.expander("⏳ 正在生成（后台任务）", expanded=True):
+            try:
+                p = float(job.get("progress") or 0.0)
+            except Exception:
+                p = 0.0
+            st.progress(max(0.0, min(1.0, p)))
+            st.caption(job.get("progress_msg") or "处理中…")
+            if st.button("取消本次生成（尽力取消）", key="draft_cancel_job"):
+                try:
+                    fut.cancel()
+                    job["error"] = "已请求取消（若任务已开始执行可能无法立即停止）。"
+                except Exception:
+                    pass
+
+        done = False
+        try:
+            done = fut.done()
+        except Exception:
+            done = False
+        if done:
+            try:
+                out = fut.result()
+                job["result_payload"] = out
+                job["done"] = True
+            except Exception as e:
+                job["error"] = str(e)
+                try:
+                    job["traceback"] = traceback.format_exc()
+                except Exception:
+                    job["traceback"] = ""
+            finally:
+                job["running"] = False
+                job["future"] = None
+
+            # 写入操作记录：后台任务结束（成功/失败/取消）
+            try:
+                add_operation_log(
+                    op_type="draft_generate_job",
+                    collection=collection,
+                    file_name="",
+                    source="draft_page_done",
+                    extra={
+                        "job_id": job.get("job_id"),
+                        "started_at": job.get("started_at"),
+                        "done": bool(job.get("done")),
+                        "error": (job.get("error") or "").strip() or None,
+                        "traceback": (job.get("traceback") or "").strip() or None,
+                        "progress_msg": job.get("progress_msg"),
+                    },
+                    model_info=get_current_model_info(),
+                )
+            except Exception:
+                pass
+
+        # 自动刷新页面以更新进度/完成状态
+        if job.get("running"):
+            try:
+                import time as _time
+
+                _time.sleep(0.25)
+            except Exception:
+                pass
+            _streamlit_rerun()
+
+    # 保留本次生成结果：避免下载/页面重跑后“页面被清空看不到结果”
+    last = st.session_state.get("_draft_last_result")
+    if last:
+        # 默认展开：勾选控件会触发 rerun，若折叠用户会误以为“内容消失”
+        with st.expander("✅ 上一次生成结果（保留展示，不会因下载清空）", expanded=True):
+            st.caption(last.get("summary") or "")
+            if st.button("清空上一次结果", key="draft_clear_last"):
+                st.session_state.pop("_draft_last_result", None)
+                _streamlit_rerun()
+            for it in last.get("items", []):
+                fn = it.get("file_name") or ""
+                st.markdown(f"**文件：{fn}**")
+                _pfsr = it.get("per_file_skills_rules")
+                if _pfsr is True:
+                    st.caption("单文件 Skills/Rules：已从数据库注入本次提示词（优先生效）。")
+                elif _pfsr is False:
+                    st.caption("单文件 Skills/Rules：未检测到该文件名的数据库配置，或内容为空。")
+                _cl = it.get("change_log")
+                if _cl:
+                    st.caption("修改日志（就地修改，改前/改后）")
+                    try:
+                        st.code(
+                            json.dumps(_cl, ensure_ascii=False, indent=2),
+                            language="json",
+                        )
+                    except Exception:
+                        st.json(_cl)
+                _draft_show_patch_skipped_errors(
+                    {
+                        "applied": [],
+                        "changes": _cl or [],
+                        "skipped": it.get("patch_skipped") or [],
+                        "errors": it.get("patch_errors") or [],
+                    },
+                    key_prefix=f"draft_last_{fn}_",
+                )
+                for dl in it.get("downloads", []):
+                    p = Path(dl)
+                    if p.is_file():
+                        st.download_button(
+                            f"下载：{p.name}",
+                            data=p.read_bytes(),
+                            file_name=p.name,
+                            mime="application/octet-stream",
+                            key=f"draft_last_dl_{fn}_{p.name}",
+                        )
+                    else:
+                        st.caption(f"文件不存在：{dl}")
+            st.markdown("---")
+
+    # 若来自历史记录“重新生成”，允许不上传输入文件：复用项目中已保存的 basic_info/system_functionality
+    regen_extra = st.session_state.pop("draft_regen_extra", None)
+    if regen_extra:
+        try:
+            st.session_state["_draft_regen_notice"] = "正在执行历史记录重新生成…（进度见下方进度条）"
+            out_map = regen_extra.get("out_files_by_target") or {}
+            out_files_hint = regen_extra.get("out_files") or []
+            # out_map: target_file_name -> existing artifact path (used as Base)
+            existing_base_files_regen = {k: v for k, v in out_map.items() if k and v}
+            # 重新生成必须复用原记录选项：
+            # - 优先用 extra 中显式保存的 inplace_patch/inplace_mode
+            # - 若历史记录未保存该字段，但原记录产物中存在 patch.json / patch.report.json，则推断为就地修改
+            inplace_mode_regen = bool(regen_extra.get("inplace_patch") or regen_extra.get("inplace_mode") or False)
+            if not inplace_mode_regen:
+                try:
+                    _has_patch = any(
+                        isinstance(x, str) and (x.endswith(".patch.json") or x.endswith(".patch.report.json"))
+                        for x in (out_files_hint or [])
+                    )
+                    inplace_mode_regen = bool(_has_patch)
+                except Exception:
+                    pass
+            st.markdown("### 生成进度（历史记录重新生成）")
+            prog = st.progress(0.0)
+            status_box = st.empty()
+            status_box.caption("准备开始…")
+
+            def _on_progress_regen(msg: str, frac: float) -> None:
+                try:
+                    f = float(frac)
+                except Exception:
+                    f = 0.0
+                f = max(0.0, min(1.0, f))
+                prog.progress(f)
+                status_box.caption(msg or "处理中…")
+
+            with st.spinner("正在按历史记录重新生成…"):
+                res = generator.generate(
+                    base_case_id=int(regen_extra.get("base_case_id") or base_case_id),
+                    template_file_names=(regen_extra.get("template_file_names") or None),
+                    project_id=int(regen_extra.get("project_id")) if regen_extra.get("project_id") else None,
+                    existing_base_files=existing_base_files_regen or None,
+                    input_files=[],
+                    document_language=str(regen_extra.get("document_language") or doc_lang_val),
+                    registration_country=str(regen_extra.get("registration_country") or registration_country),
+                    registration_type=str(regen_extra.get("registration_type") or registration_type),
+                    registration_component=str(regen_extra.get("registration_component") or registration_component),
+                    project_form=str(regen_extra.get("project_form") or project_form),
+                    project_name=str(regen_extra.get("project_name") or ""),
+                    project_code=str(regen_extra.get("project_code") or ""),
+                    project_name_en=str(regen_extra.get("project_name_en") or ""),
+                    product_name=str(regen_extra.get("product_name") or ""),
+                    product_name_en=str(regen_extra.get("product_name_en") or ""),
+                    model=str(regen_extra.get("model") or ""),
+                    model_en=str(regen_extra.get("model_en") or ""),
+                    registration_country_en=str(regen_extra.get("registration_country_en") or ""),
+                    scope_of_application_override=str(regen_extra.get("scope_of_application") or "") or None,
+                    persist_project_fields=False,
+                    new_case_name=str(regen_extra.get("new_case_name") or ""),
+                    project_key=str(regen_extra.get("project_key") or ""),
+                    skills_patch_text="",
+                    rules_patch_text="",
+                    provider=st.session_state.get("current_provider"),
+                    inplace_patch=bool(inplace_mode_regen),
+                    # 历史记录“重新生成”属于复跑，不应污染案例库；也不应新建 project_case
+                    save_as_case=False,
+                    progress_cb=_on_progress_regen,
+                    draft_strategy=str(regen_extra.get("draft_strategy") or "change"),
+                    author_role=str(
+                        regen_extra.get("author_role")
+                        or _draft_author_role_keys[
+                            max(
+                                0,
+                                min(
+                                    int(st.session_state.get("draft_author_role_idx", 0) or 0),
+                                    len(_draft_author_role_keys) - 1,
+                                ),
+                            )
+                        ]
+                    ),
+                    author_role_map=(regen_extra.get("author_role_map") or None),
+                )
+
+            # 重新生成也落盘导出，并写入历史记录：便于刷新后查看/下载
+            out_files_for_log = []
+            out_files_by_target = {}
+            last_items = []
+            change_logs_by_file = {}
+            patch_skipped_by_file = {}
+            patch_errors_by_file = {}
+            out_prefix = f"{res.project_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            _pf_map = getattr(res, "per_file_skills_rules_applied", None) or {}
+            for fn, txt in (res.generated_files or {}).items():
+                downloads = []
+                change_log_obj = None
+                patch_report_obj = None
+
+                base_path = existing_base_files_regen.get(fn) if isinstance(existing_base_files_regen, dict) else None
+                if base_path:
+                    base_suffix = Path(base_path).suffix.lower()
+                    # 输出文件后缀必须与基础文件一致（Excel Base 就导出 Excel；避免 .xlsx.docx 这类错误）
+                    out_name = fn
+                    if base_suffix:
+                        out_name = Path(out_name).stem + base_suffix
+                    drafts_dir = settings.uploads_path / "draft_outputs"
+                    drafts_dir.mkdir(parents=True, exist_ok=True)
+                    out_path = drafts_dir / f"{out_prefix}_{out_name}"
+                    meta = {
+                        "project_id": res.project_id,
+                        "project_case_id": None,
+                        "base_file": Path(base_path).name,
+                        "change_summary": "按历史记录重新生成（基于基础文件按规则补写/修订；对照参考识别新增·细化·删除）"
+                        if inplace_mode_regen
+                        else "按历史记录重新生成（基于基础文件按规则补写/修订）",
+                        "generated_by": "aicheckword 文档初稿生成（历史记录重新生成）",
+                    }
+                    saved = None
+                    patch_json = (getattr(res, "generated_patches", {}) or {}).get(fn) if inplace_mode_regen else None
+                    if inplace_mode_regen and base_suffix == ".docx" and (patch_json or "").strip():
+                        from src.core.draft_export import export_docx_inplace_patch
+
+                        saved, patch_report = export_docx_inplace_patch(
+                            base_file_path=base_path,
+                            out_path=str(out_path),
+                            patch_json=patch_json,
+                            meta=meta,
+                            track_changes=bool(st.session_state.get("draft_docx_track_changes", True)),
+                        )
+                        patch_report_obj = patch_report
+                        change_log_obj = patch_report.get("changes") if isinstance(patch_report, dict) else None
+                        patch_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.json")
+                        patch_path.write_text(patch_json, encoding="utf-8")
+                        rep_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.report.json")
+                        rep_path.write_text(json.dumps(patch_report, ensure_ascii=False, indent=2), encoding="utf-8")
+                        out_files_for_log.append(str(patch_path))
+                        out_files_for_log.append(str(rep_path))
+                        downloads.extend([saved, str(patch_path), str(rep_path)])
+                        try:
+                            add_operation_log(
+                                op_type="draft_export",
+                                collection=collection,
+                                file_name=fn,
+                                source="draft_page_regen_export",
+                                extra={
+                                    "project_id": res.project_id,
+                                    "project_case_id": None,
+                                    "base_file": str(base_path),
+                                    "out_file": str(saved),
+                                    "suffix": base_suffix,
+                                    "inplace_patch": True,
+                                    "patch_counts": {
+                                        "applied": len((patch_report or {}).get("applied") or []) if isinstance(patch_report, dict) else None,
+                                        "changes": len((patch_report or {}).get("changes") or []) if isinstance(patch_report, dict) else None,
+                                        "skipped": len((patch_report or {}).get("skipped") or []) if isinstance(patch_report, dict) else None,
+                                        "errors": len((patch_report or {}).get("errors") or []) if isinstance(patch_report, dict) else None,
+                                    },
+                                    "no_change": (
+                                        isinstance(patch_report, dict)
+                                        and len((patch_report.get("applied") or [])) == 0
+                                        and len((patch_report.get("changes") or [])) == 0
+                                    ),
+                                },
+                                model_info=get_current_model_info(),
+                            )
+                        except Exception:
+                            pass
+                    elif inplace_mode_regen and base_suffix in (".xlsx", ".xls") and (patch_json or "").strip():
+                        from src.core.draft_export import export_xlsx_inplace_patch
+
+                        saved, patch_report = export_xlsx_inplace_patch(
+                            base_file_path=base_path,
+                            out_path=str(out_path),
+                            patch_json=patch_json,
+                            meta=meta,
+                        )
+                        patch_report_obj = patch_report
+                        change_log_obj = patch_report.get("changes") if isinstance(patch_report, dict) else None
+                        patch_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.json")
+                        patch_path.write_text(patch_json, encoding="utf-8")
+                        rep_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.report.json")
+                        rep_path.write_text(json.dumps(patch_report, ensure_ascii=False, indent=2), encoding="utf-8")
+                        out_files_for_log.append(str(patch_path))
+                        out_files_for_log.append(str(rep_path))
+                        downloads.extend([saved, str(patch_path), str(rep_path)])
+                        try:
+                            add_operation_log(
+                                op_type="draft_export",
+                                collection=collection,
+                                file_name=fn,
+                                source="draft_page_regen_export",
+                                extra={
+                                    "project_id": res.project_id,
+                                    "project_case_id": None,
+                                    "base_file": str(base_path),
+                                    "out_file": str(saved),
+                                    "suffix": base_suffix,
+                                    "inplace_patch": True,
+                                    "patch_counts": {
+                                        "applied": len((patch_report or {}).get("applied") or []) if isinstance(patch_report, dict) else None,
+                                        "changes": len((patch_report or {}).get("changes") or []) if isinstance(patch_report, dict) else None,
+                                        "skipped": len((patch_report or {}).get("skipped") or []) if isinstance(patch_report, dict) else None,
+                                        "errors": len((patch_report or {}).get("errors") or []) if isinstance(patch_report, dict) else None,
+                                    },
+                                    "no_change": (
+                                        isinstance(patch_report, dict)
+                                        and len((patch_report.get("applied") or [])) == 0
+                                        and len((patch_report.get("changes") or [])) == 0
+                                    ),
+                                },
+                                model_info=get_current_model_info(),
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        saved = export_like_base(
+                            base_file_path=base_path,
+                            out_path=str(out_path),
+                            title=fn,
+                            content_text=txt or "",
+                            meta=meta,
+                        )
+                        downloads.append(saved)
+                    out_files_for_log.append(saved)
+                    out_files_by_target[fn] = saved
+                    if isinstance(patch_report_obj, dict):
+                        _sk = patch_report_obj.get("skipped")
+                        if isinstance(_sk, list) and _sk:
+                            patch_skipped_by_file[fn] = _sk
+                        _er = patch_report_obj.get("errors")
+                        if isinstance(_er, list) and _er:
+                            patch_errors_by_file[fn] = _er
+                else:
+                    drafts_dir = settings.uploads_path / "draft_outputs"
+                    drafts_dir.mkdir(parents=True, exist_ok=True)
+                    txt_path = drafts_dir / f"{out_prefix}_{fn}.draft.txt"
+                    txt_path.write_text(txt or "", encoding="utf-8")
+                    out_files_for_log.append(str(txt_path))
+                    out_files_by_target[fn] = str(txt_path)
+                    downloads.append(str(txt_path))
+
+                if change_log_obj:
+                    change_logs_by_file[fn] = change_log_obj
+                last_items.append(
+                    {
+                        "file_name": fn,
+                        "downloads": downloads,
+                        "change_log": change_log_obj,
+                        "patch_skipped": patch_report_obj.get("skipped")
+                        if isinstance(patch_report_obj, dict)
+                        else None,
+                        "patch_errors": patch_report_obj.get("errors")
+                        if isinstance(patch_report_obj, dict)
+                        else None,
+                        "per_file_skills_rules": _pf_map.get(fn),
+                    }
+                )
+
+            try:
+                add_operation_log(
+                    op_type="draft_generate",
+                    collection=collection,
+                    file_name="draft_outputs",
+                    source="draft_page_regen",
+                    extra={
+                        "base_case_id": int(regen_extra.get("base_case_id") or base_case_id),
+                        "template_file_names": (regen_extra.get("template_file_names") or None),
+                        "project_id": res.project_id,
+                        "project_case_id": None,
+                        "save_as_case": False,
+                        "inplace_patch": bool(inplace_mode_regen),
+                        "document_language": str(regen_extra.get("document_language") or doc_lang_val),
+                        "registration_country": str(regen_extra.get("registration_country") or registration_country),
+                        "registration_type": str(regen_extra.get("registration_type") or registration_type),
+                        "registration_component": str(regen_extra.get("registration_component") or registration_component),
+                        "project_form": str(regen_extra.get("project_form") or project_form),
+                        "project_name": str(regen_extra.get("project_name") or ""),
+                        "project_code": str(regen_extra.get("project_code") or ""),
+                        "project_name_en": str(regen_extra.get("project_name_en") or ""),
+                        "product_name": str(regen_extra.get("product_name") or ""),
+                        "product_name_en": str(regen_extra.get("product_name_en") or ""),
+                        "model": str(regen_extra.get("model") or ""),
+                        "model_en": str(regen_extra.get("model_en") or ""),
+                        "registration_country_en": str(regen_extra.get("registration_country_en") or ""),
+                        "scope_of_application": str(regen_extra.get("scope_of_application") or ""),
+                        "new_case_name": str(regen_extra.get("new_case_name") or ""),
+                        "project_key": str(regen_extra.get("project_key") or ""),
+                        "out_files": out_files_for_log,
+                        "out_files_by_target": out_files_by_target,
+                        "generated_file_names": list((out_files_by_target or {}).keys()),
+                        "change_logs_by_file": change_logs_by_file,
+                        "patch_skipped_by_file": patch_skipped_by_file,
+                        "patch_errors_by_file": patch_errors_by_file,
+                        "summary": "按历史记录重新生成：产物已落盘；如启用就地修改则同时写入 patch 与修订日志。",
+                    },
+                    model_info=get_current_model_info(),
+                )
+            except Exception:
+                pass
+
+            try:
+                for _it in last_items:
+                    _psk = _it.get("patch_skipped")
+                    if isinstance(_psk, list) and _psk:
+                        st.caption(f"「{_it.get('file_name') or ''}」未命中/跳过的 patch（skipped，共 {len(_psk)} 条）")
+                        try:
+                            st.code(json.dumps(_psk, ensure_ascii=False, indent=2), language="json")
+                        except Exception:
+                            st.json(_psk)
+                    _perr = _it.get("patch_errors")
+                    if isinstance(_perr, list) and _perr:
+                        st.caption(f"「{_it.get('file_name') or ''}」patch 执行错误（errors）")
+                        try:
+                            st.code(json.dumps(_perr, ensure_ascii=False, indent=2), language="json")
+                        except Exception:
+                            st.json(_perr)
+            except Exception:
+                pass
+
+            try:
+                st.session_state["_draft_last_result"] = {
+                    "summary": f"project_id={res.project_id}（历史记录重新生成）",
+                    "items": last_items,
+                }
+            except Exception:
+                pass
+
+            st.success(f"✅ 重新生成完成：project_id={res.project_id}（未写入案例库）")
+            st.session_state.pop("_draft_regen_notice", None)
+        except Exception as _re:
+            st.error(f"重新生成失败：{_re}")
+            st.session_state["_draft_regen_notice"] = f"重新生成失败：{_re}"
+        # 不要 return：继续渲染历史记录区域，便于立即查看/下载
+
+    # 生成进度、生成结果预览：放在“开始生成按钮”下方
+    if start and (not job.get("running")):
+        if not input_files:
+            st.warning("请先上传输入/参考文件。")
+        else:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="aicheckword_draft_in_ui_"))
+            input_paths = []
+            existing_base_files = {}
+            try:
+                for uf in input_files:
+                    if not uf:
+                        continue
+                    dst = tmp_dir / (uf.name or f"input_{len(input_paths)}")
+                    dst.write_bytes(uf.getbuffer())
+                    input_paths.append((str(dst), dst.name))
+
+                # 保存“已有文件”到临时目录并建立映射：template_file_name -> path（手动绑定时）
+                base_files_manifest: list = []
+                if base_files and multi_base_auto:
+                    for bf in base_files:
+                        if not bf:
+                            continue
+                        bp = tmp_dir / (bf.name or f"base_auto_{len(base_files_manifest)}")
+                        bp.write_bytes(bf.getbuffer())
+                        base_files_manifest.append((str(bp), bf.name))
+                elif base_bindings:
+                    for target_name, bf in base_bindings.items():
+                        if not bf or not target_name:
+                            continue
+                        bp = tmp_dir / (bf.name or f"base_{len(existing_base_files)}")
+                        bp.write_bytes(bf.getbuffer())
+                        existing_base_files[str(target_name)] = str(bp)
+                # 修复：若填写了项目编号，生成文件名会替换前缀；这里同时补一份“替换后 file_name”映射
+                if existing_base_files and (p_code or "").strip():
+                    extra_map = {}
+                    for k, v in existing_base_files.items():
+                        kk = _replace_prefix_for_key(k, (p_code or "").strip())
+                        if kk and kk not in existing_base_files:
+                            extra_map[kk] = v
+                    existing_base_files.update(extra_map)
+
+                st.markdown("### 生成进度")
+                prog = st.progress(0.0)
+                status_box = st.empty()
+                status_box.caption("准备开始…")
+                status_box.caption("已提交后台任务，进度见上方「正在生成（后台任务）」区域。")
+
+                # 将临时目录记录到 job，便于失败时清理；实际清理在任务完成后进行
+                job["tmp_dir"] = str(tmp_dir)
+
+                _submit_draft_job(
+                    {
+                        "base_case_id": base_case_id,
+                        "template_file_names": selected_template_files or None,
+                        "project_id": selected_project_id if proj_mode.startswith("使用已有") else None,
+                        "existing_base_files": existing_base_files or None,
+                        "base_files_manifest": base_files_manifest or None,
+                        "multi_base_auto_route": bool(multi_base_auto and base_files_manifest),
+                        "input_files": input_paths,
+                        "document_language": doc_lang_val,
+                        "registration_country": registration_country,
+                        "registration_type": registration_type,
+                        "registration_component": registration_component,
+                        "project_form": project_form,
+                        "project_name": p_name.strip() or "",
+                        "project_code": p_code.strip() or "",
+                        "project_name_en": p_name_en.strip() or "",
+                        "product_name": p_product.strip() or "",
+                        "product_name_en": p_product_en.strip() or "",
+                        "model": p_model.strip() or "",
+                        "model_en": p_model_en.strip() or "",
+                        "registration_country_en": p_country_en.strip() or "",
+                        "scope_of_application_override": p_scope.strip() if p_scope is not None else None,
+                        "persist_project_fields": bool(persist_project_fields),
+                        "new_case_name": new_case_name.strip() or "",
+                        "project_key": project_key.strip() or "",
+                        "skills_patch_text": skills_patch_text,
+                        "rules_patch_text": rules_patch_text,
+                        "provider": st.session_state.get("current_provider"),
+                        "inplace_patch": bool(inplace_mode),
+                        "save_as_case": bool(save_as_case),
+                        "draft_strategy": draft_strategy,
+                        "author_role": draft_author_role,
+                        "author_role_map": author_role_map or None,
+                    }
+                )
+
+                _streamlit_rerun()
+
+            except Exception as e:
+                st.error(f"提交生成任务失败：{e}")
+                st.code(repr(e), language="text")
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+    # 若后台任务完成：将结果渲染为“本次生成结果”
+    if (not job.get("running")) and job.get("done") and job.get("result_payload"):
+        try:
+            res = (job.get("result_payload") or {}).get("res")
+            if res is None:
+                raise RuntimeError("后台任务未返回结果对象")
+
+            st.markdown("### 生成结果预览与下载")
+            _rp = getattr(res, "draft_routing_plan", None)
+            if _rp:
+                with st.expander("本次多基础/多参考路由（AI）", expanded=False):
+                    try:
+                        st.json(_rp)
+                    except Exception:
+                        st.write(str(_rp))
+            out_files_for_log = []
+            out_files_by_target = {}
+            last_items = []
+            change_logs_by_file = {}
+            patch_skipped_by_file = {}
+            patch_errors_by_file = {}
+            out_prefix = str(res.project_case_id or res.project_id)
+            _pf_map = getattr(res, "per_file_skills_rules_applied", None) or {}
+            _base_map = getattr(res, "per_file_base_path", None) or {}
+            for fn, txt in (res.generated_files or {}).items():
+                with st.expander(f"文件：{fn}", expanded=False):
+                    _ap = _pf_map.get(fn)
+                    if _ap is True:
+                        st.caption("单文件 Skills/Rules：已从数据库注入本次提示词（优先生效）。")
+                    elif _ap is False:
+                        st.caption("单文件 Skills/Rules：未检测到该输出文件名的数据库配置，或内容为空。")
+                    st.text_area("预览（可复制）", value=txt[:50000], height=240)
+                    downloads = []
+                    change_log_obj = None
+                    patch_report_obj = None
+
+                    # 若该文件有绑定 Base，则输出同格式文件（并写入修订记录）；多基础路由时优先 per_file_base_path
+                    base_path = _base_map.get(fn) if isinstance(_base_map, dict) else None
+                    if not base_path and isinstance(existing_base_files, dict):
+                        base_path = existing_base_files.get(fn)
+                    if base_path:
+                        base_suffix = Path(base_path).suffix.lower()
+                        # 输出文件后缀必须与基础文件一致（Excel Base 就导出 Excel；避免 .xlsx.docx 这类错误）
+                        out_name = fn
+                        if base_suffix:
+                            out_name = Path(out_name).stem + base_suffix
+                        drafts_dir = settings.uploads_path / "draft_outputs"
+                        drafts_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = drafts_dir / f"{out_prefix}_{out_name}"
+                        out_path = _safe_out_path(base_path=base_path, out_path=out_path)
+                        meta = {
+                            "project_id": res.project_id,
+                            "project_case_id": res.project_case_id,
+                            "base_file": Path(base_path).name,
+                            "change_summary": "基于基础文件按规则补写/修订生成（对照参考识别新增·细化·删除）"
+                            if inplace_mode
+                            else "基于基础文件按规则补写/修订生成",
+                            "generated_by": "aicheckword 文档初稿生成",
+                        }
+                        saved = None
+                        patch_json = (getattr(res, "generated_patches", {}) or {}).get(fn) if inplace_mode else None
+                        if inplace_mode and base_suffix == ".docx" and (patch_json or "").strip():
+                            from src.core.draft_export import export_docx_inplace_patch
+
+                            saved, patch_report = export_docx_inplace_patch(
+                                base_file_path=base_path,
+                                out_path=str(out_path),
+                                patch_json=patch_json,
+                                meta=meta,
+                                track_changes=bool(docx_track_changes),
+                            )
+                            patch_report_obj = patch_report
+                            change_log_obj = patch_report.get("changes") if isinstance(patch_report, dict) else None
+                            if change_log_obj:
+                                st.caption("修改日志（就地修改，改前/改后）")
+                                try:
+                                    st.code(
+                                        json.dumps(change_log_obj, ensure_ascii=False, indent=2),
+                                        language="json",
+                                    )
+                                except Exception:
+                                    st.json(change_log_obj)
+                            # 同步保存 patch 与执行报告，便于审计/复盘
+                            patch_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.json")
+                            patch_path.write_text(patch_json, encoding="utf-8")
+                            rep_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.report.json")
+                            rep_path.write_text(json.dumps(patch_report, ensure_ascii=False, indent=2), encoding="utf-8")
+                            out_files_for_log.append(str(patch_path))
+                            out_files_for_log.append(str(rep_path))
+                            downloads.extend([saved, str(patch_path), str(rep_path)])
+                            # 操作记录：按文件导出结果（patch 统计）
+                            try:
+                                add_operation_log(
+                                    op_type="draft_export",
+                                    collection=collection,
+                                    file_name=fn,
+                                    source="draft_page_export",
+                                    extra={
+                                        "project_id": res.project_id,
+                                        "project_case_id": res.project_case_id,
+                                        "base_file": str(base_path),
+                                        "out_file": str(saved),
+                                        "suffix": base_suffix,
+                                        "inplace_patch": True,
+                                        "patch_counts": {
+                                            "applied": len((patch_report or {}).get("applied") or []) if isinstance(patch_report, dict) else None,
+                                            "changes": len((patch_report or {}).get("changes") or []) if isinstance(patch_report, dict) else None,
+                                            "skipped": len((patch_report or {}).get("skipped") or []) if isinstance(patch_report, dict) else None,
+                                            "errors": len((patch_report or {}).get("errors") or []) if isinstance(patch_report, dict) else None,
+                                        },
+                                        "no_change": (
+                                            isinstance(patch_report, dict)
+                                            and len((patch_report.get("applied") or [])) == 0
+                                            and len((patch_report.get("changes") or [])) == 0
+                                        ),
+                                    },
+                                    model_info=get_current_model_info(),
+                                )
+                            except Exception:
+                                pass
+                        elif inplace_mode and base_suffix in (".xlsx", ".xls") and (patch_json or "").strip():
+                            from src.core.draft_export import export_xlsx_inplace_patch
+
+                            saved, patch_report = export_xlsx_inplace_patch(
+                                base_file_path=base_path,
+                                out_path=str(out_path),
+                                patch_json=patch_json,
+                                meta=meta,
+                            )
+                            patch_report_obj = patch_report
+                            change_log_obj = patch_report.get("changes") if isinstance(patch_report, dict) else None
+                            if change_log_obj:
+                                st.caption("修改日志（就地修改，改前/改后）")
+                                try:
+                                    st.code(
+                                        json.dumps(change_log_obj, ensure_ascii=False, indent=2),
+                                        language="json",
+                                    )
+                                except Exception:
+                                    st.json(change_log_obj)
+                            patch_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.json")
+                            patch_path.write_text(patch_json, encoding="utf-8")
+                            rep_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.report.json")
+                            rep_path.write_text(json.dumps(patch_report, ensure_ascii=False, indent=2), encoding="utf-8")
+                            out_files_for_log.append(str(patch_path))
+                            out_files_for_log.append(str(rep_path))
+                            downloads.extend([saved, str(patch_path), str(rep_path)])
+                            try:
+                                add_operation_log(
+                                    op_type="draft_export",
+                                    collection=collection,
+                                    file_name=fn,
+                                    source="draft_page_export",
+                                    extra={
+                                        "project_id": res.project_id,
+                                        "project_case_id": res.project_case_id,
+                                        "base_file": str(base_path),
+                                        "out_file": str(saved),
+                                        "suffix": base_suffix,
+                                        "inplace_patch": True,
+                                        "patch_counts": {
+                                            "applied": len((patch_report or {}).get("applied") or []) if isinstance(patch_report, dict) else None,
+                                            "changes": len((patch_report or {}).get("changes") or []) if isinstance(patch_report, dict) else None,
+                                            "skipped": len((patch_report or {}).get("skipped") or []) if isinstance(patch_report, dict) else None,
+                                            "errors": len((patch_report or {}).get("errors") or []) if isinstance(patch_report, dict) else None,
+                                        },
+                                        "no_change": (
+                                            isinstance(patch_report, dict)
+                                            and len((patch_report.get("applied") or [])) == 0
+                                            and len((patch_report.get("changes") or [])) == 0
+                                        ),
+                                    },
+                                    model_info=get_current_model_info(),
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            saved = export_like_base(
+                                base_file_path=base_path,
+                                out_path=str(out_path),
+                                title=fn,
+                                content_text=txt or "",
+                                meta=meta,
+                            )
+                            downloads.append(saved)
+
+                        out_files_for_log.append(saved)
+                        out_files_by_target[fn] = saved
+                        st.download_button(
+                            "下载同格式文件（含修订记录）",
+                            data=Path(saved).read_bytes(),
+                            file_name=Path(saved).name,
+                            mime="application/octet-stream",
+                            key=f"dl_draft_art_{fn}_{res.project_case_id}",
+                        )
+                        _draft_show_patch_skipped_errors(
+                            patch_report_obj,
+                            key_prefix=f"draft_patch_{res.project_case_id}_{fn}_",
+                        )
+                        if isinstance(patch_report_obj, dict):
+                            _sk = patch_report_obj.get("skipped")
+                            if isinstance(_sk, list) and _sk:
+                                patch_skipped_by_file[fn] = _sk
+                            _er = patch_report_obj.get("errors")
+                            if isinstance(_er, list) and _er:
+                                patch_errors_by_file[fn] = _er
+                    else:
+                        # 非 Base：也落盘 txt，便于历史记录可见/可下载
+                        drafts_dir = settings.uploads_path / "draft_outputs"
+                        drafts_dir.mkdir(parents=True, exist_ok=True)
+                        txt_path = drafts_dir / f"{res.project_case_id}_{fn}.draft.txt"
+                        txt_path.write_text(txt or "", encoding="utf-8")
+                        out_files_for_log.append(str(txt_path))
+                        out_files_by_target[fn] = str(txt_path)
+                        downloads.append(str(txt_path))
+                        st.download_button(
+                            "下载文本",
+                            data=Path(txt_path).read_bytes(),
+                            file_name=txt_path.name,
+                            mime="text/plain",
+                            key=f"dl_draft_txt_{fn}_{res.project_case_id}",
+                        )
+
+                    last_items.append(
+                        {
+                            "file_name": fn,
+                            "downloads": downloads,
+                            "change_log": change_log_obj,
+                            "patch_skipped": patch_report_obj.get("skipped")
+                            if isinstance(patch_report_obj, dict)
+                            else None,
+                            "patch_errors": patch_report_obj.get("errors")
+                            if isinstance(patch_report_obj, dict)
+                            else None,
+                            "per_file_skills_rules": _pf_map.get(fn),
+                        }
+                    )
+                    if change_log_obj:
+                        change_logs_by_file[fn] = change_log_obj
+
+                # 写入生成记录（用于历史查看/下载/重新生成）
+                try:
+                    add_operation_log(
+                        op_type="draft_generate",
+                        collection=collection,
+                        file_name="draft_outputs",
+                        source="draft_page",
+                        extra={
+                            "base_case_id": base_case_id,
+                            "template_file_names": selected_template_files or None,
+                            "project_id": res.project_id,
+                            "project_case_id": res.project_case_id,
+                            "save_as_case": bool(save_as_case),
+                            "inplace_patch": bool(inplace_mode),
+                            "draft_strategy": draft_strategy,
+                            "author_role": draft_author_role,
+                            "author_role_map": author_role_map or {},
+                            "document_language": doc_lang_val,
+                            "registration_country": registration_country,
+                            "registration_type": registration_type,
+                            "registration_component": registration_component,
+                            "project_form": project_form,
+                            "project_name": p_name.strip() or "",
+                            "project_code": p_code.strip() or "",
+                            "project_name_en": p_name_en.strip() or "",
+                            "product_name": p_product.strip() or "",
+                            "product_name_en": p_product_en.strip() or "",
+                            "model": p_model.strip() or "",
+                            "model_en": p_model_en.strip() or "",
+                            "registration_country_en": p_country_en.strip() or "",
+                            "scope_of_application": (p_scope.strip() if p_scope is not None else ""),
+                            "new_case_name": new_case_name.strip() or "",
+                            "project_key": project_key.strip() or "",
+                            "out_files": out_files_for_log,
+                            "out_files_by_target": out_files_by_target,
+                            "generated_file_names": list((out_files_by_target or {}).keys()),
+                            "change_logs_by_file": change_logs_by_file,
+                            "patch_skipped_by_file": patch_skipped_by_file,
+                            "patch_errors_by_file": patch_errors_by_file,
+                            "summary": "生成产物已落盘；绑定 Base 的目标文件已导出同格式并写入修订记录。",
+                        },
+                        model_info=get_current_model_info(),
+                    )
+                except Exception:
+                    pass
+
+                # 缓存本次结果，避免页面重跑后丢失下载与日志展示
+                try:
+                    st.session_state["_draft_last_result"] = {
+                        "summary": f"project_id={res.project_id}, project_case_id={res.project_case_id or ''}".strip(),
+                        "items": last_items,
+                    }
+                except Exception:
+                    pass
+
+            st.success(
+                f"✅ 生成完成：project_id={res.project_id}"
+                + (f", project_case_id={res.project_case_id}" if res.project_case_id else "（未写入案例库）")
+            )
+        except Exception as e:
+            st.error(f"生成失败：{e}")
+            st.code(repr(e), language="text")
+        finally:
+            # 清理后台任务临时目录
+            try:
+                _td = (job.get("tmp_dir") or "").strip()
+                if _td:
+                    shutil.rmtree(_td, ignore_errors=True)
+            except Exception:
+                pass
+            job["tmp_dir"] = ""
+            # 防止重复渲染：重置 done 标记，但保留 last_result 与历史记录
+            job["done"] = False
+            job["result_payload"] = None
+
+    if (job.get("error") or "").strip() and (not job.get("running")):
+        st.error(f"生成任务失败/取消：{job.get('error')}")
+
+    # 历史生成记录：放在“生成设置/生成结果”之后
+    _render_draft_history()
+
+
 def _reports_markdown_for_download(reports: list) -> str:
     """生成当前会话报告 Markdown 文本（轻量，供下载按钮使用）。"""
     md_lines = []
@@ -8191,6 +9897,7 @@ def main():
         [
             "① 法规训练 & 生成审核点",
             "② 审核点管理 & 训练",
+            "✍️ 文档初稿生成",
             "③ 文档审核",
             "🌐 文档翻译",
             "📝 提示词配置",
@@ -8218,6 +9925,8 @@ def main():
         render_step2_page()
     elif page == "③ 文档审核":
         render_step3_page()
+    elif page == "✍️ 文档初稿生成":
+        render_draft_page()
     elif page == "🌐 文档翻译":
         render_translation_page()
     elif page == "📝 提示词配置":

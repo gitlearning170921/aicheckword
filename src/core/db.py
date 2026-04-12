@@ -245,6 +245,19 @@ def init_db() -> None:
                         INDEX idx_pc_collection (collection)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS draft_file_skills_rules (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        base_case_id BIGINT NOT NULL COMMENT '模板项目案例 project_cases.id',
+                        file_name VARCHAR(512) NOT NULL COMMENT '与知识库中案例文件名一致',
+                        skills_patch LONGTEXT COMMENT '本文件专用 skills 文本（与全局补丁叠加注入提示词）',
+                        rules_patch LONGTEXT COMMENT '本文件专用 rules 文本',
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY uq_draft_file_case_name (collection, base_case_id, file_name(255)),
+                        INDEX idx_draft_file_case (collection, base_case_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
                 _add_column_if_missing(cur, "project_cases", "case_name_en", "VARCHAR(512) DEFAULT '' COMMENT '案例名称英文'")
                 _add_column_if_missing(cur, "project_cases", "product_name_en", "VARCHAR(512) DEFAULT '' COMMENT '产品名称英文'")
                 _add_column_if_missing(cur, "project_cases", "registration_country_en", "VARCHAR(256) DEFAULT '' COMMENT '注册国家英文'")
@@ -273,6 +286,7 @@ def init_db() -> None:
                 _add_column_if_missing(cur, "projects", "model", "VARCHAR(512) DEFAULT '' COMMENT '型号'")
                 _add_column_if_missing(cur, "projects", "model_en", "VARCHAR(512) DEFAULT '' COMMENT '型号英文 Model'")
                 _add_column_if_missing(cur, "projects", "registration_country_en", "VARCHAR(128) DEFAULT '' COMMENT '注册国家英文'")
+                _add_column_if_missing(cur, "projects", "project_code", "VARCHAR(128) DEFAULT '' COMMENT '项目编号/项目代号（用于文件名等前缀替换）'")
                 _add_column_if_missing(cur, "app_settings", "review_extra_instructions", "LONGTEXT COMMENT '自定义审核要求/提示词，会追加到审核上下文中'")
                 _add_column_if_missing(cur, "app_settings", "review_system_prompt", "LONGTEXT COMMENT '审核系统提示词，为空则使用内置默认'")
                 _add_column_if_missing(cur, "app_settings", "review_user_prompt", "LONGTEXT COMMENT '审核用户提示词模板，支持 {context} {file_name} {document_content}，为空则使用内置默认'")
@@ -926,6 +940,7 @@ def save_knowledge_docs(
     file_name: str,
     chunks: list,
     category: str = "regulation",
+    case_id: Optional[int] = None,
 ) -> int:
     init_db()
     if not chunks:
@@ -937,15 +952,20 @@ def save_knowledge_docs(
             for idx, doc in enumerate(chunks):
                 content = doc.page_content if hasattr(doc, "page_content") else str(doc)
                 meta = doc.metadata if hasattr(doc, "metadata") else {}
+                # 优先使用函数入参，其次尝试从 metadata 读取（兼容旧调用方）
+                _cid = case_id
+                if _cid is None and isinstance(meta, dict):
+                    _cid = meta.get("case_id")
                 rows.append((
                     collection, file_name, idx,
                     content,
                     json.dumps(meta, ensure_ascii=False),
                     category,
+                    _cid,
                 ))
             cur.executemany("""
-                INSERT INTO knowledge_docs (collection, file_name, chunk_index, content, metadata_json, category)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO knowledge_docs (collection, file_name, chunk_index, content, metadata_json, category, case_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, rows)
         conn.commit()
         return len(rows)
@@ -959,6 +979,7 @@ def append_knowledge_docs(
     start_chunk_index: int,
     chunks: list,
     category: str = "regulation",
+    case_id: Optional[int] = None,
 ) -> int:
     """在 knowledge_docs 中追加块（chunk_index 从 start_chunk_index 递增）。用于分段向量化时与 Chroma 分批写入对齐。"""
     init_db()
@@ -971,15 +992,19 @@ def append_knowledge_docs(
             for j, doc in enumerate(chunks):
                 content = doc.page_content if hasattr(doc, "page_content") else str(doc)
                 meta = doc.metadata if hasattr(doc, "metadata") else {}
+                _cid = case_id
+                if _cid is None and isinstance(meta, dict):
+                    _cid = meta.get("case_id")
                 rows.append((
                     collection, file_name, start_chunk_index + j,
                     content,
                     json.dumps(meta, ensure_ascii=False),
                     category,
+                    _cid,
                 ))
             cur.executemany("""
-                INSERT INTO knowledge_docs (collection, file_name, chunk_index, content, metadata_json, category)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO knowledge_docs (collection, file_name, chunk_index, content, metadata_json, category, case_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, rows)
         conn.commit()
         return len(rows)
@@ -1116,6 +1141,23 @@ def get_existing_file_names(
                     (collection,),
                 )
             return [r["file_name"] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def delete_knowledge_docs_by_case_id(collection: str, case_id: int) -> int:
+    """删除某知识库下、指定项目案例 ID 的全部文档块（MySQL）。调用前/后需同步清理 Chroma。"""
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM knowledge_docs WHERE collection = %s AND case_id = %s",
+                (collection, int(case_id)),
+            )
+            deleted = cur.rowcount
+        conn.commit()
+        return int(deleted or 0)
     finally:
         conn.close()
 
@@ -1474,15 +1516,16 @@ def create_project(
     registration_country_en: str = "",
     model: str = "",
     model_en: str = "",
+    project_code: str = "",
 ) -> int:
     init_db()
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO projects (collection, name, registration_country, registration_type, registration_component, project_form, scope_of_application, product_name, name_en, product_name_en, registration_country_en, model, model_en)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (collection, name, registration_country, registration_type, registration_component, project_form, scope_of_application or "", product_name or "", name_en or "", product_name_en or "", registration_country_en or "", model or "", model_en or ""))
+                INSERT INTO projects (collection, name, registration_country, registration_type, registration_component, project_form, scope_of_application, product_name, name_en, product_name_en, registration_country_en, model, model_en, project_code)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (collection, name, registration_country, registration_type, registration_component, project_form, scope_of_application or "", product_name or "", name_en or "", product_name_en or "", registration_country_en or "", model or "", model_en or "", project_code or ""))
             pid = cur.lastrowid
         conn.commit()
         return pid
@@ -1504,6 +1547,7 @@ def update_project(
     registration_country_en: str = None,
     model: str = None,
     model_en: str = None,
+    project_code: str = None,
 ) -> None:
     init_db()
     conn = _get_conn()
@@ -1524,6 +1568,7 @@ def update_project(
                 ("registration_country_en", registration_country_en),
                 ("model", model),
                 ("model_en", model_en),
+                ("project_code", project_code),
             ]:
                 if v is not None:
                     updates.append(f"{k} = %s")
@@ -1930,6 +1975,30 @@ def get_knowledge_docs_by_case_id(
         conn.close()
 
 
+def get_knowledge_docs_by_case_id_and_file_name(
+    collection: str,
+    case_id: int,
+    file_name: str,
+    limit: int = 2000,
+) -> list:
+    """返回指定项目案例下、指定 file_name 的全部块内容（用于按文件生成/复用模板）。按 chunk_index 排序。"""
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT content, file_name, chunk_index FROM knowledge_docs
+                   WHERE collection = %s AND (category = %s OR category IS NULL OR category = '')
+                     AND case_id = %s AND file_name = %s
+                   ORDER BY chunk_index
+                   LIMIT %s""",
+                (collection, "project_case", case_id, file_name, limit),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 
 def delete_project_case(case_id: int) -> bool:
     """删除项目案例记录。调用前需确保该案例下无已入库文件（否则不应删除）。"""
@@ -1940,6 +2009,86 @@ def delete_project_case(case_id: int) -> bool:
             cur.execute("DELETE FROM project_cases WHERE id = %s", (case_id,))
             conn.commit()
             return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def upsert_draft_file_skills_rules(
+    collection: str,
+    base_case_id: int,
+    file_name: str,
+    skills_patch: str = "",
+    rules_patch: str = "",
+) -> None:
+    """按「知识库 + 模板案例 + 生成文件名」保存文档初稿生成用的专用 skills/rules（与页面全局补丁叠加）。"""
+    init_db()
+    fn = (file_name or "").strip()[:512]
+    if not fn:
+        raise ValueError("file_name 不能为空")
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO draft_file_skills_rules (collection, base_case_id, file_name, skills_patch, rules_patch)
+                VALUES (%s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    skills_patch = VALUES(skills_patch),
+                    rules_patch = VALUES(rules_patch),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (collection or "", int(base_case_id), fn, skills_patch or "", rules_patch or ""),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_draft_file_skills_rules(
+    collection: str,
+    base_case_id: int,
+    file_name: str,
+) -> Optional[Dict[str, Any]]:
+    init_db()
+    fn = (file_name or "").strip()[:512]
+    if not fn:
+        return None
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT skills_patch, rules_patch, updated_at FROM draft_file_skills_rules
+                WHERE collection = %s AND base_case_id = %s AND file_name = %s
+                LIMIT 1
+                """,
+                (collection or "", int(base_case_id), fn),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def delete_draft_file_skills_rules(
+    collection: str,
+    base_case_id: int,
+    file_name: str,
+) -> bool:
+    init_db()
+    fn = (file_name or "").strip()[:512]
+    if not fn:
+        return False
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM draft_file_skills_rules WHERE collection = %s AND base_case_id = %s AND file_name = %s",
+                (collection or "", int(base_case_id), fn),
+            )
+            n = cur.rowcount
+        conn.commit()
+        return n > 0
     finally:
         conn.close()
 
