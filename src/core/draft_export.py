@@ -12,12 +12,305 @@
 from __future__ import annotations
 
 import datetime as _dt
+import copy
 import json
 import random
+import re
 import shutil
 import tempfile
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
+
+# 测试用例类表格：支持可配置的编号规则（优先来自 patch/meta），用于：
+# - 已存在编号：整行相似度≥阈值则原地更新，否则分配新编号插入
+# - 新插入：按同规则下“同模块前缀”的最大序号 +1 分配，避免与已有编号冲突
+_TC_ROW_SIMILARITY_UPDATE_THRESHOLD = 0.9
+
+_DEFAULT_TC_ID_RULES = [
+    {
+        "name": "dash_prefix_num",
+        "regex": r"^([A-Za-z]+\d*)-(\d+)$",  # 例：GN3-21
+        "prefix_group": 1,
+        "number_group": 2,
+        "render": "{prefix}-{num}",
+    }
+]
+
+
+def _compile_tc_id_rules(raw_rules: Any) -> List[Dict[str, Any]]:
+    rules: List[Dict[str, Any]] = []
+    if isinstance(raw_rules, list):
+        for r in raw_rules:
+            if not isinstance(r, dict):
+                continue
+            rx = (r.get("regex") or "").strip()
+            if not rx:
+                continue
+            try:
+                compiled = re.compile(rx)
+            except Exception:
+                continue
+            rules.append(
+                {
+                    "name": (r.get("name") or "rule").strip() or "rule",
+                    "regex": rx,
+                    "compiled": compiled,
+                    "prefix_group": int(r.get("prefix_group") or 1),
+                    "number_group": int(r.get("number_group") or 2),
+                    "render": (r.get("render") or "{prefix}-{num}").strip() or "{prefix}-{num}",
+                }
+            )
+    if rules:
+        return rules
+    # fallback：默认规则
+    out: List[Dict[str, Any]] = []
+    for r in _DEFAULT_TC_ID_RULES:
+        try:
+            out.append({**r, "compiled": re.compile(r["regex"])})
+        except Exception:
+            continue
+    return out
+
+
+def _parse_tc_id_first_cell(s: str, tc_rules: Optional[List[Dict[str, Any]]] = None) -> Optional[Tuple[str, int, Dict[str, Any]]]:
+    txt = (s or "").strip()
+    if not txt:
+        return None
+    rules = tc_rules or _compile_tc_id_rules(None)
+    for r in rules:
+        try:
+            m = r["compiled"].match(txt)
+        except Exception:
+            m = None
+        if not m:
+            continue
+        try:
+            prefix = (m.group(int(r.get("prefix_group") or 1)) or "").strip()
+            num = int(m.group(int(r.get("number_group") or 2)))
+        except Exception:
+            continue
+        if prefix:
+            return prefix, num, r
+    return None
+
+
+def _render_tc_id(prefix: str, num: int, rule: Dict[str, Any]) -> str:
+    try:
+        tmpl = (rule.get("render") or "{prefix}-{num}").strip() or "{prefix}-{num}"
+        return tmpl.format(prefix=prefix, num=num)
+    except Exception:
+        return f"{prefix}-{num}"
+
+
+def _word_cell_text_as_revised(cell) -> str:
+    """按「接受修订后」的有效文本读取：跳过 w:del / w:moveFrom 内文本，保留 w:ins 与普通 run。
+
+    用于编号扫描：若编号曾被修订，cell.text / paragraph.text 可能仍含删除线内容或漏读插入，
+    导致最大流水号低估；此处以 OOXML 祖先节点为准近似「修订后」结果。
+    """
+    try:
+        from docx.oxml.ns import qn
+
+        tc = cell._tc  # type: ignore[attr-defined]
+    except Exception:
+        return ""
+    try:
+        pieces: List[str] = []
+        for t in tc.iter(qn("w:t")):
+            txt = t.text
+            if not txt:
+                continue
+            el = t
+            skip = False
+            while el is not None:
+                tag = el.tag
+                if tag == qn("w:del"):
+                    skip = True
+                    break
+                if tag == qn("w:moveFrom"):
+                    skip = True
+                    break
+                el = el.getparent()
+            if skip:
+                continue
+            pieces.append(txt)
+        return "".join(pieces).strip()
+    except Exception:
+        return ""
+
+
+def _word_cell_text_best(cell) -> str:
+    """尽量读出单元格可见文本：优先「修订后」近似；再段落拼接；最后 cell.text。"""
+    r = _word_cell_text_as_revised(cell)
+    if (r or "").strip():
+        return (r or "").strip()
+    try:
+        paras = getattr(cell, "paragraphs", None) or []
+        if paras:
+            t = "\n".join((p.text or "") for p in paras).strip()
+            if t:
+                return t
+    except Exception:
+        pass
+    try:
+        return (cell.text or "").strip()
+    except Exception:
+        return ""
+
+
+def _table_max_tc_suffix_for_prefix_word(
+    tbl,
+    prefix: str,
+    tc_rules: Optional[List[Dict[str, Any]]] = None,
+    *,
+    max_cols: int = 8,
+    max_rows: int = 8000,
+) -> int:
+    """同前缀下流水号最大值：扫描每行前若干列（编号未必在第 1 列，合并格时尤甚）。"""
+    mx = 0
+    try:
+        rows = tbl.rows
+        lim = min(len(rows), max_rows)
+        for row in rows[:lim]:
+            if not row.cells:
+                continue
+            ncells = len(row.cells)
+            for ci in range(min(max_cols, ncells)):
+                txt = _word_cell_text_best(row.cells[ci])
+                p = _parse_tc_id_first_cell(txt, tc_rules)
+                if p and p[0] == prefix:
+                    mx = max(mx, p[1])
+    except Exception:
+        pass
+    return mx
+
+
+def _table_find_row_idx_by_id_any_cell(
+    tbl, id_text: str, *, max_cols: int = 8, max_rows: int = 8000
+) -> int:
+    t = (id_text or "").strip()
+    if not t:
+        return -1
+    try:
+        rows = tbl.rows
+        lim = min(len(rows), max_rows)
+        for i, row in enumerate(rows[:lim]):
+            if not row.cells:
+                continue
+            ncells = len(row.cells)
+            for ci in range(min(max_cols, ncells)):
+                if _word_cell_text_best(row.cells[ci]).strip() == t:
+                    return i
+    except Exception:
+        pass
+    return -1
+
+
+def _table_tc_id_exists_word(tbl, id_text: str, **kwargs) -> bool:
+    return _table_find_row_idx_by_id_any_cell(tbl, id_text, **kwargs) >= 0
+
+
+def _next_unique_tc_id_word(
+    tbl,
+    prefix: str,
+    rule: Dict[str, Any],
+    tc_rules: Optional[List[Dict[str, Any]]],
+    start_num: int,
+    *,
+    max_try: int = 5000,
+) -> str:
+    """从 start_num 起渲染编号，若表中已存在则递增，直到不冲突（防重复）。"""
+    num = int(start_num)
+    for _ in range(max_try):
+        cand = _render_tc_id(prefix, num, rule)
+        if not _table_tc_id_exists_word(tbl, cand):
+            return cand
+        num += 1
+    return _render_tc_id(prefix, int(start_num), rule)
+
+
+def _word_row_joined(row, col_n: int) -> str:
+    parts: List[str] = []
+    try:
+        for ci in range(min(col_n, len(row.cells))):
+            parts.append(_word_cell_text_best(row.cells[ci]))
+    except Exception:
+        pass
+    return "\t".join(parts)
+
+
+def _table_max_tc_suffix_for_prefix_xlsx(
+    ws,
+    prefix: str,
+    tc_rules: Optional[List[Dict[str, Any]]] = None,
+    *,
+    scan_cols: int = 8,
+    max_row: int = 8000,
+) -> int:
+    mx = 0
+    try:
+        last_r = min(ws.max_row or 0, max_row)
+        for r in range(1, last_r + 1):
+            for c in range(1, scan_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                s = "" if v is None else str(v)
+                p = _parse_tc_id_first_cell(s, tc_rules)
+                if p and p[0] == prefix:
+                    mx = max(mx, p[1])
+    except Exception:
+        pass
+    return mx
+
+
+def _xlsx_find_row_by_id_any_col(
+    ws, id_text: str, *, scan_cols: int = 8, max_scan: int = 8000
+) -> int:
+    t = (id_text or "").strip()
+    lim = min((ws.max_row or 0) + 1, max_scan)
+    try:
+        for r in range(1, lim):
+            for c in range(1, scan_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                s = "" if v is None else str(v)
+                if s.strip() == t:
+                    return r
+    except Exception:
+        pass
+    return -1
+
+
+def _xlsx_tc_id_exists(ws, id_text: str, **kwargs) -> bool:
+    return _xlsx_find_row_by_id_any_col(ws, id_text, **kwargs) >= 0
+
+
+def _next_unique_tc_id_xlsx(
+    ws,
+    prefix: str,
+    rule: Dict[str, Any],
+    tc_rules: Optional[List[Dict[str, Any]]],
+    start_num: int,
+    *,
+    max_try: int = 5000,
+) -> str:
+    num = int(start_num)
+    for _ in range(max_try):
+        cand = _render_tc_id(prefix, num, rule)
+        if not _xlsx_tc_id_exists(ws, cand):
+            return cand
+        num += 1
+    return _render_tc_id(prefix, int(start_num), rule)
+
+
+def _xlsx_row_joined(ws, r: int, col_n: int) -> str:
+    parts: List[str] = []
+    try:
+        for c in range(1, col_n + 1):
+            v = ws.cell(row=r, column=c).value
+            parts.append("" if v is None else str(v))
+    except Exception:
+        pass
+    return "\t".join(parts)
 
 
 def _now_str() -> str:
@@ -47,7 +340,39 @@ def _enable_track_revisions(doc) -> None:
         pass
 
 
-def _replace_paragraph_with_track_changes(p, before: str, after: str, author: str = "aicheckword") -> None:
+def _enable_update_fields_on_open(doc) -> None:
+    """
+    打开文档时自动更新域（Fields），用于目录（TOC）、页码、交叉引用等在页数变化后自动重算。
+    注：python-docx 无法在服务端真正“计算并更新”这些域，只能设置该开关由 Word/WPS 在打开时更新。
+    """
+    try:
+        el = doc.settings.element
+    except Exception:
+        return
+    try:
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        for child in list(el):
+            if child.tag == qn("w:updateFields"):
+                try:
+                    child.set(qn("w:val"), "true")
+                except Exception:
+                    pass
+                return
+        uf = OxmlElement("w:updateFields")
+        try:
+            uf.set(qn("w:val"), "true")
+        except Exception:
+            pass
+        el.append(uf)
+    except Exception:
+        pass
+
+
+def _replace_paragraph_with_track_changes(
+    p, before: str, after: str, author: str = "aicheckword", *, run_rpr=None
+) -> None:
     """
     将段落改为「删除旧全文 + 插入新全文」的修订结构（w:del / w:ins），保留段落样式对象 p 不变。
     """
@@ -69,6 +394,11 @@ def _replace_paragraph_with_track_changes(p, before: str, after: str, author: st
     del_el.set(qn("w:author"), author)
     del_el.set(qn("w:date"), iso)
     r0 = OxmlElement("w:r")
+    try:
+        if run_rpr is not None:
+            r0.append(copy.deepcopy(run_rpr))
+    except Exception:
+        pass
     dt = OxmlElement("w:delText")
     try:
         dt.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
@@ -85,6 +415,11 @@ def _replace_paragraph_with_track_changes(p, before: str, after: str, author: st
     ins_el.set(qn("w:author"), author)
     ins_el.set(qn("w:date"), iso)
     r1 = OxmlElement("w:r")
+    try:
+        if run_rpr is not None:
+            r1.append(copy.deepcopy(run_rpr))
+    except Exception:
+        pass
     t = OxmlElement("w:t")
     try:
         t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
@@ -141,6 +476,13 @@ def _replace_table_cell_with_track_changes(cell, before: str, after: str, author
             return
 
     p0 = paras[0]
+    # 捕获基础字体/字号等 run 属性，保证插入与基础文档一致（如 Times New Roman）
+    run_rpr = None
+    try:
+        if p0.runs:
+            run_rpr = p0.runs[0]._r.rPr  # type: ignore[attr-defined]
+    except Exception:
+        run_rpr = None
     # 清理多余段落，避免旧内容残留
     try:
         tc = cell._tc  # type: ignore[attr-defined]
@@ -152,7 +494,7 @@ def _replace_table_cell_with_track_changes(cell, before: str, after: str, author
     except Exception:
         pass
 
-    _replace_paragraph_with_track_changes(p0, before or "", after or "", author=author)
+    _replace_paragraph_with_track_changes(p0, before or "", after or "", author=author, run_rpr=run_rpr)
 
 
 def _insert_paragraph_with_track_changes(p, text: str, author: str = "aicheckword") -> None:
@@ -344,6 +686,120 @@ def _revision_entry_fields(meta: Dict) -> Dict[str, str]:
         "change_content": (m.get("change_summary") or "基于基础文件按规则补写/修订生成").strip(),
         "source": (m.get("generated_by") or "aicheckword 文档初稿生成").strip(),
     }
+
+
+def _compute_next_version(prev: str) -> str:
+    """
+    将既有版本号升级到下一版：
+    - A/1 -> A/2
+    - v1 -> v2
+    - 01 -> 02（保留位数）
+    - 1.2 -> 1.3（简单最后段递增）
+    无法解析时返回原值。
+    """
+    s = (prev or "").strip()
+    if not s:
+        return s
+    import re
+
+    m = re.fullmatch(r"([A-Za-z]+)\s*/\s*(\d+)", s)
+    if m:
+        return f"{m.group(1)}/{int(m.group(2)) + 1}"
+    m = re.fullmatch(r"([Vv])\s*(\d+)", s)
+    if m:
+        return f"{m.group(1)}{int(m.group(2)) + 1}"
+    m = re.fullmatch(r"(\d+)", s)
+    if m:
+        w = len(m.group(1))
+        return str(int(m.group(1)) + 1).zfill(w)
+    m = re.fullmatch(r"(\d+(?:\.\d+)+)", s)
+    if m:
+        parts = s.split(".")
+        try:
+            parts[-1] = str(int(parts[-1]) + 1)
+            return ".".join(parts)
+        except Exception:
+            return s
+    return s
+
+
+def _docx_sync_version_everywhere(doc, *, old: str, new: str) -> int:
+    """
+    在 docx 中同步版本号：封面/正文/页眉页脚（不追求精确字段定位，做“精确旧值替换”）。
+    返回替换次数。
+    """
+    if not old or not new or old == new:
+        return 0
+
+    def _replace_in_paras(paras):
+        n = 0
+        for p in list(paras or []):
+            try:
+                txt = p.text or ""
+            except Exception:
+                continue
+            if old not in txt:
+                continue
+            try:
+                _replace_paragraph_with_track_changes(p, txt, txt.replace(old, new))
+            except Exception:
+                # fallback：不做修订，直接替换 runs
+                try:
+                    for r in list(p.runs):
+                        if old in (r.text or ""):
+                            r.text = (r.text or "").replace(old, new)
+                    n += 1
+                except Exception:
+                    pass
+            else:
+                n += 1
+        return n
+
+    count = 0
+    # 正文
+    try:
+        count += _replace_in_paras(getattr(doc, "paragraphs", []) or [])
+    except Exception:
+        pass
+    # 页眉页脚
+    try:
+        for sec in list(getattr(doc, "sections", []) or []):
+            for hf in [getattr(sec, "header", None), getattr(sec, "footer", None)]:
+                if hf is None:
+                    continue
+                count += _replace_in_paras(getattr(hf, "paragraphs", []) or [])
+    except Exception:
+        pass
+    return count
+
+
+def _xlsx_sync_version_everywhere(wb, *, old: str, new: str) -> int:
+    """
+    在 xlsx 中同步版本号：扫描每个工作表的前若干行列，做精确旧值替换。
+    返回替换次数。
+    """
+    if not old or not new or old == new:
+        return 0
+    cnt = 0
+    try:
+        for ws in list(getattr(wb, "worksheets", []) or []):
+            max_r = min((ws.max_row or 0), 120) or 120
+            max_c = min((ws.max_column or 0), 30) or 30
+            for r in range(1, max_r + 1):
+                for c in range(1, max_c + 1):
+                    try:
+                        v = ws.cell(row=r, column=c).value
+                    except Exception:
+                        continue
+                    if v is None:
+                        continue
+                    s = str(v)
+                    if old in s:
+                        ws.cell(row=r, column=c, value=s.replace(old, new))
+                        cnt += 1
+    except Exception:
+        pass
+    return cnt
 
 
 def _header_cell_norm(s: str) -> str:
@@ -680,6 +1136,27 @@ def _xlsx_append_revision_row(wb, meta: Dict) -> bool:
         headers.pop()
     if not headers:
         headers = [str(x) for x in rows[0]]
+    # 版本号：优先从修订记录表中读取上一版并升级（例如 A/1 -> A/2），而不是另写 draft-...
+    old_ver = ""
+    try:
+        slot_map = _build_header_slot_to_col(headers)
+        vcol = slot_map.get("version")
+        if isinstance(vcol, int):
+            for rr in range(ws.max_row or 0, header_row, -1):
+                s = str(ws.cell(row=rr, column=vcol + 1).value or "").strip()
+                if s:
+                    old_ver = s
+                    break
+    except Exception:
+        old_ver = ""
+    if old_ver:
+        new_ver = _compute_next_version(old_ver)
+        if new_ver and new_ver != old_ver:
+            fields["version"] = new_ver
+            try:
+                (meta or {})["version_tag"] = new_ver
+            except Exception:
+                pass
     data_row = _revision_values_by_header(headers, fields)
 
     # 计算追加行：从 header_row 起向下找最后一行有内容的记录（按表头列宽扫描）
@@ -697,6 +1174,13 @@ def _xlsx_append_revision_row(wb, meta: Dict) -> bool:
     target_row = last + 1
     for ci, v in enumerate(data_row, 1):
         ws.cell(row=target_row, column=ci, value=str(v or ""))
+
+    # 同步更新封面/页眉等版本信息（Excel 无页眉对象时，至少同步表格区）
+    try:
+        if old_ver and fields.get("version") and old_ver != fields.get("version"):
+            _xlsx_sync_version_everywhere(wb, old=old_ver, new=str(fields.get("version") or ""))
+    except Exception:
+        pass
     return True
 
 
@@ -720,6 +1204,52 @@ def _docx_append_revision_row(doc, meta: Dict, *, track_changes: bool = True) ->
             return False
         hdr_cells = tbl.rows[0].cells
         headers = [(c.text or "").strip() for c in hdr_cells]
+        slot_map = _build_header_slot_to_col(headers)
+        # 日期格式：自动跟随现有修订记录列（例如 2026.04.13 / 2026/04/13）
+        try:
+            dcol = slot_map.get("date")
+            if isinstance(dcol, int):
+                sample = ""
+                for rr in reversed(list(tbl.rows[1:])):  # 跳过表头
+                    try:
+                        s = (rr.cells[dcol].text or "").strip()
+                    except Exception:
+                        s = ""
+                    if s:
+                        sample = s
+                        break
+                if sample:
+                    if "." in sample and "/" not in sample:
+                        fields["date"] = _dt.datetime.now().strftime("%Y.%m.%d")
+                    elif "/" in sample:
+                        fields["date"] = _dt.datetime.now().strftime("%Y/%m/%d")
+        except Exception:
+            pass
+
+        # 版本号：优先从修订记录表中读取上一版并升级（例如 A/1 -> A/2），而不是另写 draft-...
+        old_ver = ""
+        try:
+            vcol = slot_map.get("version")
+            if isinstance(vcol, int):
+                for rr in reversed(list(tbl.rows[1:])):  # 跳过表头
+                    try:
+                        s = (rr.cells[vcol].text or "").strip()
+                    except Exception:
+                        s = ""
+                    if s:
+                        old_ver = s
+                        break
+        except Exception:
+            old_ver = ""
+        if old_ver:
+            new_ver = _compute_next_version(old_ver)
+            if new_ver and new_ver != old_ver:
+                fields["version"] = new_ver
+                try:
+                    (meta or {})["version_tag"] = new_ver
+                except Exception:
+                    pass
+
         data_row = _revision_values_by_header(headers, fields)
         r = tbl.add_row()
         n_cell = min(len(r.cells), len(data_row))
@@ -733,6 +1263,12 @@ def _docx_append_revision_row(doc, meta: Dict, *, track_changes: bool = True) ->
                     cell.text = val
             except Exception:
                 continue
+        # 同步更新封面/页眉页脚中的版本号（若检测到升级）
+        try:
+            if old_ver and fields.get("version") and old_ver != fields.get("version"):
+                _docx_sync_version_everywhere(doc, old=old_ver, new=str(fields.get("version") or ""))
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -763,6 +1299,7 @@ def export_like_base(
         # 以 base 为主：最大化保留原有格式/页眉页脚/表格/样式
         shutil.copyfile(str(base), str(out))
         doc = Document(str(out))
+        _enable_update_fields_on_open(doc)
 
         # 修订记录：基础文档通常已自带修订记录章节/表。
         # 这里不新建“修订记录”章节，只在已有修订记录表中追加一行；找不到则跳过。
@@ -852,6 +1389,7 @@ def export_docx_inplace_patch(
     doc = Document(str(out))
     if track_changes:
         _enable_track_revisions(doc)
+    _enable_update_fields_on_open(doc)
 
     report: Dict[str, Any] = {"applied": [], "skipped": [], "errors": [], "changes": []}
 
@@ -867,6 +1405,7 @@ def export_docx_inplace_patch(
         return str(out), report
 
     ops: List[Dict[str, Any]] = list(patch_obj.get("operations") or [])
+    tc_rules = _compile_tc_id_rules((patch_obj or {}).get("tc_id_rules") or (meta or {}).get("tc_id_rules"))
 
     def _para_heading_context(p_idx: int) -> str:
         # 粗定位“章节标题”：向上找最近的标题样式段落
@@ -1109,10 +1648,81 @@ def export_docx_inplace_patch(
                 if require_unique and len(hits) != 1:
                     report["skipped"].append({"op": op, "reason": f"插入表格行锚点命中不唯一：{len(hits)}"})
                     continue
+                insert_ok = 0
                 for tbl, r_idx, row in hits:
                     try:
                         col_n = len(row.cells)
                         vals = [x for x in (new_text or "").split("\t")]
+                        if not vals or not any(str(x).strip() for x in vals):
+                            report["skipped"].append(
+                                {
+                                    "op": op,
+                                    "reason": "new_text 按制表符分列后无有效单元格内容（仅空白/制表符），未插入行",
+                                }
+                            )
+                            continue
+
+                        new_joined = "\t".join((vals[ci] if ci < len(vals) else "") for ci in range(col_n)).strip()
+                        parsed = _parse_tc_id_first_cell(vals[0] or "", tc_rules)
+                        if not parsed:
+                            try:
+                                if row.cells:
+                                    parsed = _parse_tc_id_first_cell(row.cells[0].text or "", tc_rules)
+                            except Exception:
+                                parsed = None
+
+                        # 首列可解析为用例编号（如 GN3-22）：按表内同前缀最大编号 +1 分配；已存在编号则按整行相似度决定更新或新行
+                        if parsed:
+                            prefix, _n, rule = parsed
+                            max_n = _table_max_tc_suffix_for_prefix_word(tbl, prefix, tc_rules)
+                            next_id = _next_unique_tc_id_word(
+                                tbl, prefix, rule, tc_rules, max_n + 1
+                            )
+                            id_cell = (vals[0] or "").strip()
+                            ex_idx = _table_find_row_idx_by_id_any_cell(tbl, id_cell)
+
+                            if ex_idx >= 0:
+                                ex_row = tbl.rows[ex_idx]
+                                before_joined = _word_row_joined(ex_row, col_n)
+                                sim = SequenceMatcher(
+                                    None, new_joined, (before_joined or "").strip()
+                                ).ratio()
+                                if sim >= _TC_ROW_SIMILARITY_UPDATE_THRESHOLD:
+                                    written_cells: List[str] = []
+                                    for ci in range(col_n):
+                                        v = vals[ci] if ci < len(vals) else ""
+                                        before = (
+                                            ex_row.cells[ci].text if ci < len(ex_row.cells) else ""
+                                        ) or ""
+                                        if track_changes:
+                                            _replace_table_cell_with_track_changes(
+                                                ex_row.cells[ci], before, v
+                                            )
+                                        else:
+                                            ex_row.cells[ci].text = v
+                                        written_cells.append(v)
+                                    joined = "\t".join(written_cells)
+                                    report["changes"].append(
+                                        {
+                                            "type": "update_table_row_in_place",
+                                            "anchor": anchor,
+                                            "table_row_index": ex_idx,
+                                            "tc_id": id_cell,
+                                            "similarity": round(sim, 4),
+                                            "before": before_joined,
+                                            "after": joined,
+                                            "cells_preview": [str(x).strip() for x in written_cells],
+                                            "note": (
+                                                f"首列编号已存在且整行相似度≥{_TC_ROW_SIMILARITY_UPDATE_THRESHOLD}，已原地更新该行"
+                                            ),
+                                        }
+                                    )
+                                    insert_ok += 1
+                                    continue
+                                vals[0] = next_id
+                            else:
+                                vals[0] = next_id
+
                         # 插入新行：用 add_row + XML 移动到目标位置之后
                         new_row = tbl.add_row()
                         for ci in range(col_n):
@@ -1121,20 +1731,28 @@ def export_docx_inplace_patch(
                                 _replace_table_cell_with_track_changes(new_row.cells[ci], "", v)
                             else:
                                 new_row.cells[ci].text = v
-                        # 将新行移动到 r_idx 后
                         row._tr.addnext(new_row._tr)
-                        report["changes"].append(
-                            {
-                                "type": t,
-                                "anchor": anchor,
-                                "table_row_index": r_idx,
-                                "before": "",
-                                "after": "\t".join(c.text for c in new_row.cells),
-                            }
-                        )
+                        written_cells = [(vals[ci] if ci < len(vals) else "") for ci in range(col_n)]
+                        joined = "\t".join(written_cells)
+                        ch: Dict[str, Any] = {
+                            "type": t,
+                            "anchor": anchor,
+                            "table_row_index": r_idx,
+                            "before": "",
+                            "after": joined,
+                            "cells_preview": [str(x).strip() for x in written_cells],
+                        }
+                        if parsed:
+                            ch["tc_id_assigned"] = (vals[0] or "").strip()
+                            ch["note"] = (
+                                "首列已按表内同模块（前缀）最大编号 +1 分配，避免与已有编号冲突"
+                            )
+                        report["changes"].append(ch)
+                        insert_ok += 1
                     except Exception as _ie:
                         report["errors"].append({"op": op, "error": f"插入表格行失败：{_ie}"})
-                report["applied"].append({"op": op, "hits": len(hits)})
+                if insert_ok:
+                    report["applied"].append({"op": op, "hits": insert_ok})
                 continue
 
             if t == "replace_diagram_after_paragraph_contains":
@@ -1219,6 +1837,7 @@ def export_xlsx_inplace_patch(
     wb = openpyxl.load_workbook(str(out))
 
     ops: List[Dict[str, Any]] = list((patch_obj or {}).get("operations") or [])
+    tc_rules = _compile_tc_id_rules((patch_obj or {}).get("tc_id_rules") or (meta or {}).get("tc_id_rules"))
 
     def _iter_cells():
         for ws in wb.worksheets:
@@ -1319,21 +1938,90 @@ def export_xlsx_inplace_patch(
                     report["skipped"].append({"op": op, "reason": f"插入行锚点命中不唯一：{len(hits)}"})
                     continue
                 ws, r_idx = hits[0]
-                ws.insert_rows(r_idx + 1)
                 vals = [x for x in (new_text or "").split("\t")]
-                for ci, v in enumerate(vals, start=1):
-                    ws.cell(row=r_idx + 1, column=ci, value=v)
-                report["changes"].append(
-                    {
+                if not vals or not any(str(x).strip() for x in vals):
+                    report["skipped"].append(
+                        {
+                            "op": op,
+                            "reason": "new_text 按制表符分列后无有效单元格内容（仅空白/制表符），未插入行",
+                        }
+                    )
+                    continue
+                try:
+                    col_n = min(80, max(len(vals), int(ws.max_column or 0), 1))
+                    new_joined = "\t".join(
+                        (vals[ci] if ci < len(vals) else "") for ci in range(col_n)
+                    ).strip()
+                    parsed = _parse_tc_id_first_cell(vals[0] or "", tc_rules)
+                    if not parsed:
+                        try:
+                            av = ws.cell(row=r_idx, column=1).value
+                            parsed = _parse_tc_id_first_cell("" if av is None else str(av), tc_rules)
+                        except Exception:
+                            parsed = None
+
+                    if parsed:
+                        prefix, _n, rule = parsed
+                        max_n = _table_max_tc_suffix_for_prefix_xlsx(ws, prefix, tc_rules)
+                        next_id = _next_unique_tc_id_xlsx(
+                            ws, prefix, rule, tc_rules, max_n + 1
+                        )
+                        id_cell = (vals[0] or "").strip()
+                        ex_r = _xlsx_find_row_by_id_any_col(ws, id_cell)
+                        if ex_r >= 0:
+                            before_joined = _xlsx_row_joined(ws, ex_r, col_n)
+                            sim = SequenceMatcher(
+                                None, new_joined, (before_joined or "").strip()
+                            ).ratio()
+                            if sim >= _TC_ROW_SIMILARITY_UPDATE_THRESHOLD:
+                                for ci in range(1, col_n + 1):
+                                    v = vals[ci - 1] if ci - 1 < len(vals) else ""
+                                    ws.cell(row=ex_r, column=ci, value=v)
+                                joined = "\t".join(
+                                    (vals[ci] if ci < len(vals) else "") for ci in range(len(vals))
+                                )
+                                report["changes"].append(
+                                    {
+                                        "type": "update_table_row_in_place",
+                                        "anchor": anchor,
+                                        "sheet": ws.title,
+                                        "row_index": ex_r,
+                                        "tc_id": id_cell,
+                                        "similarity": round(sim, 4),
+                                        "before": before_joined,
+                                        "after": joined,
+                                        "cells_preview": [str(x).strip() for x in vals],
+                                        "note": (
+                                            f"首列编号已存在且整行相似度≥{_TC_ROW_SIMILARITY_UPDATE_THRESHOLD}，已原地更新该行"
+                                        ),
+                                    }
+                                )
+                                report["applied"].append({"op": op, "hits": 1})
+                                continue
+                            vals[0] = next_id
+                        else:
+                            vals[0] = next_id
+
+                    ws.insert_rows(r_idx + 1)
+                    for ci, v in enumerate(vals, start=1):
+                        ws.cell(row=r_idx + 1, column=ci, value=v)
+                    joined = "\t".join(vals)
+                    chx: Dict[str, Any] = {
                         "type": t,
                         "anchor": anchor,
                         "sheet": ws.title,
                         "row_index": r_idx,
                         "before": "",
-                        "after": new_text,
+                        "after": joined,
+                        "cells_preview": [str(x).strip() for x in vals],
                     }
-                )
-                report["applied"].append({"op": op, "hits": 1})
+                    if parsed:
+                        chx["tc_id_assigned"] = (vals[0] or "").strip()
+                        chx["note"] = "首列已按表内同模块（前缀）最大编号 +1 分配"
+                    report["changes"].append(chx)
+                    report["applied"].append({"op": op, "hits": 1})
+                except Exception as _ie:
+                    report["errors"].append({"op": op, "error": f"插入行失败：{_ie}"})
                 continue
 
             report["skipped"].append({"op": op, "reason": f"不支持的 type：{t}"})

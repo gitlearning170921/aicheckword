@@ -317,6 +317,90 @@ DOC_LANG_OPTIONS = ["不指定", "中文版", "英文版", "中英文"]
 DOC_LANG_LABEL_TO_VALUE = {"不指定": "", "中文版": "zh", "英文版": "en", "中英文": "both"}
 DOC_LANG_VALUE_TO_LABEL = {"": "不指定", "zh": "中文版", "en": "英文版", "both": "中英文"}
 
+# 与「生成初稿」页编写人员身份下拉顺序一致：["", "pm", "pjm", "rm", "rdm", "ui", "qa", "cm", "ra", "prod"]
+_DRAFT_AUTHOR_ROLE_KEYS = ["", "pm", "pjm", "rm", "rdm", "ui", "qa", "cm", "ra", "prod"]
+
+
+def _infer_draft_author_role_idx(
+    file_names: list,
+    *,
+    registration_type: str = "",
+    project_form: str = "",
+) -> int:
+    """根据待生成文件名与模板案例上的注册类别/项目形态，推断「编写人员身份」下拉索引。"""
+    scores = {k: 0 for k in _DRAFT_AUTHOR_ROLE_KEYS}
+
+    def _idx(k: str) -> int:
+        try:
+            return _DRAFT_AUTHOR_ROLE_KEYS.index(k)
+        except ValueError:
+            return 0
+
+    rt = (registration_type or "").strip()
+    pf = (project_form or "").strip()
+    high_risk_reg = any(x in rt for x in ("三类", "Ⅲ", "Ⅱb", "Ⅱa"))
+
+    for fn in file_names or []:
+        s = (fn or "").strip()
+        if not s:
+            continue
+        low = s.lower()
+
+        def _hit(*parts: str) -> bool:
+            for p in parts:
+                if not p:
+                    continue
+                if all(ord(c) < 128 for c in p):
+                    if p.lower() in low:
+                        return True
+                else:
+                    if p in s:
+                        return True
+            return False
+
+        if _hit("测试用例", "test case", "test execution", "system test", "确认测试", "verification plan", "verification report"):
+            scores["qa"] += 3
+        if _hit("traceability", "追溯", "rtm", "可追溯性", "traceability analysis"):
+            scores["qa"] += 2
+        if _hit("risk", "ras", "rmp", "rmr", "风险分析", "风险管理", "risk analysis", "risk management"):
+            scores["rm"] += 3
+            if high_risk_reg:
+                scores["rm"] += 1
+        if _hit("srs", "软件需求", "requirement specification", "软件需求规范", "urs", "软件需求说明书"):
+            scores["rdm"] += 2
+        if _hit("architecture", "ads", "架构", "详细设计", "design specification", "sdd", "网络安全", "cybersecurity", "cyber security"):
+            scores["rdm"] += 2
+        if _hit("software description", "软件描述"):
+            scores["rdm"] += 2
+        if _hit("audit", "审计", "日志", "权限", "access control"):
+            scores["rdm"] += 1
+        if _hit("instruction", "ifu", "说明书", "使用说明", "udn", "用户手册", "instructions for use"):
+            scores["ra"] += 2
+        if _hit("label", "标签"):
+            scores["ra"] += 1
+        if _hit("milestone", "计划", "project plan", "schedule"):
+            scores["pjm"] += 2
+        if _hit("config", "配置管理", "release", "baseline", "configuration"):
+            scores["cm"] += 2
+        if _hit("interface", "界面", " ui", "usability", "交互"):
+            scores["ui"] += 2
+        if _hit("生产", "production", "manufacturing"):
+            scores["prod"] += 2
+        if _hit("预期用途", "适应症", "intended use"):
+            scores["pm"] += 1
+
+    if max(scores.values()) == 0:
+        if pf and any(x in pf for x in ("软件", "APP", "Web", "PC", "独立")):
+            return _idx("rdm")
+        return 0
+
+    tie_break = ["qa", "rm", "rdm", "ra", "pm", "pjm", "ui", "cm", "prod", ""]
+    best = max(scores.values())
+    for k in tie_break:
+        if scores.get(k, 0) == best:
+            return _idx(k)
+    return 0
+
 
 def _format_case_option(c: dict) -> str:
     """项目案例下拉项显示：案例名（产品 · 国家 · 文档语言），便于区分同名案例。"""
@@ -3465,6 +3549,7 @@ def render_step3_page():
                 st.error(f"保存失败：{e}")
 
     def _step3_tab_upload_review():
+        nonlocal review_context
         _retry_ok = st.session_state.pop("review_retry_ok_msg", None)
         if _retry_ok:
             st.success(_retry_ok)
@@ -3493,6 +3578,13 @@ def render_step3_page():
                 help="填写后可在审核结果下方直接打开在线文档对照查看。",
             )
             kdocs_filename = st.text_input("文档名称（含扩展名，选填）", value="", placeholder="如 产品说明书.docx（不填则自动识别）", key="kdocs_filename")
+            kdocs_ref_files = st.file_uploader(
+                "参考文件（可选：本次审核将按参考文件要求对照核查）",
+                type=["pdf", "docx", "doc", "xlsx", "xls", "txt", "md", "zip", "tar", "gz", "tgz"],
+                accept_multiple_files=True,
+                key="kdocs_review_reference_uploader",
+                help="可上传程序文件、技术要求、规范、追溯制度等作为本次审核的对照依据。系统会摘录其内容并注入审核上下文。",
+            )
             if st.button("🚀 开始审核", key="kdocs_review_btn"):
                 download_url = (kdocs_download_url or "").strip()
                 view_url = (kdocs_view_url or "").strip()
@@ -3513,6 +3605,36 @@ def render_step3_page():
                             agent = init_agent()
                             ctx = dict(review_context or {})
                             ctx["document_language"] = DOC_LANG_LABEL_TO_VALUE.get(st.session_state.get("review_doc_lang") or "不指定", "")
+                            # 参考文件：注入审核上下文
+                            try:
+                                if kdocs_ref_files:
+                                    _ritems, _rdirs = _expand_uploads(kdocs_ref_files)
+                                    _ref_blocks = []
+                                    _ref_cap = 18000
+                                    _used = 0
+                                    for _rp, _rdn, _rarch in _ritems:
+                                        try:
+                                            _docs = load_single_file(_rp)
+                                            _txt = "\n\n".join(getattr(d, "page_content", str(d)) for d in _docs) if _docs else ""
+                                        except Exception:
+                                            _txt = ""
+                                        if not _txt.strip():
+                                            continue
+                                        _seg = f"【参考文件：{_rdn}】\n{_txt.strip()}"
+                                        _ref_blocks.append(_seg)
+                                        _used += len(_seg)
+                                        if _used >= _ref_cap:
+                                            break
+                                    if _ref_blocks:
+                                        ctx["reference_docs_excerpt"] = ("\n\n---\n\n".join(_ref_blocks))[:_ref_cap]
+                                    # 清理参考文件临时路径
+                                    for _p, _dn, _arch in _ritems:
+                                        if not _arch:
+                                            Path(_p).unlink(missing_ok=True)
+                                    for _d in _rdirs:
+                                        shutil.rmtree(_d, ignore_errors=True)
+                            except Exception:
+                                pass
                             with st.spinner("AI 正在审核文档…"):
                                 report = agent.review_text(text, file_name=fn, review_context=ctx)
                             report["original_filename"] = fn
@@ -3543,6 +3665,13 @@ def render_step3_page():
             type=["pdf", "docx", "doc", "xlsx", "xls", "txt", "md", "zip", "tar", "gz", "tgz"],
             accept_multiple_files=True,
             key="review_uploader",
+        )
+        ref_files = st.file_uploader(
+            "参考文件（可选：本次审核将按参考文件要求对照核查）",
+            type=["pdf", "docx", "doc", "xlsx", "xls", "txt", "md", "zip", "tar", "gz", "tgz"],
+            accept_multiple_files=True,
+            key="review_reference_uploader",
+            help="可上传程序文件、技术要求、规范、追溯制度等作为本次审核的对照依据。系统会摘录其内容并注入审核上下文。",
         )
         if review_files:
             n_upload = len(review_files)
@@ -3705,6 +3834,37 @@ def render_step3_page():
             # 按项目审核时自动按项目适用注册类别匹配审核点；通用审核不区分类别、使用全部审核点
             if project_id:
                 review_context["_filter_by_registration_type"] = True
+
+            # 参考文件：注入审核上下文（对所有本批文件生效）
+            try:
+                if ref_files:
+                    _ritems, _rdirs = _expand_uploads(ref_files)
+                    _ref_blocks = []
+                    _ref_cap = 22000
+                    _used = 0
+                    for _rp, _rdn, _rarch in _ritems:
+                        try:
+                            _docs = load_single_file(_rp)
+                            _txt = "\n\n".join(getattr(d, "page_content", str(d)) for d in _docs) if _docs else ""
+                        except Exception:
+                            _txt = ""
+                        if not _txt.strip():
+                            continue
+                        _seg = f"【参考文件：{_rdn}】\n{_txt.strip()}"
+                        _ref_blocks.append(_seg)
+                        _used += len(_seg)
+                        if _used >= _ref_cap:
+                            break
+                    if _ref_blocks:
+                        review_context["reference_docs_excerpt"] = ("\n\n---\n\n".join(_ref_blocks))[:_ref_cap]
+                    # 清理参考文件临时路径
+                    for _p, _dn, _arch in _ritems:
+                        if not _arch:
+                            Path(_p).unlink(missing_ok=True)
+                    for _d in _rdirs:
+                        shutil.rmtree(_d, ignore_errors=True)
+            except Exception:
+                pass
 
             total_files = len(items)
             if total_files > 1:
@@ -4378,6 +4538,13 @@ def render_step3_page():
             placeholder="粘贴文档内容到这里...",
         )
         text_file_name = st.text_input("文件名（可选）", value="直接输入")
+        text_ref_files = st.file_uploader(
+            "参考文件（可选：本次审核将按参考文件要求对照核查）",
+            type=["pdf", "docx", "doc", "xlsx", "xls", "txt", "md", "zip", "tar", "gz", "tgz"],
+            accept_multiple_files=True,
+            key="review_text_reference_uploader",
+            help="可上传程序文件、技术要求、规范、追溯制度等作为本次审核的对照依据。系统会摘录其内容并注入审核上下文。",
+        )
 
         if review_text and st.button("🔍 审核文本", key="review_text_btn"):
             agent = init_agent()
@@ -4389,6 +4556,35 @@ def render_step3_page():
                 _text_ctx = dict(review_context) if review_context else {}
                 _tl = st.session_state.get("review_text_doc_lang") or "不指定"
                 _text_ctx["document_language"] = DOC_LANG_LABEL_TO_VALUE.get(_tl, "")
+                # 参考文件：注入审核上下文
+                try:
+                    if text_ref_files:
+                        _ritems, _rdirs = _expand_uploads(text_ref_files)
+                        _ref_blocks = []
+                        _ref_cap = 18000
+                        _used = 0
+                        for _rp, _rdn, _rarch in _ritems:
+                            try:
+                                _docs = load_single_file(_rp)
+                                _txt = "\n\n".join(getattr(d, "page_content", str(d)) for d in _docs) if _docs else ""
+                            except Exception:
+                                _txt = ""
+                            if not _txt.strip():
+                                continue
+                            _seg = f"【参考文件：{_rdn}】\n{_txt.strip()}"
+                            _ref_blocks.append(_seg)
+                            _used += len(_seg)
+                            if _used >= _ref_cap:
+                                break
+                        if _ref_blocks:
+                            _text_ctx["reference_docs_excerpt"] = ("\n\n---\n\n".join(_ref_blocks))[:_ref_cap]
+                        for _p, _dn, _arch in _ritems:
+                            if not _arch:
+                                Path(_p).unlink(missing_ok=True)
+                        for _d in _rdirs:
+                            shutil.rmtree(_d, ignore_errors=True)
+                except Exception:
+                    pass
                 with st.spinner("AI 正在审核文本，请耐心等待..."):
                     report = _call_with_transient_retry(
                         lambda: agent.review_text(
@@ -7477,18 +7673,7 @@ def render_draft_page():
         "注册工程师",
         "生产专员",
     ]
-    _draft_author_role_keys = ["", "pm", "pjm", "rm", "rdm", "ui", "qa", "cm", "ra", "prod"]
-    _draft_ar_i = st.selectbox(
-        "编写人员身份（自动调整提示词视角与侧重点）",
-        list(range(len(_draft_author_role_labels))),
-        format_func=lambda i: _draft_author_role_labels[int(i)],
-        index=0,
-        key="draft_author_role_idx",
-        help="选择后会在生成提示词中注入对应身份的写作要求；不替代 skills/rules 与项目维度硬约束。",
-    )
-    draft_author_role = _draft_author_role_keys[int(_draft_ar_i)]
-    # 多文件按目标身份：先初始化，等 2.1 目标文件名确定后再渲染配置区
-    author_role_map = {}
+    _draft_author_role_keys = list(_DRAFT_AUTHOR_ROLE_KEYS)
 
     cases = _cached_list_project_cases(collection)
     if not cases:
@@ -7510,6 +7695,18 @@ def render_draft_page():
         key="draft_base_case_idx",
     )
     base_case_id, base_case = case_by_idx[int(base_case_idx)]
+    # 切换模板案例时：清空上一次目标文件选择，避免误用“留空=全部”导致默认跑全量
+    try:
+        _last_case_id = st.session_state.get("_draft_last_base_case_id")
+        if _last_case_id != base_case_id:
+            st.session_state["_draft_last_base_case_id"] = base_case_id
+            st.session_state["draft_template_files"] = []
+            # 同时清掉“生成全部文件”的确认（按 case 绑定）
+            st.session_state.pop(f"draft_select_all_{_last_case_id}", None)
+    except Exception:
+        pass
+    # 控件值统一由 session_state 驱动：避免 default 与 session_state 同时赋值触发 Streamlit 警告
+    st.session_state.setdefault("draft_template_files", [])
 
     # 案例文件名列表：支持搜索下拉选择（可多选）
     try:
@@ -7520,36 +7717,91 @@ def render_draft_page():
         selected_template_files = st.multiselect(
             "2.1) 选择要生成的文件名称（可搜索，多选；留空=生成该案例下全部文件）",
             options=case_file_names,
-            default=[],
             key="draft_template_files",
         )
+        # 重要：切换模板/清空多选后，不应默认“全选生成”。需显式确认。
+        _select_all = False
+        if not selected_template_files:
+            _select_all = st.checkbox(
+                "生成该案例下全部文件（需显式确认）",
+                value=False,
+                key=f"draft_select_all_{base_case_id}",
+                help="避免切换模板后误触发全量生成。若不勾选，请在上方多选中选择要生成的文件。",
+            )
+        effective_template_files = list(selected_template_files) if selected_template_files else (list(case_file_names) if _select_all else [])
     else:
         selected_template_files = []
+        effective_template_files = []
         st.caption("该案例在知识库中尚未关联到具体文件名（可能未完成训练或 case_id 未写入）。将尝试生成全部可用内容。")
 
+    # 编写人员身份：随「模板案例 + 待生成文件名 + 案例内项目形态/注册类别」变化自动匹配默认项，用户可改
+    try:
+        _role_sig = (
+            f"{base_case_id}|{','.join(sorted(effective_template_files or []))}|"
+            f"{(base_case.get('project_form') or '').strip()}|{(base_case.get('registration_type') or '').strip()}"
+        )
+        if st.session_state.get("_draft_author_role_sig") != _role_sig:
+            st.session_state["_draft_author_role_sig"] = _role_sig
+            st.session_state["draft_author_role_idx"] = _infer_draft_author_role_idx(
+                list(effective_template_files or []),
+                registration_type=(base_case.get("registration_type") or ""),
+                project_form=(base_case.get("project_form") or ""),
+            )
+    except Exception:
+        st.session_state.setdefault("draft_author_role_idx", 0)
+
+    _draft_ar_i = st.selectbox(
+        "编写人员身份（默认按文件名与软件法规相关项目信息智能匹配，可改）",
+        list(range(len(_draft_author_role_labels))),
+        format_func=lambda i: _draft_author_role_labels[int(i)],
+        key="draft_author_role_idx",
+        help="默认根据当前待生成文件名关键词（如测试/风险/SRS/架构/说明书等）及模板案例上的注册类别、项目形态推断；更改文件选择或模板案例后会重新匹配。可手动覆盖。",
+    )
+    draft_author_role = _draft_author_role_keys[int(_draft_ar_i)]
+    if draft_author_role == "qa":
+        st.caption(
+            "测试工程师：参考相对基底的新增/变更需求须在既有测试用例表或测试章节中生成对应用例覆盖（常见为一条需求对应多条用例），并保持可追溯；不新增顶层章节标题。"
+        )
+    author_role_map = {}
+
     # 多文件：允许为每个目标文件选择不同身份（同一套参考文件，共同属于同一 project_id 文件集）
-    _targets_for_role = list(selected_template_files) if selected_template_files else list(case_file_names or [])
+    _targets_for_role = list(effective_template_files or [])
     if _targets_for_role:
         with st.expander("按目标文件设置编写人员身份（可选）", expanded=False):
-            st.caption("未单独设置的目标文件将使用上方的「编写人员身份」默认值。")
+            st.caption("默认按每个目标文件名智能匹配（同上方逻辑）；你也可以逐个手动覆盖。未单独设置时仍使用上方的默认身份。")
             import hashlib as _hashlib
 
             for _fn in _targets_for_role:
                 if _fn not in (case_file_names or []):
                     continue
                 _hk = _hashlib.md5((_fn + "role").encode("utf-8")).hexdigest()[:12]
+                # 每个目标文件：随「模板案例 + 文件名 + 案例内项目形态/注册类别」变化自动匹配默认项
+                try:
+                    _sig_pf = (
+                        f"{base_case_id}|{_fn}|"
+                        f"{(base_case.get('project_form') or '').strip()}|{(base_case.get('registration_type') or '').strip()}"
+                    )
+                    _sig_key = f"_draft_role_pf_sig_{_hk}"
+                    if st.session_state.get(_sig_key) != _sig_pf:
+                        st.session_state[_sig_key] = _sig_pf
+                        st.session_state[f"draft_role_pf_{_hk}"] = _infer_draft_author_role_idx(
+                            [_fn],
+                            registration_type=(base_case.get("registration_type") or ""),
+                            project_form=(base_case.get("project_form") or ""),
+                        )
+                except Exception:
+                    st.session_state.setdefault(f"draft_role_pf_{_hk}", 0)
                 _i = st.selectbox(
                     f"{_fn} → 编写人员身份",
                     list(range(len(_draft_author_role_labels))),
                     format_func=lambda i: _draft_author_role_labels[int(i)],
-                    index=int(st.session_state.get(f"draft_role_pf_{_hk}", 0) or 0),
                     key=f"draft_role_pf_{_hk}",
                 )
                 rk = _draft_author_role_keys[int(_i)] if int(_i) < len(_draft_author_role_keys) else ""
                 if rk:
                     author_role_map[_fn] = rk
 
-    _cfg_for_per_file = list(selected_template_files) if selected_template_files else list(case_file_names or [])
+    _cfg_for_per_file = list(effective_template_files or [])
     if case_file_names and _cfg_for_per_file:
         with st.expander("2.2) 按生成文件配置 Skills / Rules（可选，保存到数据库）", expanded=False):
             st.caption(
@@ -7671,7 +7923,7 @@ def render_draft_page():
         "关闭则需手动将每份 Base 绑定到目标文件名。"
     )
 
-    base_target_options = selected_template_files or []
+    base_target_options = effective_template_files or []
     if not base_target_options and case_file_names:
         base_target_options = case_file_names[:]
 
@@ -8127,14 +8379,19 @@ def render_draft_page():
                     drafts_dir = settings.uploads_path / "draft_outputs"
                     drafts_dir.mkdir(parents=True, exist_ok=True)
                     out_path = drafts_dir / f"{out_prefix}_{out_name}"
+                    _is_en_doc = str(regen_extra.get("document_language") or doc_lang_val or "").strip().lower().startswith("en")
                     meta = {
                         "project_id": res.project_id,
                         "project_case_id": None,
                         "base_file": Path(base_path).name,
-                        "change_summary": "按历史记录重新生成（基于基础文件按规则补写/修订；对照参考识别新增·细化·删除）"
-                        if inplace_mode_regen
-                        else "按历史记录重新生成（基于基础文件按规则补写/修订）",
-                        "generated_by": "aicheckword 文档初稿生成（历史记录重新生成）",
+                        "change_summary": (
+                            "Regenerated from history (identify additions/refinements/deletions from references)"
+                            if _is_en_doc and inplace_mode_regen
+                            else ("Regenerated from history" if _is_en_doc else (
+                                "按历史记录重新生成（基于基础文件按规则补写/修订；对照参考识别新增·细化·删除）" if inplace_mode_regen else "按历史记录重新生成（基于基础文件按规则补写/修订）"
+                            ))
+                        ),
+                        "generated_by": ("aicheckword draft generator (regenerated)" if _is_en_doc else "aicheckword 文档初稿生成（历史记录重新生成）"),
                     }
                     saved = None
                     patch_json = (getattr(res, "generated_patches", {}) or {}).get(fn) if inplace_mode_regen else None
@@ -8358,6 +8615,10 @@ def render_draft_page():
         if not input_files:
             st.warning("请先上传输入/参考文件。")
         else:
+            # 若本案例有文件名列表，但用户未选择且未确认全量生成，则要求先选择
+            if case_file_names and not effective_template_files:
+                st.warning("请先在「2.1 选择要生成的文件名称」中选择文件；或勾选“生成该案例下全部文件”。")
+                return
             tmp_dir = Path(tempfile.mkdtemp(prefix="aicheckword_draft_in_ui_"))
             input_paths = []
             existing_base_files = {}
@@ -8406,7 +8667,7 @@ def render_draft_page():
                 _submit_draft_job(
                     {
                         "base_case_id": base_case_id,
-                        "template_file_names": selected_template_files or None,
+                        "template_file_names": effective_template_files or None,
                         "project_id": selected_project_id if proj_mode.startswith("使用已有") else None,
                         "existing_base_files": existing_base_files or None,
                         "base_files_manifest": base_files_manifest or None,
@@ -8500,14 +8761,19 @@ def render_draft_page():
                         drafts_dir.mkdir(parents=True, exist_ok=True)
                         out_path = drafts_dir / f"{out_prefix}_{out_name}"
                         out_path = _safe_out_path(base_path=base_path, out_path=out_path)
+                        _is_en_doc = str(doc_lang_val or "").strip().lower().startswith("en")
                         meta = {
                             "project_id": res.project_id,
                             "project_case_id": res.project_case_id,
                             "base_file": Path(base_path).name,
-                            "change_summary": "基于基础文件按规则补写/修订生成（对照参考识别新增·细化·删除）"
-                            if inplace_mode
-                            else "基于基础文件按规则补写/修订生成",
-                            "generated_by": "aicheckword 文档初稿生成",
+                            "change_summary": (
+                                "Update based on base document (identify additions/refinements/deletions from references)"
+                                if _is_en_doc and inplace_mode
+                                else ("Update based on base document" if _is_en_doc else (
+                                    "基于基础文件按规则补写/修订生成（对照参考识别新增·细化·删除）" if inplace_mode else "基于基础文件按规则补写/修订生成"
+                                ))
+                            ),
+                            "generated_by": ("aicheckword draft generator" if _is_en_doc else "aicheckword 文档初稿生成"),
                         }
                         saved = None
                         patch_json = (getattr(res, "generated_patches", {}) or {}).get(fn) if inplace_mode else None
