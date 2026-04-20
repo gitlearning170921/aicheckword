@@ -353,15 +353,16 @@ class ReviewAgent:
         )
         sys_p = system_prompt if (system_prompt is not None and system_prompt.strip()) else get_review_system_prompt()
         usr_p = user_prompt if (user_prompt is not None and user_prompt.strip()) else get_review_user_prompt()
+        disp = (display_file_name or "").strip()
         report = self.reviewer.review_file(
             file_path,
             review_context=ctx,
             project_context_text=project_context_text or None,
             system_prompt=sys_p,
             user_prompt=usr_p,
+            display_file_name=disp or None,
         )
         out = report.to_dict()
-        disp = (display_file_name or "").strip()
         if disp:
             out["file_name"] = disp
             out["original_filename"] = disp

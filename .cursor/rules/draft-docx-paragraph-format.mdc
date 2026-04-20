@@ -1,0 +1,32 @@
+---
+description: 文档初稿/就地修改时，插入或替换段落须与基底 Word 同位置版式一致；缩略语/法规分项换行；参考文献 [n] 续号；与项目案例知识库模板对齐
+globs: src/core/draft_export.py,src/core/document_draft_generator.py
+---
+
+# Docx 就地修改：段落版式与分项规则（aicheckword）
+
+## 1) 与「项目案例知识库」的关系
+
+- **格式真源**：`project_case` 知识库中的模板/案例正文（生成提示里的 `TEMPLATE_TEXT`、`TEMPLATE_REFERENCE_TEXT`）与用户 **EXISTING_DRAFT_TEXT / 上传基底 Word** 决定章节结构、缩进层级、字体习惯与参考文献写法。
+- **模型职责**：在 `PATCH_JSON` / 全文输出中，对 Definitions、References、法规列表等，**多条内容必须换行分项**；不得把多条缩略语或多项标准挤成单段；编号样式须与**该小节已有写法**一致（见 `document_draft_generator` 提示中的分项要求）。
+- **程序职责**：`export_docx_inplace_patch` 对 `replace_paragraph_contains` / `insert_paragraph_after_contains` 在写回 docx 时，须继承锚点段落的 **run 字体属性（rPr）** 与 **paragraph_format**（含首行缩进、行距等），并对 `new_text` 做**拆段**与（在 References 等语境下）**`[n]` 续号**（见 `draft_export.py` 中 `_expand_docx_insert_text_to_paragraphs`、`_copy_paragraph_layout_and_style`、`_normalize_reference_chunks` 等）。
+
+## 2) 分项与换行（模型 + 程序）
+
+- **优先换行**：同一小节内多条缩略语定义、多条 `[n]` 文献、多条以分号分隔的标准/法规，在 `new_text` 中用 **换行** 分隔；程序会再按规则拆成多段。
+- **英文定义链**：多条 `… refers to …` 不得糊成一段；模型侧换行；程序侧可按句号/分号等边界再拆（见 `_split_definitions_and_standards_blob`）。
+- **参考文献 `[n]`**：仅在标题语境含 `reference` / `参考文献` / `normative` 等，或条目明显为文献（IEC/ISO/FDA…）时，程序才做 **`[n]` 全文档最大号续编**；**Definitions** 等小节勿误套 `[n]`。
+
+## 3) 版式继承（程序硬约束）
+
+- 插入/新增段须 **`style` + `paragraph_format` 与锚点段一致**（对齐、左右缩进、首行缩进、段前后距、行距规则等，以 python-docx 可写属性为限）。
+- 跟踪修订写入时，**w:del / w:ins 内 run** 应带锚点段 **rPr 副本**，避免插入段落到默认字体与正文不一致。
+
+## 4) 与追溯/审核规则的关系
+
+- **追溯编号（URS/REQ/CS…）**：仍遵守 `document-authoring-and-audit.mdc`：**逐字复制**，与本条「分项换行」独立；不得因拆段改写编号。
+- **页码**：仍禁止虚构页码；定位用章节/表头/条目编号。
+
+## 5) 局限与后续增强
+
+- **Word 多级列表/自动编号域**：当前以「段落 + 文本 `[n]`」为主；若模板纯用列表样式而无显式 `[n]`，需在模板或程序侧单独增强，不可假定已继承列表定义。

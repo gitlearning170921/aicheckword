@@ -15,6 +15,7 @@ from .review_throttle import wait_before_llm_call
 from .knowledge_base import KnowledgeBase
 from .document_loader import load_single_file
 from .db import get_dimension_options, get_corrections_for_collection, get_review_extra_instructions
+from .display_filename import is_probable_temp_upload_basename
 
 
 def _registration_strictness_context(registration_type: str) -> str:
@@ -1219,6 +1220,41 @@ class DocumentReviewer:
                 out.append(replace(p, modify_docs=[fn]))
         return out
 
+    def _rewrite_temp_modify_docs(
+        self,
+        points: List[AuditPoint],
+        *,
+        storage_basename: str,
+        display_basename: str,
+        multi_doc_mode: bool,
+    ) -> List[AuditPoint]:
+        """将 modify_docs 中的临时上传名（tmp*.docx）替换为用户展示名，避免界面出现系统临时文件名。"""
+        if multi_doc_mode or not display_basename:
+            return points
+        sb = (storage_basename or "").strip()
+        if not sb:
+            return points
+        sb_key = Path(sb.replace("\\", "/")).name.casefold()
+        dd = display_basename.strip()
+        if not dd or sb_key == Path(dd.replace("\\", "/")).name.casefold():
+            return points
+        out: List[AuditPoint] = []
+        for p in points:
+            md_in = [str(x).strip() for x in (p.modify_docs or []) if x is not None and str(x).strip()]
+            new_md: List[str] = []
+            seen = set()
+            for ms in md_in:
+                bn = Path(ms.replace("\\", "/")).name
+                if bn.casefold() == sb_key or is_probable_temp_upload_basename(bn):
+                    val = dd
+                else:
+                    val = ms
+                if val not in seen:
+                    seen.add(val)
+                    new_md.append(val)
+            out.append(replace(p, modify_docs=new_md))
+        return out
+
     def _post_process_audit_points(
         self,
         points: List[AuditPoint],
@@ -1226,6 +1262,8 @@ class DocumentReviewer:
         review_context: Optional[dict] = None,
         *,
         primary_display_name: str = "",
+        logical_display_name: str = "",
+        storage_basename: str = "",
         multi_doc_mode: bool = False,
     ) -> List[AuditPoint]:
         points = self._normalize_actions(points)
@@ -1258,9 +1296,16 @@ class DocumentReviewer:
                     filtered.append(p)
             points = filtered
         points = self._deduplicate_audit_points(points)
+        backfill_name = (logical_display_name or primary_display_name or "").strip()
+        points = self._rewrite_temp_modify_docs(
+            points,
+            storage_basename=storage_basename,
+            display_basename=backfill_name,
+            multi_doc_mode=multi_doc_mode,
+        )
         points = self._backfill_empty_modify_docs(
             points,
-            primary_display_name=primary_display_name,
+            primary_display_name=backfill_name,
             multi_doc_mode=multi_doc_mode,
         )
         return points
@@ -1273,12 +1318,17 @@ class DocumentReviewer:
         project_context_text: Optional[str] = None,
         system_prompt: Optional[str] = None,
         user_prompt: Optional[str] = None,
+        *,
+        storage_basename: str = "",
+        logical_display_name: str = "",
     ) -> AuditReport:
         pv = (
             (review_context or {}).get("current_provider")
             or getattr(settings, "provider", "")
             or ""
         ).strip().lower()
+        # 展示用文件名：单文件为上传名；分块审核时 file_name 为「xxx (第i/n段)」，纠正/知识库检索用 eff_display
+        eff_display = (logical_display_name or file_name).strip() or file_name
         # 按项目审核时用项目类别过滤审核点；通用审核不过滤，匹配所有审核点
         reg_type_for_filter = None
         reg_countries_for_retrieval = None
@@ -1292,7 +1342,7 @@ class DocumentReviewer:
             registration_countries=reg_countries_for_retrieval,
             for_provider=pv,
         )
-        _corr_ctx = self._retrieve_audit_corrections_context(file_name)
+        _corr_ctx = self._retrieve_audit_corrections_context(eff_display)
         if _corr_ctx:
             context += _corr_ctx
         # 按页面选中的注册国家，用「国家→额外关键词」扩展检索知识库中该国家相关法规，扩大审核面
@@ -1432,16 +1482,18 @@ class DocumentReviewer:
             text=text,
             review_context=review_context,
             primary_display_name=file_name,
+            logical_display_name=logical_display_name,
+            storage_basename=storage_basename,
             multi_doc_mode=False,
         )
         # 程序级显性检查（补漏）
         try:
-            audit_points = (self._rule_based_obvious_checks(text, file_name) or []) + (audit_points or [])
+            audit_points = (self._rule_based_obvious_checks(text, eff_display) or []) + (audit_points or [])
         except Exception:
             pass
         audit_points = self._deduplicate_audit_points(audit_points)
 
-        report = AuditReport(file_name=file_name)
+        report = AuditReport(file_name=eff_display)
         report.audit_points = audit_points
         report.total_points = len(audit_points)
         report.high_count = sum(1 for p in audit_points if p.severity == "high")
@@ -1459,15 +1511,35 @@ class DocumentReviewer:
         project_context_text: Optional[str] = None,
         system_prompt: Optional[str] = None,
         user_prompt: Optional[str] = None,
+        display_file_name: Optional[str] = None,
     ) -> AuditReport:
         path = Path(file_path)
+        storage_bn = path.name
+        fn = (display_file_name or "").strip() or storage_bn
         docs = load_single_file(path)
         full_text = "\n\n".join(doc.page_content for doc in docs)
 
         if len(full_text) > 30000:
-            return self._review_long_document(full_text, path.name, review_context, project_context_text, system_prompt, user_prompt)
+            return self._review_long_document(
+                full_text,
+                fn,
+                review_context,
+                project_context_text,
+                system_prompt,
+                user_prompt,
+                storage_basename=storage_bn,
+            )
 
-        return self.review_text(full_text, path.name, review_context, project_context_text, system_prompt, user_prompt)
+        return self.review_text(
+            full_text,
+            fn,
+            review_context,
+            project_context_text,
+            system_prompt,
+            user_prompt,
+            storage_basename=storage_bn,
+            logical_display_name=fn,
+        )
 
     def _review_long_document(
         self,
@@ -1477,6 +1549,8 @@ class DocumentReviewer:
         project_context_text: Optional[str] = None,
         system_prompt: Optional[str] = None,
         user_prompt: Optional[str] = None,
+        *,
+        storage_basename: str = "",
     ) -> AuditReport:
         chunk_size = 25000
         overlap = 2000
@@ -1509,7 +1583,14 @@ class DocumentReviewer:
             if provider == "deepseek" and i > 0:
                 time.sleep(0.55)
             report = self.review_text(
-                chunk, chunk_name, review_context, project_context_text, system_prompt, user_prompt
+                chunk,
+                chunk_name,
+                review_context,
+                project_context_text,
+                system_prompt,
+                user_prompt,
+                storage_basename=storage_basename,
+                logical_display_name=file_name,
             )
             return i, report.audit_points
 
@@ -1552,6 +1633,8 @@ class DocumentReviewer:
             text=text,
             review_context=review_context,
             primary_display_name=file_name,
+            logical_display_name=file_name,
+            storage_basename=storage_basename,
             multi_doc_mode=False,
         )
 

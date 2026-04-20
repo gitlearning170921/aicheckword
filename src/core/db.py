@@ -12,6 +12,11 @@ from pymysql.err import InterfaceError, OperationalError
 
 from config import settings
 
+from .display_filename import (
+    effective_audit_report_display_name,
+    sanitize_audit_report_dict,
+)
+
 # 列表查询短 TTL 缓存（减轻历史报告列表反复查库）；写入报告后须 invalidate_audit_reports_list_cache
 _audit_reports_list_cache: Dict[Tuple[str, int, int], Tuple[float, list]] = {}
 _audit_reports_list_cache_lock = threading.Lock()
@@ -40,7 +45,8 @@ def _get_conn():
         database=settings.mysql_database,
         charset=settings.mysql_charset,
         cursorclass=DictCursor,
-        connect_timeout=30,
+        # 连接失败时不要阻塞页面加载过久；上层会提示并允许降级运行
+        connect_timeout=5,
         read_timeout=300,
         write_timeout=300,
         autocommit=False,
@@ -62,6 +68,7 @@ def _ensure_database():
         user=settings.mysql_user,
         password=settings.mysql_password,
         charset=settings.mysql_charset,
+        connect_timeout=5,
     )
     try:
         with conn.cursor() as cur:
@@ -361,17 +368,24 @@ def _init_dimension_options(cur):
 
 
 def load_app_settings() -> Optional[Dict[str, Any]]:
-    init_db()
-    conn = _get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM app_settings WHERE id = 1")
-            row = cur.fetchone()
-        if not row:
-            return None
-        return dict(row)
-    finally:
-        conn.close()
+        init_db()
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM app_settings WHERE id = 1")
+                row = cur.fetchone()
+            if not row:
+                return None
+            return dict(row)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except (OperationalError, InterfaceError):
+        # 允许无 DB 启动：侧栏将使用默认 settings，并提示数据库不可用
+        return None
 
 
 def save_runtime_settings_blob(data: Dict[str, Any]) -> None:
@@ -862,6 +876,7 @@ def get_audit_reports(
                     r["report"] = {}
             else:
                 r["report"] = {}
+            sanitize_audit_report_dict(r["report"], db_file_name=r.get("file_name") or "")
             result.append(r)
         with _audit_reports_list_cache_lock:
             _audit_reports_list_cache[ck] = (now, copy.deepcopy(result))
@@ -881,6 +896,7 @@ def get_audit_report_by_id(report_id: int) -> Optional[Dict[str, Any]]:
             return None
         r = dict(row)
         r["report"] = json.loads(r.get("report_json") or "{}") if r.get("report_json") else {}
+        sanitize_audit_report_dict(r["report"], db_file_name=r.get("file_name") or "")
         return r
     finally:
         conn.close()
@@ -891,18 +907,23 @@ def get_audit_reports_by_file_name(
     file_name: str,
     limit: int = 100,
 ) -> list:
-    """按文件名查询该文件的所有历史审核报告（用于整合多份报告）。"""
+    """按「展示用文件名」查询该文件的所有历史审核报告（兼容库表列为临时名、JSON 内为上传名）。"""
     init_db()
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT * FROM audit_reports
-                WHERE collection = %s AND file_name = %s
-                ORDER BY id DESC LIMIT %s
-            """, (collection, file_name, limit))
+                WHERE collection = %s
+                ORDER BY id DESC
+                LIMIT 800
+                """,
+                (collection,),
+            )
             rows = cur.fetchall()
         result = []
+        tgt = (file_name or "").strip()
         for row in rows:
             r = dict(row)
             if r.get("report_json"):
@@ -912,27 +933,53 @@ def get_audit_reports_by_file_name(
                     r["report"] = {}
             else:
                 r["report"] = {}
-            result.append(r)
+            sanitize_audit_report_dict(r["report"], db_file_name=r.get("file_name") or "")
+            disp = effective_audit_report_display_name(r["report"], db_file_name=r.get("file_name") or "")
+            fn_col = (r.get("file_name") or "").strip()
+            o = ""
+            if isinstance(r.get("report"), dict):
+                o = (r["report"].get("original_filename") or "").strip()
+            if tgt and (tgt == disp or tgt == fn_col or tgt == o):
+                result.append(r)
+            if len(result) >= limit:
+                break
         return result
     finally:
         conn.close()
 
 
 def get_audit_report_file_names(collection: str, limit: int = 200) -> list:
-    """返回当前 collection 下有过审核报告的不重复文件名列表（用于按文件整合）。"""
+    """返回有过审核报告的不重复「展示用」文件名（优先 report JSON 中的 original_filename，避免 tmp*.docx）。"""
     init_db()
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT DISTINCT file_name FROM audit_reports
+            cur.execute(
+                """
+                SELECT file_name, report_json FROM audit_reports
                 WHERE collection = %s AND file_name IS NOT NULL AND file_name != ''
-                ORDER BY file_name LIMIT %s
-            """, (collection, limit))
+                ORDER BY id DESC
+                LIMIT 3000
+                """,
+                (collection,),
+            )
             rows = cur.fetchall()
-        return [r["file_name"] for r in rows]
     finally:
         conn.close()
+    seen = set()
+    out: List[str] = []
+    for row in rows:
+        try:
+            rep = json.loads(row.get("report_json") or "{}")
+        except Exception:
+            rep = {}
+        disp = effective_audit_report_display_name(rep, db_file_name=row.get("file_name") or "")
+        if not disp or disp in seen:
+            continue
+        seen.add(disp)
+        out.append(disp)
+    out.sort()
+    return out[:limit]
 
 
 def save_knowledge_docs(

@@ -1,0 +1,17 @@
+---
+description: 上传文件审核与报告展示必须使用用户原始文件名，禁止将 NamedTemporaryFile 等系统临时名写入报告、modify_docs 或历史列表
+alwaysApply: true
+---
+
+# 上传文件展示名（禁止临时文件名）
+
+## 原则
+
+- 审核与落库时，**展示用文件名**须为**用户上传时的 `file.name`**（或业务约定的 `display_name`），不得使用 `NamedTemporaryFile` 生成的 `tmp*.docx` / `tmp*.xlsx` 等路径基名。
+- 磁盘上的临时路径仅用于解析；向 LLM 的「文件名」占位符、报告 `file_name` / `original_filename`、审核点 `modify_docs`、历史报告下拉选项，均须使用展示名。
+- 若报告 JSON 中曾误存临时名，读取展示层应通过 `original_filename` 或统一 `sanitize` 修正后再给用户看。
+
+## 实现提示
+
+- `review_file` / `review_text`：用 `display_file_name` 与 `storage_basename` 区分「展示名」与「临时路径基名」；后处理中把 `modify_docs` 里的临时名替换为展示名。
+- 历史列表：`get_audit_report_file_names` 等查询应对齐「展示名」（兼容旧数据库存了临时名列的情况）。

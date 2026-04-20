@@ -1,0 +1,22 @@
+---
+description: Streamlit 页面布局约束（禁止 expander 嵌套等），避免 StreamlitAPIException 与重复踩坑
+globs: src/app.py
+---
+
+# Streamlit UI 布局（aicheckword / app.py）
+
+## 1) 禁止 `st.expander` 嵌套
+
+- **不得在 `with st.expander(...):` 块内再使用 `st.expander`**，否则会触发 `StreamlitAPIException: Expanders may not be nested inside other expanders`。
+- **典型踩坑**：外层「历史记录 / 批次」用 expander，内层再按「每个文件」用 expander 展示修改日志。
+
+## 2) 推荐替代（内层需要「多选一」时）
+
+- 用 **`st.selectbox`** / **`st.radio`** 切换子项，再在下方渲染详情（`st.code` / `st.json` / 下载按钮）。
+- 或 **`st.tabs`**（子项数量适中时）；或 **`st.checkbox`「展开 xxx」** 控制是否显示某段（注意 `key` 唯一）。
+- 若仅需折叠大块 JSON：继续用外层 expander，**内层用 caption + code**，不要再套 expander。
+
+## 3) 其它注意
+
+- 列表/循环内控件 **`key` 必须唯一**（含 `rec['id']`、索引、文件名等），避免跨批次冲突。
+- 大 JSON 仍避免塞进 `session_state` / DB `extra`；优先落盘 + 路径引用（与现有 draft 历史逻辑一致）。

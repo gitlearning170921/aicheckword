@@ -23,6 +23,7 @@ import pickle
 import html
 import time
 import tempfile
+import zipfile
 from datetime import datetime
 from typing import Optional, Tuple
 import uuid
@@ -140,6 +141,7 @@ def _st_run_tabs_or_pick(labels: list, *, radio_label: str, session_key: str, ta
 from config import settings
 from src.core.agent import ReviewAgent
 from src.core.document_draft_generator import DocumentDraftGenerator
+from src.core.display_filename import sanitize_audit_report_dict
 from src.core.document_loader import (
     load_single_file,
     split_documents,
@@ -230,6 +232,105 @@ from src.core.report_export import report_to_html, report_to_docx, report_to_pdf
 from src.core.draft_export import export_like_base
 from src.streamlit_compat import streamlit_divider, streamlit_rerun
 from src.system_config_ui import render_system_config_page
+
+
+def _resolve_draft_artifact_path(raw_path: str) -> Path:
+    """把历史记录里保存的产物路径尽量解析为当前机器可读的绝对路径。
+
+    典型问题：
+    - 记录里是绝对路径，但服务迁机/换盘符后原路径不存在；
+    - 记录里误存了相对路径（相对项目根或相对 uploads 根）。
+    """
+    s = (raw_path or "").strip()
+    if not s:
+        return Path("")
+    p = Path(s)
+    # 1) 原样存在：直接返回（尽量 resolve，便于后续比较）
+    try:
+        if p.is_file():
+            return p
+    except Exception:
+        pass
+
+    # 2) 相对 uploads_path（常见：把 uploads 下的子路径入库）
+    try:
+        up = settings.uploads_path
+        cand = (up / p).resolve()
+        if cand.is_file():
+            return cand
+    except Exception:
+        pass
+
+    # 3) 相对项目根（常见：误把相对仓库路径写入日志）
+    try:
+        cand2 = (_root / p).resolve()
+        if cand2.is_file():
+            return cand2
+    except Exception:
+        pass
+
+    # 4) 仅按文件名在 draft_outputs 下兜底搜索（最后手段：避免历史记录完全不可用）
+    try:
+        name = Path(s).name
+        if name:
+            drafts_dir = (settings.uploads_path / "draft_outputs").resolve()
+            if drafts_dir.is_dir():
+                hits = list(drafts_dir.rglob(name))
+                # 取最近修改的一个（同名文件可能多次生成）
+                hits = [h for h in hits if h.is_file()]
+                if hits:
+                    hits.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                    return hits[0]
+    except Exception:
+        pass
+
+    return p
+
+
+def _read_download_bytes(resolved: Path) -> Tuple[Optional[bytes], str]:
+    """读取下载字节；失败返回 (None, 错误说明)。"""
+    try:
+        if not resolved or not str(resolved).strip():
+            return None, "路径为空"
+        if not resolved.is_file():
+            return None, f"文件不存在或不可访问：{resolved}"
+        data = resolved.read_bytes()
+        if not data:
+            return None, f"文件为空：{resolved}"
+        return data, ""
+    except Exception as e:
+        return None, f"读取失败：{type(e).__name__}: {e}"
+
+
+def _draft_download_button(*, label: str, raw_path: str, mime: str, key: str) -> None:
+    """历史/结果区统一下载：避免 Streamlit /media/*.bin 404（常见原因：路径失效或读取失败仍渲染按钮）。"""
+    rp = _resolve_draft_artifact_path(raw_path)
+    # Streamlit 的 /media 下载是临时资源：同一 widget key 在 rerun 后可能仍被浏览器复用旧 URL。
+    # 用“文件签名（mtime+size）”拼进 key：文件不变时 key 稳定；文件更新/重导出后 key 自动变化，触发重新注册。
+    try:
+        if rp.is_file():
+            stt = rp.stat()
+            sig = f"{int(getattr(stt, 'st_mtime_ns', int(stt.st_mtime * 1e9)))}_{int(stt.st_size)}"
+        else:
+            sig = uuid.uuid4().hex[:10]
+    except Exception:
+        sig = uuid.uuid4().hex[:10]
+    _key = f"{key}__{sig}"
+    data, err = _read_download_bytes(rp)
+    if data is None:
+        st.caption(f"下载不可用：{err}")
+        try:
+            st.caption(f"原始记录路径：{raw_path}")
+        except Exception:
+            pass
+        return
+    st.download_button(
+        label,
+        data=data,
+        file_name=rp.name,
+        mime=mime,
+        key=_key,
+    )
 
 
 def _make_ttl_cache(ttl_sec=5):
@@ -358,35 +459,82 @@ def _infer_draft_author_role_idx(
                         return True
             return False
 
-        if _hit("测试用例", "test case", "test execution", "system test", "确认测试", "verification plan", "verification report"):
+        # 测试/验证/确认 → 测试工程师（qa）
+        if _hit(
+            "测试用例", "test case", "test execution", "system test", "system testing",
+            "确认测试", "集成测试", "单元测试", "unit test", "integration test",
+            "verification plan", "verification report", "validation plan", "validation report",
+            "测试报告", "测试计划", "测试方案", "测试", "验证", "确认", "V&V", "IQ", "OQ", "PQ",
+        ):
             scores["qa"] += 3
-        if _hit("traceability", "追溯", "rtm", "可追溯性", "traceability analysis"):
+        if _hit("traceability", "追溯", "rtm", "可追溯性", "traceability analysis", "追溯矩阵", "追溯分析"):
             scores["qa"] += 2
-        if _hit("risk", "ras", "rmp", "rmr", "风险分析", "风险管理", "risk analysis", "risk management"):
+        # 风险 → 风险经理（rm）
+        if _hit(
+            "risk", "ras", "rmp", "rmr", "风险分析", "风险管理", "risk analysis",
+            "risk management", "风险评估", "风险控制", "风险报告", "风险",
+            "hazard", "fmea", "fta",
+        ):
             scores["rm"] += 3
             if high_risk_reg:
                 scores["rm"] += 1
-        if _hit("srs", "软件需求", "requirement specification", "软件需求规范", "urs", "软件需求说明书"):
+        # 用户需求/产品预期用途 → 产品经理（pm）
+        if _hit(
+            "urs", "用户需求", "product requirement", "产品需求", "市场需求",
+            "prd", "mrd", "需求", "user needs", "user requirement",
+        ):
+            scores["pm"] += 3
+        # 软件需求/设计/架构 → 研发经理（rdm）
+        if _hit(
+            "srs", "软件需求规范", "requirement specification", "软件需求说明书", "软件需求",
+            "software requirement", "software requirements",
+        ):
+            scores["rdm"] += 3
+        if _hit(
+            "architecture", "ads", "架构", "详细设计", "概要设计", "design specification", "sdd",
+            "网络安全", "cybersecurity", "cyber security", "设计说明", "设计规范", "软件设计",
+            "设计",
+        ):
             scores["rdm"] += 2
-        if _hit("architecture", "ads", "架构", "详细设计", "design specification", "sdd", "网络安全", "cybersecurity", "cyber security"):
+        if _hit("software description", "软件描述", "软件研究"):
             scores["rdm"] += 2
-        if _hit("software description", "软件描述"):
-            scores["rdm"] += 2
-        if _hit("audit", "审计", "日志", "权限", "access control"):
+        if _hit("audit", "审计", "日志", "权限", "access control", "编码规范"):
             scores["rdm"] += 1
-        if _hit("instruction", "ifu", "说明书", "使用说明", "udn", "用户手册", "instructions for use"):
+        # 说明书/标签 → 注册工程师（ra）
+        if _hit(
+            "instruction", "ifu", "说明书", "使用说明", "udn", "user manual", "用户手册",
+            "instructions for use", "产品技术要求", "注册申报", "注册申请", "注册自检",
+            "技术审评", "临床评价",
+        ):
             scores["ra"] += 2
-        if _hit("label", "标签"):
+        if _hit("label", "标签", "包装标识"):
             scores["ra"] += 1
-        if _hit("milestone", "计划", "project plan", "schedule"):
+        # 计划/进度 → 项目经理（pjm）
+        if _hit(
+            "milestone", "计划", "project plan", "schedule", "开发计划",
+            "项目计划", "进度计划", "立项", "里程碑",
+        ):
             scores["pjm"] += 2
-        if _hit("config", "配置管理", "release", "baseline", "configuration"):
-            scores["cm"] += 2
-        if _hit("interface", "界面", " ui", "usability", "交互"):
+        # 配置管理 → 配置管理员（cm）
+        if _hit(
+            "config", "配置管理", "release", "baseline", "configuration",
+            "version control", "版本控制", "变更管理", "变更控制", "配置项",
+            "配置", "scm", "cm plan",
+        ):
+            scores["cm"] += 3
+        # 界面/可用性 → UI 设计师（ui）
+        if _hit(
+            "interface", "界面", " ui", "usability", "可用性",
+            "交互", "user experience", "用户体验", "ux",
+        ):
             scores["ui"] += 2
-        if _hit("生产", "production", "manufacturing"):
+        # 生产/制造 → 生产专员（prod）
+        if _hit(
+            "生产", "production", "manufacturing", "制造", "生产工艺",
+            "生产放行", "工艺规程", "bom",
+        ):
             scores["prod"] += 2
-        if _hit("预期用途", "适应症", "intended use"):
+        if _hit("预期用途", "适应症", "intended use", "产品特性", "产品定义"):
             scores["pm"] += 1
 
     if max(scores.values()) == 0:
@@ -520,7 +668,12 @@ def render_sidebar():
 
         # 首次从 DB 载入配置到 settings（仅一次）
         if not st.session_state.get("db_settings_loaded"):
-            db_conf = load_app_settings()
+            db_conf = None
+            try:
+                db_conf = load_app_settings()
+            except Exception as _e:
+                # DB 连接失败不应阻塞页面加载（常见：MySQL 不可达/超时）
+                st.warning(f"⚠️ 数据库连接失败，已使用本地默认配置继续运行：{_e}")
             if db_conf:
                 settings.provider = db_conf.get("provider") or settings.provider
                 settings.openai_api_key = db_conf.get("openai_api_key") or settings.openai_api_key
@@ -3666,6 +3819,42 @@ def render_step3_page():
             accept_multiple_files=True,
             key="review_uploader",
         )
+        # 文件夹（服务端路径）输入：浏览器“上传文件夹”在 Streamlit 中不稳定，这里用路径扫描保证可用
+        with st.expander("📁 通过文件夹路径加载待审核文件（可选）", expanded=False):
+            st.caption("适用场景：文件在运行本工具的机器上（服务器/本机）。会递归扫描支持格式；路径中含「废弃」的文件/目录会自动跳过。")
+            _dir = st.text_input("待审核文件夹路径", value="", placeholder=r"例如：D:\docs\to_review", key="review_dir_path")
+            _dir_items = st.session_state.setdefault("review_dir_items", [])
+            cda, cdb = st.columns(2)
+            with cda:
+                if st.button("添加该文件夹", key="review_dir_add_btn"):
+                    try:
+                        if _dir.strip():
+                            fps = _scan_directory_files(_dir.strip())
+                        else:
+                            fps = []
+                        if fps:
+                            for fp in fps:
+                                _dir_items.append((str(fp), fp.name, False))
+                            # 去重（按 path）
+                            seen = set()
+                            ded = []
+                            for p, dn, arch in _dir_items:
+                                if p in seen:
+                                    continue
+                                seen.add(p)
+                                ded.append((p, dn, arch))
+                            st.session_state["review_dir_items"] = ded
+                            st.success(f"已添加 {len(fps)} 个文件。")
+                        else:
+                            st.warning("未扫描到可审核的文件。")
+                    except Exception as _e:
+                        st.error(f"扫描失败：{_e}")
+            with cdb:
+                if st.button("清空文件夹列表", key="review_dir_clear_btn"):
+                    st.session_state["review_dir_items"] = []
+                    st.success("已清空。")
+            if st.session_state.get("review_dir_items"):
+                st.caption(f"文件夹已加入 **{len(st.session_state['review_dir_items'])}** 个文件；开始审核时会与上方上传文件合并。")
         ref_files = st.file_uploader(
             "参考文件（可选：本次审核将按参考文件要求对照核查）",
             type=["pdf", "docx", "doc", "xlsx", "xls", "txt", "md", "zip", "tar", "gz", "tgz"],
@@ -3673,9 +3862,45 @@ def render_step3_page():
             key="review_reference_uploader",
             help="可上传程序文件、技术要求、规范、追溯制度等作为本次审核的对照依据。系统会摘录其内容并注入审核上下文。",
         )
-        if review_files:
+        with st.expander("📁 通过文件夹路径加载参考文件（可选）", expanded=False):
+            st.caption("同上：仅当参考文件位于运行本工具的机器上时可用。")
+            _rdir = st.text_input("参考文件夹路径", value="", placeholder=r"例如：D:\docs\refs", key="review_ref_dir_path")
+            _rdir_items = st.session_state.setdefault("review_ref_dir_items", [])
+            cra, crb = st.columns(2)
+            with cra:
+                if st.button("添加参考文件夹", key="review_ref_dir_add_btn"):
+                    try:
+                        if _rdir.strip():
+                            fps = _scan_directory_files(_rdir.strip())
+                        else:
+                            fps = []
+                        if fps:
+                            for fp in fps:
+                                _rdir_items.append((str(fp), fp.name, False))
+                            seen = set()
+                            ded = []
+                            for p, dn, arch in _rdir_items:
+                                if p in seen:
+                                    continue
+                                seen.add(p)
+                                ded.append((p, dn, arch))
+                            st.session_state["review_ref_dir_items"] = ded
+                            st.success(f"已添加 {len(fps)} 个参考文件。")
+                        else:
+                            st.warning("未扫描到可用参考文件。")
+                    except Exception as _e:
+                        st.error(f"扫描失败：{_e}")
+            with crb:
+                if st.button("清空参考文件夹列表", key="review_ref_dir_clear_btn"):
+                    st.session_state["review_ref_dir_items"] = []
+                    st.success("已清空。")
+            if st.session_state.get("review_ref_dir_items"):
+                st.caption(f"参考文件夹已加入 **{len(st.session_state['review_ref_dir_items'])}** 个文件；开始审核时会与上方上传参考文件合并。")
+        _has_review_inputs = bool(review_files) or bool(st.session_state.get("review_dir_items"))
+        if _has_review_inputs:
             n_upload = len(review_files)
-            st.caption(f"已选择 **{n_upload}** 个文件，点击下方按钮将批量审核。")
+            n_dir = len(st.session_state.get("review_dir_items") or [])
+            st.caption(f"已选择 **{n_upload}** 个上传文件，文件夹列表 **{n_dir}** 个文件；点击下方按钮将合并批量审核。")
             do_multi_doc = st.checkbox(
                 "进行多文档一致性与模板风格审核（2 个及以上文件时）",
                 value=True,
@@ -3753,8 +3978,14 @@ def render_step3_page():
                         for _d in temp_dirs_tr:
                             shutil.rmtree(_d, ignore_errors=True)
                     _streamlit_rerun()
-        if review_files and st.button("🔍 开始批量审核" if len(review_files) > 1 else "🔍 开始审核", key="review_btn"):
-            items, temp_dirs = _expand_uploads(review_files)
+        if _has_review_inputs and st.button("🔍 开始批量审核" if (len(review_files) + len(st.session_state.get("review_dir_items") or [])) > 1 else "🔍 开始审核", key="review_btn"):
+            items, temp_dirs = _expand_uploads(review_files or [])
+            # 合并文件夹扫描结果（不会进入 temp_dirs 管理）
+            try:
+                for p, dn, arch in (st.session_state.get("review_dir_items") or []):
+                    items.append((p, dn, arch))
+            except Exception:
+                pass
 
             if not items:
                 st.warning("没有可审核的文件。")
@@ -3837,8 +4068,15 @@ def render_step3_page():
 
             # 参考文件：注入审核上下文（对所有本批文件生效）
             try:
-                if ref_files:
-                    _ritems, _rdirs = _expand_uploads(ref_files)
+                _ref_all = list(ref_files or [])
+                # 文件夹参考文件也合并进来（转为伪 UploadedFile items 逻辑：直接复用 items 列表）
+                _ritems, _rdirs = _expand_uploads(_ref_all) if _ref_all else ([], [])
+                try:
+                    for p, dn, arch in (st.session_state.get("review_ref_dir_items") or []):
+                        _ritems.append((p, dn, arch))
+                except Exception:
+                    pass
+                if _ritems:
                     _ref_blocks = []
                     _ref_cap = 22000
                     _used = 0
@@ -4997,6 +5235,35 @@ def _unique_doc_display_names(doc_names: list) -> list:
     return out
 
 
+def _report_related_doc_names(report: Optional[dict], *, reports: Optional[list] = None, parent_batch_report: Optional[dict] = None) -> list:
+    """为详情/纠正页兜底获取关联文档名：优先报告自身 related_doc_names；否则从父批量报告或同批 reports 推断。"""
+    if isinstance(report, dict):
+        rdn = report.get("related_doc_names")
+        if isinstance(rdn, list) and _unique_doc_display_names(rdn):
+            return _unique_doc_display_names(rdn)
+    if isinstance(parent_batch_report, dict):
+        prdn = parent_batch_report.get("related_doc_names")
+        if isinstance(prdn, list) and _unique_doc_display_names(prdn):
+            return _unique_doc_display_names(prdn)
+    if isinstance(reports, list) and reports:
+        inferred: list = []
+        for r in reports:
+            if not isinstance(r, dict):
+                continue
+            nm = (r.get("original_filename") or r.get("file_name") or "").strip()
+            if nm:
+                inferred.append(nm)
+        u = _unique_doc_display_names(inferred)
+        if u:
+            return u
+    # 最后兜底：至少放当前报告名，避免 options 为空导致无法下拉
+    if isinstance(report, dict):
+        nm0 = (report.get("original_filename") or report.get("file_name") or "").strip()
+        if nm0:
+            return [nm0]
+    return []
+
+
 def _point_modify_docs_merged_list(point: Optional[dict]) -> list:
     """合并审核点里可能分散在多个键下的「需修改文档」（如 modify_docs、需修改文档）。"""
     if not isinstance(point, dict):
@@ -5030,8 +5297,8 @@ def _effective_point_modify_docs_list(
     if len(u) == 1:
         return list(u)
     if len(u) > 1:
-        # 多文档报告：须以审核点内 modify_docs 为准，勿用单文件名误填整列
-        return []
+        # 多文档：modify_docs 为空时与 UI 下拉一致，用位置/描述等推断涉及文档；推断不出则等同「关联文档全集」（与 multiselect 默认全选一致）
+        return _point_modify_docs_dropdown_options(point or {}, rel)
     fn = (file_name_hint or "").strip()
     if fn and fn != "未知":
         return [fn]
@@ -5093,8 +5360,85 @@ def _match_doc_name_option(option: str, stored: str) -> bool:
     return False
 
 
+def _point_modify_docs_dropdown_options(point: Optional[dict], related_doc_names: Optional[list]) -> list:
+    """本审核点「需修改文档」下拉的选项：从位置/描述/建议等推断涉及的文档（related_doc_names 的子集）；推断不出则退回整份关联文档列表。"""
+    if not isinstance(point, dict):
+        point = {}
+    rel = _unique_doc_display_names(related_doc_names or [])
+    if not rel:
+        # 某些报告/历史/纠正路径里 related_doc_names 可能缺失；至少用已存 modify_docs 兜底，避免 options 为空
+        return _unique_doc_display_names(_point_modify_docs_merged_list(point))
+    import re
+
+    parts = [
+        str(point.get("location") or ""),
+        str(point.get("description") or ""),
+        str(point.get("suggestion") or ""),
+        str(point.get("category") or ""),
+    ]
+    blob = " ".join(parts)
+    blob_cf = blob.casefold()
+    involved: list = []
+    seen = set()
+
+    def _add(nm: str) -> None:
+        s = (nm or "").strip()
+        if not s or s in seen:
+            return
+        involved.append(s)
+        seen.add(s)
+
+    for d in rel:
+        d_strip = str(d).strip()
+        if not d_strip:
+            continue
+        base = Path(d_strip.replace("\\", "/")).name
+        base_cf = base.casefold()
+        if d_strip in blob:
+            _add(d_strip)
+        elif base in blob:
+            _add(d_strip)
+        elif len(base_cf) >= 4 and base_cf in blob_cf:
+            _add(d_strip)
+
+    for m in re.finditer(r"\[([^\]\n]{2,300}?)\]", blob):
+        inner = (m.group(1) or "").strip()
+        if not inner:
+            continue
+        inner_base = Path(inner.replace("\\", "/")).name
+        inner_cf = inner_base.casefold()
+        for d in rel:
+            ds = str(d).strip()
+            if not ds:
+                continue
+            db = Path(ds.replace("\\", "/")).name
+            dbcf = db.casefold()
+            if inner == ds or inner_cf == dbcf or inner_base in ds or db in inner:
+                _add(ds)
+
+    for sd in _point_modify_docs_merged_list(point):
+        for d in rel:
+            ds = str(d).strip()
+            if ds and _match_doc_name_option(ds, sd):
+                _add(ds)
+                break
+
+    if involved:
+        return _unique_doc_display_names(involved)
+    return list(rel)
+
+
 def _default_modify_docs_selection(doc_names: list, raw_modify_docs) -> list:
-    """计算「需修改的文档」多选应对齐的选项（返回值均为 doc_names 中原字符串）。"""
+    """计算「需修改的文档」多选应对齐的选项（返回值均为 doc_names 中原字符串）。
+
+    设计取舍：
+    - 审核结果里的「需修改文档」下拉应避免出现“有选项可选、但默认勾选为空”导致用户误以为
+      “没有需要修改的文档”的情况。
+    - 若审核点未显式给出 modify_docs：
+        - 单文档（names 仅 1 个）→ 默认选中该唯一项；
+        - 多文档 → 默认全选关联文档（related_doc_names），由用户按需取消即可。
+    - 若审核点给出了 modify_docs 但与 options 对不上：回退到与“未给出”相同的默认策略。
+    """
     names = [str(d).strip() for d in (doc_names or []) if d is not None and str(d).strip()]
     stored = _coerce_modify_docs_list(raw_modify_docs)
     if not names:
@@ -5165,31 +5509,63 @@ def _multiselect_modify_docs(label: str, doc_names: list, raw_modify_docs, *, ke
     names = _unique_doc_display_names(doc_names)
     coerced = _coerce_modify_docs_list(raw_modify_docs)
     if not names:
-        return coerced
+        # 极端兜底：报告未提供 related_doc_names 时，至少用已存 modify_docs / 当前 session 值作为 options
+        # 否则会出现「已有 chips，但下拉 No results」的空选项状态
+        fallback_opts = _unique_doc_display_names(coerced)
+        if not fallback_opts:
+            _cur = st.session_state.get(key)
+            if isinstance(_cur, tuple):
+                _cur = list(_cur)
+            if isinstance(_cur, list):
+                fallback_opts = _unique_doc_display_names(_cur)
+        if not fallback_opts:
+            return coerced
+        if key not in st.session_state:
+            st.session_state[key] = list(fallback_opts)
+        return st.multiselect(label, options=fallback_opts, key=key)
     options, default_docs = _modify_docs_options_and_picked(names, raw_modify_docs)
+    # 额外兜底：把当前会话里已选值也塞进 options，避免出现「已有 chips 但下拉 No results」
+    _cur_for_opts = st.session_state.get(key)
+    if isinstance(_cur_for_opts, tuple):
+        _cur_for_opts = list(_cur_for_opts)
+    if isinstance(_cur_for_opts, list) and _cur_for_opts:
+        for x in _unique_doc_display_names(_cur_for_opts):
+            if x and x not in options:
+                options.append(x)
+    if not options:
+        # 额外兜底：极端情况下 options 仍可能为空，强制退回 names/coerced，避免出现「chips 存在但下拉 No results」
+        options = list(names) if names else _unique_doc_display_names(coerced)
+        default_docs = _default_modify_docs_selection(options, coerced) if options else list(coerced)
     opt_set = set(options)
+
+    # 重要：不要同时使用 default= 与 session_state 赋值，否则 Streamlit 会报错
+    # 仅在「审核点切换/选项变化/源数据变化」时初始化默认；允许用户手动清空而不被强制回填
     sig = (tuple(options), tuple(coerced))
     sk = f"{key}__modify_docs_sig"
-    if st.session_state.get(sk) != sig:
+    if key not in st.session_state or st.session_state.get(sk) != sig:
         st.session_state[key] = list(default_docs)
         st.session_state[sk] = sig
     else:
-        # 会话里曾被写成 []（Streamlit 丢弃非法选项、或旧版未正确灌入），但数据源仍有需修改文档时补回
         _cur = st.session_state.get(key)
         if isinstance(_cur, tuple):
             _cur = list(_cur)
-        if isinstance(_cur, list) and not _cur and default_docs and coerced:
-            st.session_state[key] = list(default_docs)
-        elif isinstance(_cur, list) and not _cur and default_docs and not coerced:
-            # modify_docs 为空时，与 _default_modify_docs_selection 一致：默认等价于「在可选文档全选」；
-            # 仅 coerced 非空时才在上一分支补回，会导致此处会话被 Streamlit 置空后一直空白，普通编辑看起来像「只有纠正里能带出」。
-            st.session_state[key] = list(default_docs)
-        elif isinstance(_cur, list) and _cur and coerced:
+        if isinstance(_cur, list):
+            # options 变化后只剔除无效项，不要在用户清空时强制回填
             valid = [x for x in _cur if x in opt_set]
-            if not valid and default_docs:
-                st.session_state[key] = list(default_docs)
-    if key not in st.session_state:
-        st.session_state[key] = list(default_docs)
+            if valid != _cur:
+                st.session_state[key] = valid
+        elif default_docs:
+            st.session_state[key] = list(default_docs)
+
+    try:
+        _cur2 = st.session_state.get(key)
+        if isinstance(_cur2, tuple):
+            _cur2 = list(_cur2)
+        if isinstance(_cur2, list) and options and len(_cur2) >= len(options):
+            st.caption("提示：下拉中不显示已选项；取消勾选请点击上方标签右侧「×」。")
+    except Exception:
+        pass
+
     return st.multiselect(label, options=options, key=key)
 
 
@@ -5205,7 +5581,7 @@ def _audit_point_modify_docs_key(report_id: int, point_idx: int, scope_key: str,
 def _render_multi_doc_report(report: dict, r_idx: int, reports: list, key_prefix: str = "", history_id: int = 0, parent_batch_report: dict = None):
     """通用审核报告渲染：分区域展示；可编辑内容、需修改文档多选、处理状态、纠正、一键待办。history_id>0 时显示纠正此审核点。parent_batch_report 为批量报告时纠正会更新整份报告。"""
     file_name = report.get("original_filename", report.get("file_name", "审核报告"))
-    doc_names = report.get("related_doc_names") or []
+    doc_names = _report_related_doc_names(report, reports=reports, parent_batch_report=parent_batch_report)
     points = report.get("audit_points") or []
     pk = key_prefix or "r"
 
@@ -5271,9 +5647,10 @@ def _render_multi_doc_report(report: dict, r_idx: int, reports: list, key_prefix
             new_desc = st.text_area("问题描述", value=point.get("description", ""), height=120, key=key_desc)
             new_sug = st.text_area("修改建议（请写明需修改哪份或哪几份文档）", value=point.get("suggestion", ""), height=120, key=key_sug)
 
+            _opt_md = _point_modify_docs_dropdown_options(point, doc_names)
             _caption_stored_modify_docs(point)
             new_modify_docs = _multiselect_modify_docs(
-                "需修改的文档", doc_names, _point_modify_docs_merged_list(point), key=_md_unify
+                "需修改的文档", _opt_md, _point_modify_docs_merged_list(point), key=_md_unify
             )
 
             key_action = f"{pk}_action_{r_idx}_{i}"
@@ -5830,7 +6207,8 @@ def _render_correction_form(
     modify_docs_widget_key：与「普通审核点编辑」共用 multiselect 的 session key。"""
     prefix = f"cf_{report_id}_{point_idx}_{sub_report_index if sub_report_index is not None else 'x'}"
     _md_key = modify_docs_widget_key if modify_docs_widget_key else f"{prefix}_modify_docs"
-    doc_names = report.get("related_doc_names") or []
+    doc_names = _report_related_doc_names(report, parent_batch_report=parent_batch_report)
+    opt_modify_docs = _point_modify_docs_dropdown_options(point, doc_names)
 
     _kind_default = 0
     if point.get("correction_kind") == "false_positive" or point.get("false_positive_reason"):
@@ -5853,10 +6231,10 @@ def _render_correction_form(
         _sev_i = _sev_list.index(_sv) if _sv in _sev_list else 3
         new_sev = st.selectbox("严重程度", _sev_list, index=_sev_i, key=f"{prefix}_sev")
         new_sug = st.text_area("修改建议", value=point.get("suggestion", ""), key=f"{prefix}_sug")
-        if doc_names:
+        if opt_modify_docs:
             _caption_stored_modify_docs(point)
             new_modify_docs = _multiselect_modify_docs(
-                "需修改的文档", doc_names, _point_modify_docs_merged_list(point), key=_md_key
+                "需修改的文档", opt_modify_docs, _point_modify_docs_merged_list(point), key=_md_key
             )
         else:
             new_modify_docs = _point_modify_docs_merged_list(point)
@@ -6965,6 +7343,11 @@ def _render_reports_table_layout(
     """
     if not reports:
         return
+    for r in reports:
+        try:
+            sanitize_audit_report_dict(r, db_file_name=str((r.get("file_name") or "")).strip())
+        except Exception:
+            pass
     meta = {}
     for r in reports:
         m = r.get("_review_meta") or {}
@@ -7321,7 +7704,8 @@ def _render_point_detail_inline(
     _detail_scope = detail_scope_suffix if detail_scope_suffix is not None else ""
     detail_key = f"_show_detail_{pk}_{point_idx}"
     file_name = report.get("original_filename", report.get("file_name", "未知"))
-    doc_names = report.get("related_doc_names") or []
+    doc_names = _report_related_doc_names(report, reports=reports, parent_batch_report=parent_batch_report)
+    opt_modify_docs = _point_modify_docs_dropdown_options(point, doc_names)
     hist_corr_key = f"_hist_corr_{history_id}_{pk}_{point_idx}{key_suffix}" if history_id else ""
 
     with st.container():
@@ -7371,7 +7755,7 @@ def _render_point_detail_inline(
 
         _caption_stored_modify_docs(point)
         new_modify_docs = _multiselect_modify_docs(
-            "需修改的文档", doc_names, _point_modify_docs_merged_list(point), key=_md_unify_detail
+            "需修改的文档", opt_modify_docs, _point_modify_docs_merged_list(point), key=_md_unify_detail
         )
 
         current_action = point.get("action") or _get_multi_doc_default_action(new_sev)
@@ -7534,7 +7918,7 @@ def render_draft_page():
         if _notice:
             st.info(_notice)
         try:
-            draft_logs = get_operation_logs(op_type="draft_generate", collection=collection, limit=30)
+            draft_logs = get_operation_logs(op_type="draft_generate", collection=collection, limit=100)
         except Exception:
             draft_logs = []
         if not draft_logs:
@@ -7548,9 +7932,13 @@ def render_draft_page():
             fn_line = "、".join(fns) if fns else "（无）"
             # 标题中展示全部文件名（过长截断），避免只看到第一个文件名
             _title_fn = fn_line if len(fn_line) <= 160 else (fn_line[:157] + "…")
-            title = f"{rec.get('created_at','')} | project_id={extra.get('project_id','')} | 生成文件：{_title_fn}"
+            _bid = (extra.get("batch_id") or "").strip()
+            _bid_part = f" | 批次={_bid}" if _bid else ""
+            title = f"{rec.get('created_at','')}{_bid_part} | project_id={extra.get('project_id','')} | 生成文件：{_title_fn}"
             with st.expander(title, expanded=(idx < 1)):
                 st.caption(extra.get("summary") or "")
+                if _bid:
+                    st.caption(f"批次ID：{_bid}")
                 st.caption(f"生成文件名：{fn_line}")
                 mid = (rec.get("model_info") or "").strip()
                 if mid:
@@ -7564,66 +7952,296 @@ def render_draft_page():
                             f"已触发历史记录重新生成：{rec.get('created_at','')} | project_id={extra.get('project_id','')}"
                         )
                 with cols[1]:
-                    for of in out_files:
-                        p = Path(of)
-                        if p.is_file():
-                            st.download_button(
-                                f"下载：{p.name}",
-                                data=p.read_bytes(),
-                                file_name=p.name,
-                                mime="application/octet-stream",
-                                key=f"draft_hist_dl_{rec.get('id')}_{p.name}",
-                            )
-                        else:
-                            st.caption(f"文件不存在：{of}")
-
-                # 修改日志：有 changes 只展示 changes；没有 changes 则提示并展示 skipped（帮助定位未命中原因）
-                chg = extra.get("change_logs_by_file") or {}
-                skip_map = extra.get("patch_skipped_by_file") or {}
-                err_map = extra.get("patch_errors_by_file") or {}
-                if isinstance(skip_map, dict) and skip_map:
-                    st.caption("未命中/跳过的 patch 操作（skipped，按文件）")
+                    # 下载：恢复为“下拉选择文件”，并在文件名后标记是否产生修改；同时区分输出文件与 JSON 产物
+                    # 修改状态：以 patch.report.json 的 changes 数为准（比 out_file 映射更可靠）
+                    _changes_by_report: dict = {}
+                    _changes_by_out: dict = {}
                     try:
-                        st.code(json.dumps(skip_map, ensure_ascii=False, indent=2), language="json")
-                    except Exception:
-                        st.json(skip_map)
-                if isinstance(err_map, dict) and err_map:
-                    st.caption("patch 执行错误（errors，按文件）")
-                    try:
-                        st.code(json.dumps(err_map, ensure_ascii=False, indent=2), language="json")
-                    except Exception:
-                        st.json(err_map)
-                if isinstance(chg, dict) and chg:
-                    st.caption("修改日志（就地修改，按文件；改前/改后）")
-                    try:
-                        st.code(json.dumps(chg, ensure_ascii=False, indent=2), language="json")
-                    except Exception:
-                        st.json(chg)
-                else:
-                    rep_candidates = [x for x in out_files if isinstance(x, str) and x.endswith(".patch.report.json")]
-                    if rep_candidates:
-                        st.caption("修改日志（就地修改执行报告）")
-                        for rp in rep_candidates[:5]:
+                        _rep_paths = [
+                            str(x).strip()
+                            for x in (out_files or [])
+                            if isinstance(x, str) and str(x).strip().endswith(".patch.report.json")
+                        ]
+                        for rp in _rep_paths:
                             try:
-                                data = Path(rp).read_text(encoding="utf-8")
-                                obj = json.loads(data)
+                                rp_path = _resolve_draft_artifact_path(rp)
+                                if not rp_path.is_file():
+                                    continue
+                                obj = json.loads(rp_path.read_text(encoding="utf-8"))
                                 if not isinstance(obj, dict):
                                     continue
-                                changes = obj.get("changes") or []
-                                skipped = obj.get("skipped") or []
-                                if not (changes or skipped):
-                                    continue
-                                st.markdown(f"**{Path(rp).name}**")
-                                if isinstance(changes, list) and changes:
-                                    st.caption(f"changes：{len(changes)} 条")
-                                    st.code(json.dumps(changes, ensure_ascii=False, indent=2), language="json")
-                                else:
-                                    st.caption("changes：0 条（本次没有实际写入变更）。将展示 skipped 供定位原因。")
-                                    if isinstance(skipped, list) and skipped:
-                                        st.caption(f"skipped：{len(skipped)} 条")
-                                        st.code(json.dumps(skipped, ensure_ascii=False, indent=2), language="json")
+                                ch = obj.get("changes") or []
+                                n_ch = len(ch) if isinstance(ch, list) else 0
+                                _changes_by_report[rp] = n_ch
+                                try:
+                                    out_guess = str(rp)[: -len(".patch.report.json")]
+                                    _changes_by_out[out_guess] = n_ch
+                                    _changes_by_out[Path(out_guess).name] = n_ch
+                                except Exception:
+                                    pass
                             except Exception:
                                 continue
+                    except Exception:
+                        pass
+
+                    # 1) 输出文件（原格式文件）
+                    _out_map = extra.get("out_files_by_target") or {}
+                    _out_paths: list = []
+                    if isinstance(_out_map, dict) and _out_map:
+                        for _k, _v in _out_map.items():
+                            if isinstance(_v, str) and _v.strip():
+                                _out_paths.append(str(_v).strip())
+                    if not _out_paths:
+                        _out_paths = [
+                            str(x).strip()
+                            for x in (out_files or [])
+                            if isinstance(x, str)
+                            and str(x).strip()
+                            and (not str(x).endswith(".patch.json"))
+                            and (not str(x).endswith(".patch.report.json"))
+                            and (not str(x).endswith(".zip"))
+                        ]
+                    _out_paths = list(dict.fromkeys(_out_paths))
+                    if _out_paths:
+                        def _fmt_out(i: int) -> str:
+                            p = _out_paths[int(i)]
+                            n_ch = _changes_by_out.get(p) or _changes_by_out.get(Path(p).name)
+                            if isinstance(n_ch, int):
+                                tag = "（未修改）" if n_ch <= 0 else f"（已修改，changes={n_ch}）"
+                            else:
+                                tag = ""
+                            return f"{Path(p).name}{tag}"
+
+                        _picked_out = st.selectbox(
+                            "下载原格式文件（输出）",
+                            options=list(range(len(_out_paths))),
+                            format_func=_fmt_out,
+                            index=0,
+                            key=f"draft_hist_out_pick_{rec.get('id')}_{idx}",
+                        )
+                        _picked_out_path = _out_paths[int(_picked_out)]
+                        _draft_download_button(
+                            label=f"下载：{Path(_picked_out_path).name}",
+                            raw_path=_picked_out_path,
+                            mime="application/octet-stream",
+                            key=f"draft_hist_out_btn_{rec.get('id')}_{idx}_{Path(_picked_out_path).name}",
+                        )
+
+                    # 2) JSON 产物（patch / patch.report）
+                    _json_paths = [
+                        str(x).strip()
+                        for x in (out_files or [])
+                        if isinstance(x, str)
+                        and str(x).strip()
+                        and (str(x).endswith(".patch.json") or str(x).endswith(".patch.report.json"))
+                    ]
+                    _json_paths = list(dict.fromkeys(_json_paths))
+                    if _json_paths:
+                        def _fmt_json(i: int) -> str:
+                            p = _json_paths[int(i)]
+                            n_ch = _changes_by_report.get(p)
+                            if p.endswith(".patch.report.json") and isinstance(n_ch, int):
+                                return f"{Path(p).name}（changes={n_ch}）"
+                            return Path(p).name
+
+                        _picked_json = st.selectbox(
+                            "下载 JSON（patch / report）",
+                            options=list(range(len(_json_paths))),
+                            format_func=_fmt_json,
+                            index=0,
+                            key=f"draft_hist_json_pick_{rec.get('id')}_{idx}",
+                        )
+                        _picked_json_path = _json_paths[int(_picked_json)]
+                        _draft_download_button(
+                            label=f"下载：{Path(_picked_json_path).name}",
+                            raw_path=_picked_json_path,
+                            mime="application/json",
+                            key=f"draft_hist_json_btn_{rec.get('id')}_{idx}_{Path(_picked_json_path).name}",
+                        )
+
+                    # 3) 打包下载：输出文件/JSON/全部 三种 zip
+                    def _zip_download(paths: list, *, label: str, tag: str) -> None:
+                        try:
+                            _zip_members = []
+                            for of in paths or []:
+                                rpz = _resolve_draft_artifact_path(str(of))
+                                if rpz.is_file():
+                                    _zip_members.append(rpz)
+                            if len(_zip_members) < 2:
+                                return
+                            zdir = settings.uploads_path / "draft_outputs" / "_zip_exports"
+                            zdir.mkdir(parents=True, exist_ok=True)
+                            zname = f"draft_batch_{rec.get('id')}_{idx}_{tag}.zip"
+                            zpath = zdir / zname
+                            _reuse = False
+                            try:
+                                if zpath.is_file() and (time.time() - zpath.stat().st_mtime) < 600:
+                                    _reuse = True
+                            except Exception:
+                                _reuse = False
+                            if not _reuse:
+                                with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                                    for rpz in _zip_members:
+                                        zf.write(rpz, arcname=rpz.name)
+                            _draft_download_button(
+                                label=f"{label}（{len(_zip_members)} 个文件，ZIP）",
+                                raw_path=str(zpath),
+                                mime="application/zip",
+                                key=f"draft_hist_zip_{rec.get('id')}_{idx}_{tag}",
+                            )
+                        except Exception:
+                            return
+
+                    _zip_download(_out_paths, label="打包下载输出文件", tag="outputs")
+                    _zip_download(_json_paths, label="打包下载 JSON", tag="json")
+                    # 全部：包含输出文件 + JSON（如果存在）
+                    _zip_download((_out_paths or []) + (_json_paths or []), label="打包下载全部产物", tag="all")
+
+                # 修改日志：从落盘的 patch.report.json 分项展示（每文件一条，避免大批次只显示前几条）
+                # 目标：修改日志下拉列表与“下载产物”一致；即使某文件未产出 patch.report，也要在列表中可选并提示原因。
+                rep_candidates = [x for x in out_files if isinstance(x, str) and x.endswith(".patch.report.json")]
+                _summ = extra.get("per_file_patch_summaries") or []
+                _entries: list = []
+
+                # 1) 先以“输出产物”为主生成条目（与下载列表一致）
+                _out_map = extra.get("out_files_by_target") or {}
+                _out_paths = []
+                if isinstance(_out_map, dict) and _out_map:
+                    for _k, _v in _out_map.items():
+                        if isinstance(_v, str) and _v.strip():
+                            _out_paths.append(str(_v).strip())
+                # 兜底：从 out_files 中挑出“非 patch/json 的主产物”
+                if not _out_paths:
+                    for of in out_files or []:
+                        if not isinstance(of, str):
+                            continue
+                        s = of.strip()
+                        if not s:
+                            continue
+                        if s.endswith(".patch.json") or s.endswith(".patch.report.json"):
+                            continue
+                        _out_paths.append(s)
+                _out_paths = list(dict.fromkeys(_out_paths))  # 去重保序
+
+                for opath in _out_paths:
+                    try:
+                        rp_guess = str(Path(opath).with_suffix(Path(opath).suffix + ".patch.report.json"))
+                    except Exception:
+                        rp_guess = ""
+                    rp = rp_guess if (rp_guess and (rp_guess in (out_files or []) or rp_guess in rep_candidates)) else ""
+                    _entries.append({"file_name": Path(opath).name, "out_file": opath, "patch_report_path": rp})
+
+                # 2) 补充 per_file_patch_summaries（含 patch_counts 等信息）
+                if isinstance(_summ, list) and _summ:
+                    for ent in _summ:
+                        if not isinstance(ent, dict):
+                            continue
+                        rp0 = (ent.get("patch_report_path") or "").strip()
+                        if not rp0:
+                            continue
+                        fn0 = (
+                            (ent.get("file_name") or "").strip()
+                            or Path(str(rp0)).name
+                        )
+                        # 若同名条目已存在则合并信息，否则追加
+                        merged = False
+                        for ee in _entries:
+                            if (ee.get("file_name") or "").strip() == fn0:
+                                ee.update(ent)
+                                merged = True
+                                break
+                        if not merged:
+                            _entries.append(ent)
+
+                if _entries:
+                    st.markdown(
+                        f"**就地修改执行报告**（按输出文件列出，共 **{len(_entries)}** 条；在下拉框中选择文件查看详情）"
+                    )
+
+                    def _fmt_hist_pr_row(i: int) -> str:
+                        ent0 = _entries[int(i)]
+                        fn0 = (
+                            ent0.get("file_name")
+                            or Path(str(ent0.get("patch_report_path") or "")).name
+                        ).strip()
+                        pc0 = ent0.get("patch_counts") if isinstance(ent0.get("patch_counts"), dict) else {}
+                        s0 = fn0
+                        if pc0:
+                            s0 += (
+                                f" | applied={pc0.get('applied', '?')} changes={pc0.get('changes', '?')} "
+                                f"skipped={pc0.get('skipped', '?')} errors={pc0.get('errors', '?')}"
+                            )
+                        if not (ent0.get("patch_report_path") or "").strip():
+                            s0 += " | 无 patch.report（可能未启用就地修改或 patch 生成失败降级）"
+                        return s0
+
+                    _sel_i = st.selectbox(
+                        "选择文件查看就地修改明细",
+                        options=list(range(len(_entries))),
+                        format_func=_fmt_hist_pr_row,
+                        key=f"hist_pr_pick_{rec.get('id')}_{idx}",
+                    )
+                    j = int(_sel_i)
+                    ent = _entries[j]
+                    rp = (ent.get("patch_report_path") or "").strip()
+                    if rp:
+                        try:
+                            rp_path = _resolve_draft_artifact_path(str(rp))
+                            if not rp_path.is_file():
+                                st.caption("报告文件不存在或路径已失效。")
+                            else:
+                                data = rp_path.read_text(encoding="utf-8")
+                                obj = json.loads(data)
+                                if not isinstance(obj, dict):
+                                    st.caption("报告 JSON 格式异常。")
+                                else:
+                                    changes = obj.get("changes") or []
+                                    skipped = obj.get("skipped") or []
+                                    errors = obj.get("errors") or []
+                                    _draft_show_patch_skipped_errors(
+                                        obj, key_prefix=f"histpr_{rec.get('id')}_{j}_"
+                                    )
+                                    if isinstance(changes, list) and changes:
+                                        st.caption(f"changes（截断展示前 80 条，共 {len(changes)} 条）")
+                                        st.code(
+                                            json.dumps(changes[:80], ensure_ascii=False, indent=2),
+                                            language="json",
+                                        )
+                                        if len(changes) > 80:
+                                            st.caption(
+                                                "changes 过长已截断；请下载本文件 patch.report.json 查看完整内容。"
+                                            )
+                                    elif isinstance(skipped, list) and skipped:
+                                        st.caption(
+                                            f"changes=0，skipped（截断前 80 条，共 {len(skipped)} 条）"
+                                        )
+                                        st.code(
+                                            json.dumps(skipped[:80], ensure_ascii=False, indent=2),
+                                            language="json",
+                                        )
+                                        if len(skipped) > 80:
+                                            st.caption(
+                                                "skipped 过长已截断；请下载 patch.report.json 查看完整内容。"
+                                            )
+                                    elif isinstance(errors, list) and errors:
+                                        st.caption("errors")
+                                        st.code(
+                                            json.dumps(errors[:80], ensure_ascii=False, indent=2),
+                                            language="json",
+                                        )
+                                    try:
+                                        _draft_download_button(
+                                            label=f"下载报告：{Path(rp).name}",
+                                            raw_path=str(rp_path),
+                                            mime="application/json",
+                                            key=f"draft_hist_pr_dl_{rec.get('id')}_{j}_{Path(rp).name}",
+                                        )
+                                    except Exception:
+                                        pass
+                        except Exception as _he:
+                            st.caption(f"读取失败：{_he}")
+                    else:
+                        st.caption("该文件未生成 patch.report.json，因此没有可展示的修改日志。可在下载产物中查看输出文件内容。")
 
     st.markdown(
         "依据训练知识库中的“项目案例文档”生成新项目初稿："
@@ -7909,10 +8527,34 @@ def render_draft_page():
 
     input_files = st.file_uploader(
         "8) 上传输入/参考文件（用于提炼系统功能与基本信息，同时作为生成参考；支持 Word/Excel/PDF，多文件）",
-        type=["docx", "doc", "pdf", "xlsx", "xls"],
+        type=["docx", "doc", "pdf", "xlsx", "xls", "txt", "md", "zip", "tar", "gz", "tgz"],
         accept_multiple_files=True,
         key="draft_input_upload",
     )
+    with st.expander("📁 通过文件夹路径加载输入/参考文件（可选）", expanded=False):
+        st.caption("适用场景：输入/参考文件位于运行本工具的机器上（服务器/本机）。会递归扫描支持格式；路径中含「废弃」的文件/目录会自动跳过。")
+        _idir = st.text_input("输入/参考文件夹路径", value="", placeholder=r"例如：D:\docs\inputs", key="draft_input_dir_path")
+        st.session_state.setdefault("draft_input_dir_items", [])
+        da, db = st.columns(2)
+        with da:
+            if st.button("添加输入文件夹", key="draft_input_dir_add_btn"):
+                try:
+                    fps = _scan_directory_files(_idir.strip()) if _idir.strip() else []
+                    if fps:
+                        for fp in fps:
+                            if str(fp) not in [x[0] for x in st.session_state["draft_input_dir_items"]]:
+                                st.session_state["draft_input_dir_items"].append((str(fp), fp.name, False))
+                        st.success(f"已添加 {len(fps)} 个文件。")
+                    else:
+                        st.warning("未扫描到可用输入/参考文件。")
+                except Exception as _e:
+                    st.error(f"扫描失败：{_e}")
+        with db:
+            if st.button("清空输入文件夹列表", key="draft_input_dir_clear_btn"):
+                st.session_state["draft_input_dir_items"] = []
+                st.success("已清空。")
+        if st.session_state.get("draft_input_dir_items"):
+            st.caption(f"输入文件夹已加入 **{len(st.session_state['draft_input_dir_items'])}** 个文件；生成时会与上方上传文件合并。")
 
     # 可选：上传已有文件作为基底（继续编写）
     st.markdown("---")
@@ -7929,10 +8571,36 @@ def render_draft_page():
 
     base_files = st.file_uploader(
         "基础文件（Base，可多选）",
-        type=["docx", "doc", "pdf", "xlsx", "xls", "txt", "md"],
+        type=["docx", "doc", "pdf", "xlsx", "xls", "txt", "md", "zip", "tar", "gz", "tgz"],
         accept_multiple_files=True,
         key="draft_existing_base_files",
     )
+    with st.expander("📁 通过文件夹路径加载基础文件（Base，可选）", expanded=False):
+        st.caption("适用场景：基础文件位于运行本工具的机器上（服务器/本机）。会递归扫描支持格式；路径中含「废弃」的文件/目录会自动跳过。")
+        _bdir = st.text_input("基础文件夹路径", value="", placeholder=r"例如：D:\docs\bases", key="draft_base_dir_path")
+        st.session_state.setdefault("draft_base_dir_items", [])
+        ba, bb = st.columns(2)
+        with ba:
+            if st.button("添加基础文件夹", key="draft_base_dir_add_btn"):
+                try:
+                    fps = _scan_directory_files(_bdir.strip()) if _bdir.strip() else []
+                    # 仅保留 base 支持格式
+                    fps = [fp for fp in fps if fp.suffix.lower() in LOADER_MAP]
+                    if fps:
+                        for fp in fps:
+                            if str(fp) not in [x[0] for x in st.session_state["draft_base_dir_items"]]:
+                                st.session_state["draft_base_dir_items"].append((str(fp), fp.name, False))
+                        st.success(f"已添加 {len(fps)} 个基础文件。")
+                    else:
+                        st.warning("未扫描到可用基础文件。")
+                except Exception as _e:
+                    st.error(f"扫描失败：{_e}")
+        with bb:
+            if st.button("清空基础文件夹列表", key="draft_base_dir_clear_btn"):
+                st.session_state["draft_base_dir_items"] = []
+                st.success("已清空。")
+        if st.session_state.get("draft_base_dir_items"):
+            st.caption(f"基础文件夹已加入 **{len(st.session_state['draft_base_dir_items'])}** 个文件；生成时会与上方上传基础文件合并。")
     multi_base_auto = st.checkbox(
         "多份基础/多份参考时由 AI 自动分配（推荐：自动匹配改哪几份 Base、参考内容如何拆分）",
         value=True,
@@ -7975,6 +8643,30 @@ def render_draft_page():
                     base_bindings[sel] = bf
     elif base_files and multi_base_auto:
         st.caption(f"已上传 {len(base_files)} 份基础文件，将走自动分配（无需逐项绑定）。")
+
+    # 目标文件名自动匹配：按基础文件名尝试在当前模板案例文件名列表中选中（不覆盖用户已手动选择）
+    try:
+        _base_name_candidates = []
+        if base_files:
+            _base_name_candidates.extend([bf.name for bf in base_files if bf and bf.name])
+        try:
+            for _p, _dn, _arch in (st.session_state.get("draft_base_dir_items") or []):
+                if _dn:
+                    _base_name_candidates.append(str(_dn))
+        except Exception:
+            pass
+        _base_name_candidates = [x for x in _base_name_candidates if (x or "").strip()]
+        if case_file_names and _base_name_candidates and not selected_template_files:
+            _matched = [n for n in _base_name_candidates if n in case_file_names]
+            if _matched:
+                # 仅当用户未选择且未确认“生成全部”时自动填充
+                try:
+                    if not st.session_state.get(f"draft_select_all_{base_case_id}"):
+                        st.session_state["draft_template_files"] = list(dict.fromkeys(_matched))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     st.markdown("---")
     st.subheader("🧾 项目选择（可选：用已有项目 / 新建项目）")
@@ -8103,33 +8795,7 @@ def render_draft_page():
         job["job_id"] = uuid.uuid4().hex[:12]
         job["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 写入操作记录：后台任务已提交
-        try:
-            add_operation_log(
-                op_type="draft_generate_job",
-                collection=collection,
-                file_name="",
-                source="draft_page_submit",
-                extra={
-                    "job_id": job.get("job_id"),
-                    "started_at": job.get("started_at"),
-                    "payload": {
-                        "project_id": payload.get("project_id"),
-                        "base_case_id": payload.get("base_case_id"),
-                        "template_file_names": payload.get("template_file_names"),
-                        "inplace_patch": payload.get("inplace_patch"),
-                        "draft_strategy": payload.get("draft_strategy"),
-                        "document_language": payload.get("document_language"),
-                        "registration_country": payload.get("registration_country"),
-                        "registration_type": payload.get("registration_type"),
-                        "registration_component": payload.get("registration_component"),
-                        "project_form": payload.get("project_form"),
-                    },
-                },
-                model_info=get_current_model_info(),
-            )
-        except Exception:
-            pass
+        # 不在「仅提交」时写库：避免与「任务完成」draft_generate_job 重复刷屏；完成时会写一条含 batch_id 的记录。
 
         def _run() -> dict:
             # 在后台线程运行：不要调用 streamlit UI API
@@ -8142,8 +8808,24 @@ def render_draft_page():
                 with lock:
                     job["progress"] = f
                     job["progress_msg"] = str(msg or "")
+                # 同步打印到服务启动控制台，便于观察后台任务日志（不依赖 Streamlit UI）
+                try:
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    _m = (str(msg or "")).strip()
+                    if _m:
+                        print(f"[draft-job {job.get('job_id')}] {ts} {int(f*100):>3}% {_m}", flush=True)
+                except Exception:
+                    pass
 
+            try:
+                print(f"[draft-job {job.get('job_id')}] started payload_keys={sorted(list(payload.keys()))}", flush=True)
+            except Exception:
+                pass
             res = generator.generate(**payload, progress_cb=_on_progress)
+            try:
+                print(f"[draft-job {job.get('job_id')}] finished", flush=True)
+            except Exception:
+                pass
 
             # 仅返回必要信息，供主线程渲染下载/历史
             return {"res": res, "payload": payload}
@@ -8194,18 +8876,28 @@ def render_draft_page():
 
             # 写入操作记录：后台任务结束（成功/失败/取消）
             try:
+                _gen_n = None
+                try:
+                    if job.get("done") and job.get("result_payload"):
+                        _res0 = (job.get("result_payload") or {}).get("res")
+                        if _res0 is not None and getattr(_res0, "generated_files", None) is not None:
+                            _gen_n = len(_res0.generated_files or {})
+                except Exception:
+                    _gen_n = None
                 add_operation_log(
                     op_type="draft_generate_job",
                     collection=collection,
                     file_name="",
                     source="draft_page_done",
                     extra={
+                        "batch_id": job.get("job_id"),
                         "job_id": job.get("job_id"),
                         "started_at": job.get("started_at"),
                         "done": bool(job.get("done")),
                         "error": (job.get("error") or "").strip() or None,
                         "traceback": (job.get("traceback") or "").strip() or None,
                         "progress_msg": job.get("progress_msg"),
+                        "generated_file_count": _gen_n,
                     },
                     model_info=get_current_model_info(),
                 )
@@ -8226,50 +8918,68 @@ def render_draft_page():
     last = st.session_state.get("_draft_last_result")
     if last:
         # 默认展开：勾选控件会触发 rerun，若折叠用户会误以为“内容消失”
-        with st.expander("✅ 上一次生成结果（保留展示，不会因下载清空）", expanded=True):
+        with st.expander(
+            "✅ 上一次生成结果（保留展示，不会因下载清空）",
+            expanded=bool(last.get("expand", True)),
+        ):
             st.caption(last.get("summary") or "")
+            if (last.get("batch_id") or "").strip():
+                st.caption(f"批次ID：{last.get('batch_id')}")
             if st.button("清空上一次结果", key="draft_clear_last"):
                 st.session_state.pop("_draft_last_result", None)
                 _streamlit_rerun()
             for it in last.get("items", []):
                 fn = it.get("file_name") or ""
-                st.markdown(f"**文件：{fn}**")
-                _pfsr = it.get("per_file_skills_rules")
-                if _pfsr is True:
-                    st.caption("单文件 Skills/Rules：已从数据库注入本次提示词（优先生效）。")
-                elif _pfsr is False:
-                    st.caption("单文件 Skills/Rules：未检测到该文件名的数据库配置，或内容为空。")
-                _cl = it.get("change_log")
-                if _cl:
-                    st.caption("修改日志（就地修改，改前/改后）")
-                    try:
-                        st.code(
-                            json.dumps(_cl, ensure_ascii=False, indent=2),
-                            language="json",
+                with st.expander(f"文件：{fn}", expanded=False):
+                    _pfsr = it.get("per_file_skills_rules")
+                    if _pfsr is True:
+                        st.caption("单文件 Skills/Rules：已从数据库注入本次提示词（优先生效）。")
+                    elif _pfsr is False:
+                        st.caption("单文件 Skills/Rules：未检测到该文件名的数据库配置，或内容为空。")
+
+                    # 修改日志：优先从 patch.report.json 展示（避免把超大 changes 塞进 session_state 导致前端不稳）
+                    _rep = (it.get("patch_report_path") or "").strip()
+                    _rep_path = _resolve_draft_artifact_path(_rep) if _rep else Path("")
+                    if _rep and _rep_path.is_file():
+                        try:
+                            obj = json.loads(_rep_path.read_text(encoding="utf-8"))
+                            if isinstance(obj, dict):
+                                _draft_show_patch_skipped_errors(obj, key_prefix=f"draft_last_{fn}_")
+                                _chg = obj.get("changes") or []
+                                if isinstance(_chg, list) and _chg:
+                                    st.caption(f"修改日志（changes，共 {len(_chg)} 条；改前/改后）")
+                                    _show_all_changes = st.checkbox(
+                                        "展开显示全部 changes（可能较长）",
+                                        value=False,
+                                        key=f"draft_last_show_changes_all_{fn}",
+                                    )
+                                    if _show_all_changes:
+                                        st.code(
+                                            json.dumps(_chg, ensure_ascii=False, indent=2),
+                                            language="json",
+                                        )
+                                    else:
+                                        st.caption("已收起 changes 展示；勾选上方选项可展开查看全量内容。")
+                        except Exception:
+                            st.caption("patch.report.json 解析失败，可直接下载查看。")
+
+                    _dls = [str(x) for x in (it.get("downloads", []) or []) if str(x).strip()]
+                    if _dls:
+                        _dl_labels = [Path(p).name for p in _dls]
+                        _picked = st.selectbox(
+                            "下载产物",
+                            options=list(range(len(_dls))),
+                            format_func=lambda i: _dl_labels[i],
+                            index=0,
+                            key=f"draft_last_dl_pick_{fn}",
                         )
-                    except Exception:
-                        st.json(_cl)
-                _draft_show_patch_skipped_errors(
-                    {
-                        "applied": [],
-                        "changes": _cl or [],
-                        "skipped": it.get("patch_skipped") or [],
-                        "errors": it.get("patch_errors") or [],
-                    },
-                    key_prefix=f"draft_last_{fn}_",
-                )
-                for dl in it.get("downloads", []):
-                    p = Path(dl)
-                    if p.is_file():
-                        st.download_button(
-                            f"下载：{p.name}",
-                            data=p.read_bytes(),
-                            file_name=p.name,
+                        _picked_path = _dls[int(_picked)]
+                        _draft_download_button(
+                            label=f"下载：{Path(_picked_path).name}",
+                            raw_path=_picked_path,
                             mime="application/octet-stream",
-                            key=f"draft_last_dl_{fn}_{p.name}",
+                            key=f"draft_last_dl_btn_{fn}_{Path(_picked_path).name}",
                         )
-                    else:
-                        st.caption(f"文件不存在：{dl}")
             st.markdown("---")
 
     # 若来自历史记录“重新生成”，允许不上传输入文件：复用项目中已保存的 basic_info/system_functionality
@@ -8362,6 +9072,7 @@ def render_draft_page():
             change_logs_by_file = {}
             patch_skipped_by_file = {}
             patch_errors_by_file = {}
+            per_file_patch_summaries_regen: list = []
             out_prefix = f"{res.project_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
             _pf_map = getattr(res, "per_file_skills_rules_applied", None) or {}
             for fn, txt in (res.generated_files or {}).items():
@@ -8415,31 +9126,34 @@ def render_draft_page():
                         out_files_for_log.append(str(rep_path))
                         downloads.extend([saved, str(patch_path), str(rep_path)])
                         try:
-                            add_operation_log(
-                                op_type="draft_export",
-                                collection=collection,
-                                file_name=fn,
-                                source="draft_page_regen_export",
-                                extra={
-                                    "project_id": res.project_id,
-                                    "project_case_id": None,
-                                    "base_file": str(base_path),
+                            per_file_patch_summaries_regen.append(
+                                {
+                                    "file_name": fn,
                                     "out_file": str(saved),
+                                    "base_file": str(base_path),
                                     "suffix": base_suffix,
-                                    "inplace_patch": True,
+                                    "patch_report_path": str(rep_path),
+                                    "patch_json_path": str(patch_path),
                                     "patch_counts": {
-                                        "applied": len((patch_report or {}).get("applied") or []) if isinstance(patch_report, dict) else None,
-                                        "changes": len((patch_report or {}).get("changes") or []) if isinstance(patch_report, dict) else None,
-                                        "skipped": len((patch_report or {}).get("skipped") or []) if isinstance(patch_report, dict) else None,
-                                        "errors": len((patch_report or {}).get("errors") or []) if isinstance(patch_report, dict) else None,
+                                        "applied": len((patch_report or {}).get("applied") or [])
+                                        if isinstance(patch_report, dict)
+                                        else None,
+                                        "changes": len((patch_report or {}).get("changes") or [])
+                                        if isinstance(patch_report, dict)
+                                        else None,
+                                        "skipped": len((patch_report or {}).get("skipped") or [])
+                                        if isinstance(patch_report, dict)
+                                        else None,
+                                        "errors": len((patch_report or {}).get("errors") or [])
+                                        if isinstance(patch_report, dict)
+                                        else None,
                                     },
                                     "no_change": (
                                         isinstance(patch_report, dict)
                                         and len((patch_report.get("applied") or [])) == 0
                                         and len((patch_report.get("changes") or [])) == 0
                                     ),
-                                },
-                                model_info=get_current_model_info(),
+                                }
                             )
                         except Exception:
                             pass
@@ -8462,31 +9176,34 @@ def render_draft_page():
                         out_files_for_log.append(str(rep_path))
                         downloads.extend([saved, str(patch_path), str(rep_path)])
                         try:
-                            add_operation_log(
-                                op_type="draft_export",
-                                collection=collection,
-                                file_name=fn,
-                                source="draft_page_regen_export",
-                                extra={
-                                    "project_id": res.project_id,
-                                    "project_case_id": None,
-                                    "base_file": str(base_path),
+                            per_file_patch_summaries_regen.append(
+                                {
+                                    "file_name": fn,
                                     "out_file": str(saved),
+                                    "base_file": str(base_path),
                                     "suffix": base_suffix,
-                                    "inplace_patch": True,
+                                    "patch_report_path": str(rep_path),
+                                    "patch_json_path": str(patch_path),
                                     "patch_counts": {
-                                        "applied": len((patch_report or {}).get("applied") or []) if isinstance(patch_report, dict) else None,
-                                        "changes": len((patch_report or {}).get("changes") or []) if isinstance(patch_report, dict) else None,
-                                        "skipped": len((patch_report or {}).get("skipped") or []) if isinstance(patch_report, dict) else None,
-                                        "errors": len((patch_report or {}).get("errors") or []) if isinstance(patch_report, dict) else None,
+                                        "applied": len((patch_report or {}).get("applied") or [])
+                                        if isinstance(patch_report, dict)
+                                        else None,
+                                        "changes": len((patch_report or {}).get("changes") or [])
+                                        if isinstance(patch_report, dict)
+                                        else None,
+                                        "skipped": len((patch_report or {}).get("skipped") or [])
+                                        if isinstance(patch_report, dict)
+                                        else None,
+                                        "errors": len((patch_report or {}).get("errors") or [])
+                                        if isinstance(patch_report, dict)
+                                        else None,
                                     },
                                     "no_change": (
                                         isinstance(patch_report, dict)
                                         and len((patch_report.get("applied") or [])) == 0
                                         and len((patch_report.get("changes") or [])) == 0
                                     ),
-                                },
-                                model_info=get_current_model_info(),
+                                }
                             )
                         except Exception:
                             pass
@@ -8566,10 +9283,14 @@ def render_draft_page():
                         "out_files": out_files_for_log,
                         "out_files_by_target": out_files_by_target,
                         "generated_file_names": list((out_files_by_target or {}).keys()),
+                        "per_file_patch_summaries": per_file_patch_summaries_regen,
                         "change_logs_by_file": change_logs_by_file,
                         "patch_skipped_by_file": patch_skipped_by_file,
                         "patch_errors_by_file": patch_errors_by_file,
-                        "summary": "按历史记录重新生成：产物已落盘；如启用就地修改则同时写入 patch 与修订日志。",
+                        "summary": (
+                            f"按历史记录重新生成：共 {len(list((out_files_by_target or {}).keys()))} 个目标文件；"
+                            f"其中 {len(per_file_patch_summaries_regen)} 份含就地修改执行报告，请在历史记录下按文件展开查看。"
+                        ),
                     },
                     model_info=get_current_model_info(),
                 )
@@ -8612,40 +9333,92 @@ def render_draft_page():
 
     # 生成进度、生成结果预览：放在“开始生成按钮”下方
     if start and (not job.get("running")):
-        if not input_files:
-            st.warning("请先上传输入/参考文件。")
+        _dir_inputs = st.session_state.get("draft_input_dir_items") or []
+        if not input_files and not _dir_inputs:
+            st.warning("请先上传输入/参考文件，或通过文件夹路径添加输入文件。")
         else:
-            # 若本案例有文件名列表，但用户未选择且未确认全量生成，则要求先选择
-            if case_file_names and not effective_template_files:
-                st.warning("请先在「2.1 选择要生成的文件名称」中选择文件；或勾选“生成该案例下全部文件”。")
-                return
+            # 允许目标文件名为空：将走“仅基于基础文件+参考文件”的生成模式（不强制依赖模板文件名）
             tmp_dir = Path(tempfile.mkdtemp(prefix="aicheckword_draft_in_ui_"))
             input_paths = []
             existing_base_files = {}
+            expand_temp_dirs: list = []
             try:
-                for uf in input_files:
-                    if not uf:
-                        continue
-                    dst = tmp_dir / (uf.name or f"input_{len(input_paths)}")
-                    dst.write_bytes(uf.getbuffer())
-                    input_paths.append((str(dst), dst.name))
+                # 上传输入/参考文件（自动解压压缩包，保留子目录内文档）
+                if input_files:
+                    _in_items, _in_tmp_dirs = _expand_uploads(input_files)
+                    expand_temp_dirs.extend(_in_tmp_dirs or [])
+                    for _p, _dn, _arch in (_in_items or []):
+                        if not _p:
+                            continue
+                        try:
+                            if not Path(_p).is_file():
+                                continue
+                        except Exception:
+                            continue
+                        # 展示名：必须保留“压缩包名/子目录/文件名”，用于多份参考/多份 Base 的路由区分
+                        _name = str((_dn or Path(_p).name) or Path(_p).name)
+                        input_paths.append((str(_p), str(_name)))
+                # 文件夹输入/参考文件（服务端路径）
+                try:
+                    for p, dn, _arch in (_dir_inputs or []):
+                        if p and Path(p).is_file():
+                            input_paths.append((str(p), str(dn or Path(p).name)))
+                except Exception:
+                    pass
 
                 # 保存“已有文件”到临时目录并建立映射：template_file_name -> path（手动绑定时）
                 base_files_manifest: list = []
+                # 1) 自动分配：上传的 base_files + 文件夹 base_files 全部进入 manifest
+                #    压缩包会被解压，子目录内的每个文档都作为独立 Base 进入 manifest
                 if base_files and multi_base_auto:
-                    for bf in base_files:
-                        if not bf:
+                    _bf_items, _bf_tmp_dirs = _expand_uploads(base_files)
+                    expand_temp_dirs.extend(_bf_tmp_dirs or [])
+                    for _p, _dn, _arch in (_bf_items or []):
+                        if not _p:
                             continue
-                        bp = tmp_dir / (bf.name or f"base_auto_{len(base_files_manifest)}")
-                        bp.write_bytes(bf.getbuffer())
-                        base_files_manifest.append((str(bp), bf.name))
-                elif base_bindings:
+                        try:
+                            if not Path(_p).is_file():
+                                continue
+                        except Exception:
+                            continue
+                        # 仅保留受支持的文档类型作为 Base，避免 .zip/.rar 等误作为基础文件
+                        if Path(_p).suffix.lower() not in LOADER_MAP:
+                            continue
+                        # 展示名：保留“压缩包名/子目录/文件名”，让文件夹名参与多基础自动路由
+                        _name = str((_dn or Path(_p).name) or Path(_p).name)
+                        base_files_manifest.append((str(_p), str(_name)))
+                try:
+                    _dir_bases = st.session_state.get("draft_base_dir_items") or []
+                    for p, dn, _arch in (_dir_bases or []):
+                        if p and Path(p).is_file() and Path(p).suffix.lower() in LOADER_MAP:
+                            base_files_manifest.append((str(p), str(dn or Path(p).name)))
+                except Exception:
+                    pass
+
+                # 2) 手动绑定：仅处理上传的 base_files（文件夹 base 不参与手动绑定，避免无 UI 绑定关系）
+                if base_bindings and not multi_base_auto:
                     for target_name, bf in base_bindings.items():
                         if not bf or not target_name:
                             continue
-                        bp = tmp_dir / (bf.name or f"base_{len(existing_base_files)}")
-                        bp.write_bytes(bf.getbuffer())
-                        existing_base_files[str(target_name)] = str(bp)
+                        _tmp_list, _tmp_dirs = _expand_uploads([bf])
+                        expand_temp_dirs.extend(_tmp_dirs or [])
+                        _doc_items = [
+                            (p, dn, _arch) for (p, dn, _arch) in (_tmp_list or [])
+                            if p and Path(p).is_file() and Path(p).suffix.lower() in LOADER_MAP
+                        ]
+                        if not _doc_items:
+                            continue
+                        # 绑定一份 Base 到目标文件名；若压缩包内多个文档，取首个并提醒
+                        _p0, _dn0, _arch0 = _doc_items[0]
+                        existing_base_files[str(target_name)] = str(_p0)
+                        if len(_doc_items) > 1:
+                            try:
+                                st.warning(
+                                    f"绑定到「{target_name}」的基础文件为压缩包（{bf.name}），内含多个文档；"
+                                    f"本次仅使用首个：{Path(_p0).name}。如需分别绑定，请改为逐份上传。"
+                                )
+                            except Exception:
+                                pass
                 # 修复：若填写了项目编号，生成文件名会替换前缀；这里同时补一份“替换后 file_name”映射
                 if existing_base_files and (p_code or "").strip():
                     extra_map = {}
@@ -8667,11 +9440,12 @@ def render_draft_page():
                 _submit_draft_job(
                     {
                         "base_case_id": base_case_id,
-                        "template_file_names": effective_template_files or None,
+                        # 目标文件为空时：显式传空列表触发“base-only”模式；否则按选择生成
+                        "template_file_names": (effective_template_files if effective_template_files else []),
                         "project_id": selected_project_id if proj_mode.startswith("使用已有") else None,
                         "existing_base_files": existing_base_files or None,
                         "base_files_manifest": base_files_manifest or None,
-                        "multi_base_auto_route": bool(multi_base_auto and base_files_manifest),
+                        "multi_base_auto_route": bool(base_files_manifest),
                         "input_files": input_paths,
                         "document_language": doc_lang_val,
                         "registration_country": registration_country,
@@ -8732,6 +9506,7 @@ def render_draft_page():
             change_logs_by_file = {}
             patch_skipped_by_file = {}
             patch_errors_by_file = {}
+            per_file_patch_summaries: list = []
             out_prefix = str(res.project_case_id or res.project_id)
             _pf_map = getattr(res, "per_file_skills_rules_applied", None) or {}
             _base_map = getattr(res, "per_file_base_path", None) or {}
@@ -8746,6 +9521,8 @@ def render_draft_page():
                     downloads = []
                     change_log_obj = None
                     patch_report_obj = None
+                    patch_path_str = ""
+                    rep_path_str = ""
 
                     # 若该文件有绑定 Base，则输出同格式文件（并写入修订记录）；多基础路由时优先 per_file_base_path
                     base_path = _base_map.get(fn) if isinstance(_base_map, dict) else None
@@ -8803,36 +9580,40 @@ def render_draft_page():
                             patch_path.write_text(patch_json, encoding="utf-8")
                             rep_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.report.json")
                             rep_path.write_text(json.dumps(patch_report, ensure_ascii=False, indent=2), encoding="utf-8")
+                            patch_path_str = str(patch_path)
+                            rep_path_str = str(rep_path)
                             out_files_for_log.append(str(patch_path))
                             out_files_for_log.append(str(rep_path))
                             downloads.extend([saved, str(patch_path), str(rep_path)])
-                            # 操作记录：按文件导出结果（patch 统计）
                             try:
-                                add_operation_log(
-                                    op_type="draft_export",
-                                    collection=collection,
-                                    file_name=fn,
-                                    source="draft_page_export",
-                                    extra={
-                                        "project_id": res.project_id,
-                                        "project_case_id": res.project_case_id,
-                                        "base_file": str(base_path),
+                                per_file_patch_summaries.append(
+                                    {
+                                        "file_name": fn,
                                         "out_file": str(saved),
+                                        "base_file": str(base_path),
                                         "suffix": base_suffix,
-                                        "inplace_patch": True,
+                                        "patch_report_path": rep_path_str,
+                                        "patch_json_path": patch_path_str,
                                         "patch_counts": {
-                                            "applied": len((patch_report or {}).get("applied") or []) if isinstance(patch_report, dict) else None,
-                                            "changes": len((patch_report or {}).get("changes") or []) if isinstance(patch_report, dict) else None,
-                                            "skipped": len((patch_report or {}).get("skipped") or []) if isinstance(patch_report, dict) else None,
-                                            "errors": len((patch_report or {}).get("errors") or []) if isinstance(patch_report, dict) else None,
+                                            "applied": len((patch_report or {}).get("applied") or [])
+                                            if isinstance(patch_report, dict)
+                                            else None,
+                                            "changes": len((patch_report or {}).get("changes") or [])
+                                            if isinstance(patch_report, dict)
+                                            else None,
+                                            "skipped": len((patch_report or {}).get("skipped") or [])
+                                            if isinstance(patch_report, dict)
+                                            else None,
+                                            "errors": len((patch_report or {}).get("errors") or [])
+                                            if isinstance(patch_report, dict)
+                                            else None,
                                         },
                                         "no_change": (
                                             isinstance(patch_report, dict)
                                             and len((patch_report.get("applied") or [])) == 0
                                             and len((patch_report.get("changes") or [])) == 0
                                         ),
-                                    },
-                                    model_info=get_current_model_info(),
+                                    }
                                 )
                             except Exception:
                                 pass
@@ -8860,35 +9641,40 @@ def render_draft_page():
                             patch_path.write_text(patch_json, encoding="utf-8")
                             rep_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.report.json")
                             rep_path.write_text(json.dumps(patch_report, ensure_ascii=False, indent=2), encoding="utf-8")
+                            patch_path_str = str(patch_path)
+                            rep_path_str = str(rep_path)
                             out_files_for_log.append(str(patch_path))
                             out_files_for_log.append(str(rep_path))
                             downloads.extend([saved, str(patch_path), str(rep_path)])
                             try:
-                                add_operation_log(
-                                    op_type="draft_export",
-                                    collection=collection,
-                                    file_name=fn,
-                                    source="draft_page_export",
-                                    extra={
-                                        "project_id": res.project_id,
-                                        "project_case_id": res.project_case_id,
-                                        "base_file": str(base_path),
+                                per_file_patch_summaries.append(
+                                    {
+                                        "file_name": fn,
                                         "out_file": str(saved),
+                                        "base_file": str(base_path),
                                         "suffix": base_suffix,
-                                        "inplace_patch": True,
+                                        "patch_report_path": rep_path_str,
+                                        "patch_json_path": patch_path_str,
                                         "patch_counts": {
-                                            "applied": len((patch_report or {}).get("applied") or []) if isinstance(patch_report, dict) else None,
-                                            "changes": len((patch_report or {}).get("changes") or []) if isinstance(patch_report, dict) else None,
-                                            "skipped": len((patch_report or {}).get("skipped") or []) if isinstance(patch_report, dict) else None,
-                                            "errors": len((patch_report or {}).get("errors") or []) if isinstance(patch_report, dict) else None,
+                                            "applied": len((patch_report or {}).get("applied") or [])
+                                            if isinstance(patch_report, dict)
+                                            else None,
+                                            "changes": len((patch_report or {}).get("changes") or [])
+                                            if isinstance(patch_report, dict)
+                                            else None,
+                                            "skipped": len((patch_report or {}).get("skipped") or [])
+                                            if isinstance(patch_report, dict)
+                                            else None,
+                                            "errors": len((patch_report or {}).get("errors") or [])
+                                            if isinstance(patch_report, dict)
+                                            else None,
                                         },
                                         "no_change": (
                                             isinstance(patch_report, dict)
                                             and len((patch_report.get("applied") or [])) == 0
                                             and len((patch_report.get("changes") or [])) == 0
                                         ),
-                                    },
-                                    model_info=get_current_model_info(),
+                                    }
                                 )
                             except Exception:
                                 pass
@@ -8904,13 +9690,6 @@ def render_draft_page():
 
                         out_files_for_log.append(saved)
                         out_files_by_target[fn] = saved
-                        st.download_button(
-                            "下载同格式文件（含修订记录）",
-                            data=Path(saved).read_bytes(),
-                            file_name=Path(saved).name,
-                            mime="application/octet-stream",
-                            key=f"dl_draft_art_{fn}_{res.project_case_id}",
-                        )
                         _draft_show_patch_skipped_errors(
                             patch_report_obj,
                             key_prefix=f"draft_patch_{res.project_case_id}_{fn}_",
@@ -8931,30 +9710,40 @@ def render_draft_page():
                         out_files_for_log.append(str(txt_path))
                         out_files_by_target[fn] = str(txt_path)
                         downloads.append(str(txt_path))
-                        st.download_button(
-                            "下载文本",
-                            data=Path(txt_path).read_bytes(),
-                            file_name=txt_path.name,
-                            mime="text/plain",
-                            key=f"dl_draft_txt_{fn}_{res.project_case_id}",
+                    # 下载入口：下拉选择一个产物 + 单按钮（避免平铺刷屏）
+                    _dls = [str(x) for x in (downloads or []) if str(x).strip()]
+                    if _dls:
+                        _dl_labels = [Path(p).name for p in _dls]
+                        _picked = st.selectbox(
+                            "下载产物",
+                            options=list(range(len(_dls))),
+                            format_func=lambda i: _dl_labels[i],
+                            index=0,
+                            key=f"draft_cur_dl_pick_{fn}_{res.project_case_id}",
+                        )
+                        _picked_path = _dls[int(_picked)]
+                        _mime = (
+                            "application/json"
+                            if _picked_path.endswith(".json")
+                            else ("text/plain" if _picked_path.endswith(".txt") else "application/octet-stream")
+                        )
+                        _draft_download_button(
+                            label=f"下载：{Path(_picked_path).name}",
+                            raw_path=str(_picked_path),
+                            mime=_mime,
+                            key=f"draft_cur_dl_btn_{fn}_{res.project_case_id}_{Path(_picked_path).name}",
                         )
 
                     last_items.append(
                         {
                             "file_name": fn,
                             "downloads": downloads,
-                            "change_log": change_log_obj,
-                            "patch_skipped": patch_report_obj.get("skipped")
-                            if isinstance(patch_report_obj, dict)
-                            else None,
-                            "patch_errors": patch_report_obj.get("errors")
-                            if isinstance(patch_report_obj, dict)
-                            else None,
+                            "patch_json_path": patch_path_str or "",
+                            "patch_report_path": rep_path_str or "",
                             "per_file_skills_rules": _pf_map.get(fn),
                         }
                     )
-                    if change_log_obj:
-                        change_logs_by_file[fn] = change_log_obj
+                    # 注意：不要把超大 changes/skipped/errors 塞进 session_state/DB extra；历史页可从 patch.report.json 落盘文件读取
 
                 # 写入生成记录（用于历史查看/下载/重新生成）
                 try:
@@ -8964,6 +9753,7 @@ def render_draft_page():
                         file_name="draft_outputs",
                         source="draft_page",
                         extra={
+                            "batch_id": job.get("job_id"),
                             "base_case_id": base_case_id,
                             "template_file_names": selected_template_files or None,
                             "project_id": res.project_id,
@@ -8992,21 +9782,29 @@ def render_draft_page():
                             "out_files": out_files_for_log,
                             "out_files_by_target": out_files_by_target,
                             "generated_file_names": list((out_files_by_target or {}).keys()),
-                            "change_logs_by_file": change_logs_by_file,
-                            "patch_skipped_by_file": patch_skipped_by_file,
-                            "patch_errors_by_file": patch_errors_by_file,
-                            "summary": "生成产物已落盘；绑定 Base 的目标文件已导出同格式并写入修订记录。",
+                            "per_file_patch_summaries": per_file_patch_summaries,
+                            # 大体积的 changes/skipped/errors 不写入 DB extra，避免历史页渲染和前端传输不稳定；
+                            # 需要审计时可从 per_file_patch_summaries / *.patch.report.json 读取
+                            "summary": (
+                                f"本批共 {len(list((out_files_by_target or {}).keys()))} 个目标文件；"
+                                f"其中 {len(per_file_patch_summaries)} 份含就地修改执行报告（*.patch.report.json），"
+                                "请在下方按文件展开查看或下载报告。"
+                            ),
                         },
                         model_info=get_current_model_info(),
                     )
                 except Exception:
                     pass
 
-                # 缓存本次结果，避免页面重跑后丢失下载与日志展示
+                # 缓存本次结果（仅存轻量信息），避免页面重跑后丢失下载与日志展示
                 try:
+                    _items0 = list(last_items or [])
+                    _expand_last = True if len(_items0) <= 3 else False
                     st.session_state["_draft_last_result"] = {
                         "summary": f"project_id={res.project_id}, project_case_id={res.project_case_id or ''}".strip(),
-                        "items": last_items,
+                        "batch_id": job.get("job_id") or "",
+                        "expand": _expand_last,
+                        "items": _items0,
                     }
                 except Exception:
                     pass
@@ -9827,6 +10625,10 @@ def _op_type_label(op_type):
         OP_TYPE_CORRECTION: "✏️ 审核纠正",
         OP_TYPE_TRANSLATION: "🌐 文档翻译",
         OP_TYPE_TRANSLATION_ERROR: "❌ 文档翻译失败",
+        # 文档生成（初稿/就地修改）
+        "draft_generate_job": "🧾 文档生成任务",
+        "draft_generate": "🧾 文档生成",
+        "draft_export": "📦 文档导出（同格式/就地修改）",
     }
     return labels.get(op_type, op_type)
 
@@ -9874,8 +10676,26 @@ def render_operations_page():
     with col_filter:
         op_type_filter = st.selectbox(
             "操作类型",
-            ["全部", "法规训练批次", "生成审核点", "审核点训练", "项目专属训练", "项目专属训练失败/中断", "审核批次",
-             "单文件训练", "单文件审核", "文本审核", "审核纠正", "文档翻译", "文档翻译失败", "训练失败", "审核失败"],
+            [
+                "全部",
+                "法规训练批次",
+                "生成审核点",
+                "审核点训练",
+                "项目专属训练",
+                "项目专属训练失败/中断",
+                "审核批次",
+                "单文件训练",
+                "单文件审核",
+                "文本审核",
+                "审核纠正",
+                "文档翻译",
+                "文档翻译失败",
+                "文档生成",
+                "文档导出",
+                "文档生成任务",
+                "训练失败",
+                "审核失败",
+            ],
             key="op_type_filter",
         )
     with col_limit:
@@ -9895,6 +10715,9 @@ def render_operations_page():
         "审核纠正": OP_TYPE_CORRECTION,
         "文档翻译": OP_TYPE_TRANSLATION,
         "文档翻译失败": OP_TYPE_TRANSLATION_ERROR,
+        "文档生成": "draft_generate",
+        "文档导出": "draft_export",
+        "文档生成任务": "draft_generate_job",
         "训练失败": "train_error",
         "审核失败": "review_error",
     }
@@ -9983,6 +10806,50 @@ def render_operations_page():
         elif rec["op_type"] == OP_TYPE_TRANSLATION_ERROR:
             title = f"{op_label} | {rec.get('file_name', '')}"
             detail = f"错误：{extra.get('error', '')} | 来源：{rec.get('source', '')}"
+        elif rec["op_type"] == "draft_generate_job":
+            payload = extra.get("payload") or {}
+            done = extra.get("done")
+            err = (extra.get("error") or "").strip()
+            status = "完成" if done else ("失败" if err else "已提交")
+            base_case_id = payload.get("base_case_id", "")
+            inplace = payload.get("inplace_patch")
+            inplace_lbl = "就地修改" if inplace else "非就地"
+            _gfc = extra.get("generated_file_count")
+            _gfc_s = f" | 生成文件数={_gfc}" if _gfc is not None else ""
+            title = f"{op_label} | {status} | base_case_id={base_case_id} | {inplace_lbl}{_gfc_s}"
+            if err:
+                detail = f"错误：{err[:200]}{'…' if len(err) > 200 else ''}"
+            else:
+                detail = f"job_id={extra.get('job_id','')} | started_at={extra.get('started_at','')}"
+                if _gfc is not None:
+                    detail += f" | 生成文件数={_gfc}"
+        elif rec["op_type"] == "draft_generate":
+            fns = extra.get("generated_file_names") or list((extra.get("out_files_by_target") or {}).keys())
+            cnt = len([x for x in (fns or []) if str(x).strip()])
+            project_id = extra.get("project_id", "")
+            base_case_id = extra.get("base_case_id", "")
+            inplace_lbl = "就地修改" if extra.get("inplace_patch") else "非就地"
+            title = f"{op_label} | 生成 {cnt} 份 | project_id={project_id} | base_case_id={base_case_id} | {inplace_lbl}"
+            _sum = (extra.get("summary") or "").strip()
+            detail = _sum if _sum else f"来源：{rec.get('source','')} | 知识库：{rec.get('collection','')}"
+        elif rec["op_type"] == "draft_export":
+            pc = (extra.get("patch_counts") or {}) if isinstance(extra.get("patch_counts"), dict) else {}
+            applied = pc.get("applied")
+            changes = pc.get("changes")
+            skipped = pc.get("skipped")
+            errors = pc.get("errors")
+            suffix = extra.get("suffix", "")
+            title = f"{op_label} | {rec.get('file_name','')} | {suffix}"
+            parts = []
+            if applied is not None:
+                parts.append(f"applied={applied}")
+            if changes is not None:
+                parts.append(f"changes={changes}")
+            if skipped is not None:
+                parts.append(f"skipped={skipped}")
+            if errors is not None:
+                parts.append(f"errors={errors}")
+            detail = (" | ".join(parts)) if parts else f"来源：{rec.get('source','')}"
         elif rec["op_type"] in ("train_error", "review_error", "review_text_error"):
             title = f"{op_label} | {rec.get('file_name', '')}"
             detail = f"错误：{extra.get('error', '')} | 知识库：{rec.get('collection', '')}"
