@@ -239,6 +239,19 @@ def init_db() -> None:
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """)
                 cur.execute("""
+                    CREATE TABLE IF NOT EXISTS ocr_cache_docs (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        file_name VARCHAR(512) NOT NULL DEFAULT '',
+                        file_hash VARCHAR(128) DEFAULT '',
+                        ocr_text LONGTEXT NOT NULL,
+                        metadata_json LONGTEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY uq_ocr_file_name (file_name(255)),
+                        INDEX idx_ocr_updated (updated_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS project_cases (
                         id BIGINT AUTO_INCREMENT PRIMARY KEY,
                         collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
@@ -797,10 +810,21 @@ def get_operation_summary() -> Dict[str, Any]:
                 (OP_TYPE_REVIEW_BATCH,),
             )
             total_review_batches = cur.fetchone()["c"]
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT COUNT(*) AS c FROM operation_logs
-                WHERE op_type IN (%s, %s, %s, %s) AND DATE(created_at) = CURDATE()
-            """, (OP_TYPE_TRAIN_BATCH, OP_TYPE_REVIEW_BATCH, OP_TYPE_TRANSLATION, OP_TYPE_TRANSLATION_ERROR))
+                WHERE op_type IN (%s, %s, %s, %s, %s, %s, %s) AND DATE(created_at) = CURDATE()
+                """,
+                (
+                    OP_TYPE_TRAIN_BATCH,
+                    OP_TYPE_REVIEW_BATCH,
+                    OP_TYPE_TRANSLATION,
+                    OP_TYPE_TRANSLATION_ERROR,
+                    "draft_generate",
+                    "draft_generate_job",
+                    "draft_export",
+                ),
+            )
             today_ops = cur.fetchone()["c"]
         return {
             "total_train_batches": total_train_batches,
@@ -1198,6 +1222,94 @@ def get_existing_file_names(
                     (collection,),
                 )
             return [r["file_name"] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def list_ocr_cache_file_names(limit: int = 2000) -> list:
+    """返回 OCR 缓存中的文件名列表（用于重名提示）。"""
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT file_name FROM ocr_cache_docs WHERE file_name IS NOT NULL AND file_name != '' ORDER BY updated_at DESC LIMIT %s",
+                (int(limit),),
+            )
+            return [str(r.get("file_name") or "").strip() for r in cur.fetchall() if str(r.get("file_name") or "").strip()]
+    finally:
+        conn.close()
+
+
+def get_ocr_cache_by_file_name(file_name: str) -> Optional[Dict[str, Any]]:
+    """按展示文件名读取 OCR 缓存。"""
+    fn = (file_name or "").strip()
+    if not fn:
+        return None
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT file_name, file_hash, ocr_text, metadata_json, updated_at
+                FROM ocr_cache_docs
+                WHERE file_name = %s
+                LIMIT 1
+                """,
+                (fn,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            meta_raw = row.get("metadata_json")
+            try:
+                meta = json.loads(meta_raw) if meta_raw else {}
+            except Exception:
+                meta = {}
+            return {
+                "file_name": row.get("file_name") or "",
+                "file_hash": row.get("file_hash") or "",
+                "ocr_text": row.get("ocr_text") or "",
+                "metadata": meta if isinstance(meta, dict) else {},
+                "updated_at": row.get("updated_at"),
+            }
+    finally:
+        conn.close()
+
+
+def upsert_ocr_cache_by_file_name(
+    file_name: str,
+    file_hash: str,
+    ocr_text: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """保存 OCR 缓存；同名文件会覆盖旧缓存。"""
+    fn = (file_name or "").strip()
+    if not fn or not (ocr_text or "").strip():
+        return
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ocr_cache_docs (file_name, file_hash, ocr_text, metadata_json)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    file_hash = VALUES(file_hash),
+                    ocr_text = VALUES(ocr_text),
+                    metadata_json = VALUES(metadata_json),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    fn,
+                    (file_hash or "").strip(),
+                    ocr_text,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
     finally:
         conn.close()
 

@@ -1516,7 +1516,12 @@ class DocumentReviewer:
         path = Path(file_path)
         storage_bn = path.name
         fn = (display_file_name or "").strip() or storage_bn
-        docs = load_single_file(path)
+        force_ocr_refresh = bool((review_context or {}).get("_force_ocr_refresh"))
+        docs = load_single_file(
+            path,
+            force_ocr_refresh=force_ocr_refresh,
+            ocr_cache_file_name=fn or storage_bn,
+        )
         full_text = "\n\n".join(doc.page_content for doc in docs)
 
         if len(full_text) > 30000:

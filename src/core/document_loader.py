@@ -8,6 +8,8 @@ import zipfile
 import tempfile
 import tarfile
 import base64
+import json
+import hashlib
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -194,11 +196,66 @@ def _extract_openai_choice_text(data: dict) -> str:
     return ""
 
 
-def _pdf_ocr_with_multimodal_llm(path: Path, max_pages: int = MAX_PDF_OCR_PAGES) -> Tuple[List[Document], str]:
+def _calc_file_sha256(path: Path) -> str:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for b in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(b)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def _ocr_docs_from_cache_payload(path: Path, payload: dict) -> List[Document]:
+    pages = payload.get("pages") if isinstance(payload, dict) else None
+    docs: List[Document] = []
+    if isinstance(pages, list) and pages:
+        for i, t in enumerate(pages):
+            txt = str(t or "").strip() or "[该页 OCR 未识别到可用文本]"
+            docs.append(
+                Document(
+                    page_content=txt,
+                    metadata={"source_file": path.name, "file_type": ".pdf", "page": i + 1, "ocr_fallback": True, "ocr_cache_hit": True},
+                )
+            )
+    return docs
+
+
+def _pdf_ocr_with_multimodal_llm(
+    path: Path,
+    max_pages: int = MAX_PDF_OCR_PAGES,
+    *,
+    force_ocr_refresh: bool = False,
+    cache_file_name: str = "",
+) -> Tuple[List[Document], str]:
     """
     当 PDF 文本层几乎为空时，尝试用多模态模型 OCR。
     返回 (docs, err_msg)：成功时 err_msg 为空；失败时 docs 为空并给出可读错误。
     """
+    cache_name = (cache_file_name or path.name or "").strip()
+    file_hash = _calc_file_sha256(path)
+
+    if (not force_ocr_refresh) and cache_name:
+        try:
+            from .db import get_ocr_cache_by_file_name
+            cache_row = get_ocr_cache_by_file_name(cache_name)
+            if isinstance(cache_row, dict):
+                cached_meta = cache_row.get("metadata") if isinstance(cache_row.get("metadata"), dict) else {}
+                docs_from_cache = _ocr_docs_from_cache_payload(path, cached_meta)
+                if docs_from_cache:
+                    return docs_from_cache, ""
+                cached_text = str(cache_row.get("ocr_text") or "").strip()
+                if cached_text:
+                    return [
+                        Document(
+                            page_content=cached_text,
+                            metadata={"source_file": path.name, "file_type": ".pdf", "ocr_fallback": True, "ocr_cache_hit": True},
+                        )
+                    ], ""
+        except Exception:
+            pass
+
     p = (settings.provider or "").strip().lower()
     # Cursor 主对话不走本函数；扫描 PDF 的 OCR 按「向量化使用」走 Ollama 多模态或 OpenAI Vision
     if p == "cursor":
@@ -330,6 +387,23 @@ def _pdf_ocr_with_multimodal_llm(path: Path, max_pages: int = MAX_PDF_OCR_PAGES)
 
     if not docs:
         return [], f"AI OCR 失败：{err_detail or '模型未返回可用内容'}"
+    try:
+        from .db import upsert_ocr_cache_by_file_name
+        page_texts = [str(getattr(d, "page_content", "") or "") for d in docs]
+        upsert_ocr_cache_by_file_name(
+            file_name=cache_name or path.name,
+            file_hash=file_hash,
+            ocr_text="\n\n".join(page_texts).strip(),
+            metadata={
+                "pages": page_texts,
+                "provider": p,
+                "ocr_model": model,
+                "page_count": len(page_texts),
+                "source_file": path.name,
+            },
+        )
+    except Exception:
+        pass
     return docs, ""
 
 
@@ -1218,7 +1292,7 @@ def _build_pdf_signoff_image_supplement(pdf_path: Path, max_pages: int = MAX_PDF
     )
 
 
-def load_single_file(file_path) -> List[Document]:
+def load_single_file(file_path, *, force_ocr_refresh: bool = False, ocr_cache_file_name: str = "") -> List[Document]:
     """加载单个文件，返回 Document 列表。失败时抛出带完整原因的异常。"""
     path = Path(file_path)
     suffix = path.suffix.lower()
@@ -1296,7 +1370,12 @@ def load_single_file(file_path) -> List[Document]:
             total_text = "".join(d.page_content for d in docs)
             if len(total_text.strip()) < MIN_PDF_TEXT_LEN:
                 # 先尝试 AI OCR 兜底，避免扫描版直接失败
-                ocr_docs, ocr_err = _pdf_ocr_with_multimodal_llm(path, max_pages=MAX_PDF_OCR_PAGES)
+                ocr_docs, ocr_err = _pdf_ocr_with_multimodal_llm(
+                    path,
+                    max_pages=MAX_PDF_OCR_PAGES,
+                    force_ocr_refresh=bool(force_ocr_refresh),
+                    cache_file_name=(ocr_cache_file_name or path.name),
+                )
                 if ocr_docs:
                     docs = ocr_docs
                 else:
@@ -1579,9 +1658,13 @@ def split_documents(
     return splitter.split_documents(documents)
 
 
-def load_and_split(file_path) -> List[Document]:
+def load_and_split(file_path, *, force_ocr_refresh: bool = False, ocr_cache_file_name: str = "") -> List[Document]:
     """加载并分块单个文件"""
-    docs = load_single_file(file_path)
+    docs = load_single_file(
+        file_path,
+        force_ocr_refresh=bool(force_ocr_refresh),
+        ocr_cache_file_name=(ocr_cache_file_name or ""),
+    )
     return split_documents(docs)
 
 

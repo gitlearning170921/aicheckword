@@ -1248,6 +1248,7 @@ class DocumentDraftGenerator:
         inplace_patch: bool = False,
         workspace_root: Optional[Path] = None,
         provider: Optional[str] = None,
+        audit_remediation_text: str = "",
     ) -> Tuple[str, bool]:
         try:
             _row_pf = get_draft_file_skills_rules(self.collection, int(base_case_id), template_file_name)
@@ -1332,6 +1333,18 @@ class DocumentDraftGenerator:
             template_text=template_text[:22000],
             template_reference_text=(template_reference_text or "").strip()[:12000],
         )
+        _audit_txt = (audit_remediation_text or "").strip()
+        if _audit_txt:
+            prompt += (
+                "\n\n【审核待落实项（仅本次选中，处理状态=立即修改）】\n"
+                f"{_audit_txt[:9000]}\n"
+                "你必须优先覆盖上述审核点，并在可锚定前提下给出可审计修改；禁止发散到未选中审核点。\n"
+            )
+            if inplace_patch:
+                prompt += (
+                    "PATCH_JSON 中每条 operation 必须带 `audit_point_refs`（字符串数组），"
+                    "元素必须来自上述清单中的 [R*_P*] 引用；若确实无法对应则填空数组 []。\n"
+                )
 
         if settings.is_cursor or (provider or "").strip().lower() == "cursor":
             # Cursor 模式下 skills/rules 也会参与；但此处仍把其内容注入 prompt，确保非 Cursor/或截断时依旧遵循硬约束。
@@ -1387,6 +1400,9 @@ class DocumentDraftGenerator:
         draft_strategy: str = "change",
         author_role: str = "",
         author_role_map: Optional[Dict[str, str]] = None,
+        audit_remediation_by_target: Optional[Dict[str, str]] = None,
+        # True：不读取案例库中的模板文档文本（仍可用 base_case_id 取项目维度占位；与 save_as_case=False 的审核后修改配合）
+        skip_case_template_text: bool = False,
     ) -> GeneratedCaseDocs:
         def _progress(msg: str, frac: float) -> None:
             try:
@@ -1406,9 +1422,14 @@ class DocumentDraftGenerator:
                 workspace_root=Path(__file__).resolve().parents[2],
             )
 
-        base_case = get_project_case(base_case_id)
-        if not base_case:
-            raise RuntimeError(f"找不到 base_case_id={base_case_id}")
+        _skip_tpl = bool(skip_case_template_text)
+        _bcid = int(base_case_id or 0)
+        if _skip_tpl and _bcid == 0:
+            base_case = {}
+        else:
+            base_case = get_project_case(_bcid)
+            if not base_case:
+                raise RuntimeError(f"找不到 base_case_id={_bcid}")
 
         scope_of_application = (
             (scope_of_application_override or "").strip()
@@ -1585,7 +1606,12 @@ class DocumentDraftGenerator:
             # 7) 确定本次要生成的目标文件名列表
             # - 常规：按模板案例（project_case）文件名生成
             # - Base-only：当目标文件名为空或无法与模板案例对齐时，允许仅基于用户上传的基础文件（Base）+参考文件生成
-            all_case_files = get_project_case_file_names(self.collection, base_case_id) or []
+            if int(base_case_id or 0) > 0:
+                all_case_files = get_project_case_file_names(self.collection, int(base_case_id)) or []
+            else:
+                all_case_files = []
+            if _skip_tpl:
+                all_case_files = []
             chosen = [x for x in (template_file_names or []) if (x or "").strip()]
             base_only_mode = False
             if template_file_names is not None and not chosen:
@@ -1594,8 +1620,12 @@ class DocumentDraftGenerator:
             if not chosen and not base_only_mode:
                 chosen = list(all_case_files)
             if not base_only_mode:
-                # 防御：只生成该 case 下存在的文件
-                chosen = [x for x in chosen if x in all_case_files]
+                # 常规优先使用 case 内目标；未命中的目标不直接丢弃，转入 base-only 兜底
+                in_case = [x for x in chosen if x in all_case_files]
+                not_in_case = [x for x in chosen if x not in all_case_files]
+                if not_in_case:
+                    base_only_mode = True
+                chosen = in_case + not_in_case
             if not chosen and base_only_mode:
                 # 仅基于基础文件（Base）生成：目标文件名取基础文件清单
                 base_keys = []
@@ -1603,6 +1633,14 @@ class DocumentDraftGenerator:
                     base_keys.extend([k for k in existing_base_files.keys() if (k or "").strip()])
                 if base_files_manifest:
                     base_keys.extend([n for _p, n in (base_files_manifest or []) if (n or "").strip()])
+                if isinstance(audit_remediation_by_target, dict) and audit_remediation_by_target:
+                    base_keys.extend(
+                        [
+                            str(k).strip()
+                            for k, v in (audit_remediation_by_target or {}).items()
+                            if str(k or "").strip() and str(v or "").strip()
+                        ]
+                    )
                 # 去重保持顺序
                 seen = set()
                 chosen = []
@@ -1613,6 +1651,25 @@ class DocumentDraftGenerator:
                     chosen.append(k)
             if not chosen:
                 raise RuntimeError(f"base_case_id={base_case_id} 在 knowledge base 中无可用目标文件名；请上传基础文件或选择模板案例文件")
+
+            # base-only 且无基底文件时：准备一个模板文本兜底，保证“仅审核点文本也可继续生成”
+            base_only_template_fallback = ""
+            if base_only_mode and all_case_files and (not _skip_tpl):
+                try:
+                    _fb_name = str(all_case_files[0])
+                    _fb_rows = get_knowledge_docs_by_case_id_and_file_name(
+                        collection=self.collection,
+                        case_id=base_case_id,
+                        file_name=_fb_name,
+                        limit=base_case_limit_chunks,
+                    )
+                    base_only_template_fallback = "\n\n".join(
+                        (r.get("content") or "").strip()
+                        for r in _fb_rows
+                        if (r.get("content") or "").strip()
+                    ).strip()
+                except Exception:
+                    base_only_template_fallback = ""
 
             # 性能优化：开启“就地修改(inplace_patch)”且用户提供了 Base 绑定时，
             # 仅对“有 Base 的目标文件”进行生成/patch，避免对未绑定 Base 的文件逐个调用大模型导致极慢。
@@ -1761,6 +1818,8 @@ class DocumentDraftGenerator:
                         existing_text = ""
                 if (base_only_mode or _is_leftover_only) and not template_text:
                     template_text = existing_text or ""
+                if (base_only_mode or _is_leftover_only) and not template_text and base_only_template_fallback:
+                    template_text = base_only_template_fallback
                 if not template_text:
                     # 无模板也无基础正文：跳过
                     continue
@@ -1819,6 +1878,11 @@ class DocumentDraftGenerator:
                     inplace_patch=bool(inplace_patch and bool(existing_text)),
                     workspace_root=Path(__file__).resolve().parents[2],
                     provider=provider,
+                    audit_remediation_text=(
+                        ((audit_remediation_by_target or {}).get(template_file_name) or "")
+                        if isinstance(audit_remediation_by_target, dict)
+                        else ""
+                    ),
                 )
                 if not (raw_out or "").strip():
                     raise RuntimeError(f"生成失败：{template_file_name} 返回空文本")

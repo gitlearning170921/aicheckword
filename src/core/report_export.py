@@ -6,6 +6,11 @@ import html
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 
+from .audit_handoff import (
+    build_immediate_audit_point_records,
+    build_immediate_audit_remediation_by_target,
+)
+
 _SEVERITY_MAP = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
 
 

@@ -1,0 +1,23 @@
+---
+description: 操作记录与列表缓存一致性（写入后失效缓存、初稿/审核后修改等同台展示）
+globs: src/app.py,src/core/db.py
+---
+
+# 操作记录与 UI 一致性
+
+## 1) 写入 `operation_logs` 后必须失效列表缓存
+
+- `render_operations_page` 使用 `_cached_operation_logs`（TTL 缓存）。**任何** `add_operation_log(...)` 若应立刻在「操作记录」页可见，须在写入成功后调用 **`_invalidate_operation_logs_cache()`**（与初稿生成、审核后修改、历史重新生成等路径一致）。
+- 避免依赖用户去「知识库设置 → 刷新统计」才看到新日志。
+
+## 2) 与「文档初稿生成」同形态的能力
+
+- 若新功能落库形态与 `draft_generate` 相同（如审核后修改），须同时满足：
+  - **操作记录**：`extra` 中带可筛选字段（如 `post_audit: true`）或独立 `source`，并在 `render_operations_page` 增加**标题区分**与（如需）**独立筛选项**。
+  - **今日操作数**：`get_operation_summary()` 的「今日」统计应包含相关 `op_type`，避免用户误以为未记录。
+  - **页面内历史列表**：与初稿共用 `op_type` 时，须在 UI 上**分开展示**（如 `_render_draft_history(post_audit_only=…)`），且拉取条数要足够再在内存中过滤，避免「仅取最新 100 条全是初稿」把审核后修改挤出列表。
+  - **写库失败**：`add_operation_log` 不得静默吞掉异常；应 `st.warning` 提示，避免用户误以为未落库而重复跑 AI。
+
+## 3) 不在此规则中重复的内容
+
+- 大 JSON 不进 DB `extra`、patch 落盘路径等，继续遵守 `streamlit-ui-layout.mdc` 与既有 draft 历史约定。

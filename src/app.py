@@ -30,6 +30,7 @@ import uuid
 import shutil
 import traceback
 import inspect
+from difflib import SequenceMatcher
 import warnings
 from pathlib import Path
 
@@ -202,6 +203,7 @@ from src.core.db import (
     get_existing_file_names,
     get_existing_checkpoint_file_names,
     get_existing_project_file_names,
+    list_ocr_cache_file_names,
     create_project_case,
     list_project_cases,
     get_project_case_file_names,
@@ -239,7 +241,21 @@ from src.core.db import (
     OP_TYPE_TRANSLATION,
     OP_TYPE_TRANSLATION_ERROR,
 )
-from src.core.report_export import report_to_html, report_to_docx, report_to_pdf, report_to_excel, report_to_docx_with_comments, report_todo_to_csv, report_todo_to_pdf, report_todo_to_docx, report_todo_to_excel
+from src.core.audit_handoff import (
+    build_immediate_audit_point_records,
+    build_immediate_audit_remediation_by_target,
+)
+from src.core.report_export import (
+    report_to_html,
+    report_to_docx,
+    report_to_pdf,
+    report_to_excel,
+    report_to_docx_with_comments,
+    report_todo_to_csv,
+    report_todo_to_pdf,
+    report_todo_to_docx,
+    report_todo_to_excel,
+)
 from src.core.draft_export import export_like_base
 from src.streamlit_compat import streamlit_divider, streamlit_rerun
 from src.system_config_ui import render_system_config_page
@@ -402,6 +418,14 @@ def _cached_knowledge_stats_by_category(collection: str):
 @_make_ttl_cache(ttl_sec=8)
 def _cached_operation_logs(op_type, collection_filter, limit: int):
     return get_operation_logs(op_type=op_type, collection=collection_filter, limit=limit)
+
+
+def _invalidate_operation_logs_cache() -> None:
+    """写入 operation_logs 后调用，避免「操作记录」页 TTL 缓存看不到刚写入的行。"""
+    try:
+        _cached_operation_logs.clear()
+    except Exception:
+        pass
 
 
 @_make_ttl_cache(ttl_sec=12)
@@ -4092,10 +4116,32 @@ def render_step3_page():
             if st.session_state.get("review_ref_dir_items"):
                 st.caption(f"参考文件夹已加入 **{len(st.session_state['review_ref_dir_items'])}** 个文件；开始审核时会与上方上传参考文件合并。")
         _has_review_inputs = bool(review_files) or bool(st.session_state.get("review_dir_items"))
+        _force_ocr_refresh = False
         if _has_review_inputs:
             n_upload = len(review_files)
             n_dir = len(st.session_state.get("review_dir_items") or [])
             st.caption(f"已选择 **{n_upload}** 个上传文件，文件夹列表 **{n_dir}** 个文件；点击下方按钮将合并批量审核。")
+            try:
+                _sel_names = [str(getattr(f, "name", "") or "").strip() for f in (review_files or [])]
+                _sel_names.extend([str(dn or "").strip() for (_p, dn, _a) in (st.session_state.get("review_dir_items") or [])])
+                _sel_names = [x for x in _sel_names if x and x.lower().endswith(".pdf")]
+                _cached_names = set(list_ocr_cache_file_names(limit=5000))
+                _dup_ocr = sorted({x for x in _sel_names if x in _cached_names})
+            except Exception:
+                _dup_ocr = []
+            if _dup_ocr:
+                st.warning(
+                    "检测到以下 PDF 在 OCR 缓存中已存在同名结果："
+                    + "、".join(_dup_ocr[:8])
+                    + ("…" if len(_dup_ocr) > 8 else "")
+                )
+                _force_ocr_refresh = st.checkbox(
+                    "同名文件重新 OCR 并覆盖缓存（默认关闭：直接复用缓存，节省 token）",
+                    value=False,
+                    key="review_force_ocr_refresh",
+                )
+            else:
+                st.caption("未命中同名 OCR 缓存：本次如遇扫描版 PDF 将执行 OCR，并自动写入缓存。")
             do_multi_doc = st.checkbox(
                 "进行多文档一致性与模板风格审核（2 个及以上文件时）",
                 value=True,
@@ -4132,6 +4178,7 @@ def render_step3_page():
                             _tr_ctx["current_provider"] = (
                                 st.session_state.get("current_provider") or settings.provider or ""
                             ).strip().lower()
+                            _tr_ctx["_force_ocr_refresh"] = bool(_force_ocr_refresh)
                             if project_id:
                                 _tr_ctx["_filter_by_registration_type"] = True
                             _rbid_tr = datetime.now().strftime("%Y%m%d_%H%M%S") + "-" + uuid.uuid4().hex[:8]
@@ -4195,7 +4242,11 @@ def render_step3_page():
             if st.session_state.get("review_auto_match_case"):
                 first_path = items[0][0]
                 try:
-                    docs = load_single_file(first_path)
+                    docs = load_single_file(
+                        first_path,
+                        force_ocr_refresh=bool(_force_ocr_refresh),
+                        ocr_cache_file_name=(items[0][1] or Path(first_path).name),
+                    )
                     doc_text = "\n\n".join(getattr(d, "page_content", str(d)) for d in docs) if docs else ""
                 except Exception:
                     doc_text = ""
@@ -4257,6 +4308,7 @@ def render_step3_page():
             review_context["current_provider"] = (
                 st.session_state.get("current_provider") or settings.provider or ""
             ).strip().lower()
+            review_context["_force_ocr_refresh"] = bool(_force_ocr_refresh)
             # 按项目审核时自动按项目适用注册类别匹配审核点；通用审核不区分类别、使用全部审核点
             if project_id:
                 review_context["_filter_by_registration_type"] = True
@@ -4277,7 +4329,11 @@ def render_step3_page():
                     _used = 0
                     for _rp, _rdn, _rarch in _ritems:
                         try:
-                            _docs = load_single_file(_rp)
+                            _docs = load_single_file(
+                                _rp,
+                                force_ocr_refresh=bool(_force_ocr_refresh),
+                                ocr_cache_file_name=(_rdn or Path(_rp).name),
+                            )
                             _txt = "\n\n".join(getattr(d, "page_content", str(d)) for d in _docs) if _docs else ""
                         except Exception:
                             _txt = ""
@@ -5373,6 +5429,67 @@ def _inject_review_meta(report: dict, batch_record_kind: Optional[str] = None):
     if batch_record_kind:
         report["review_batch_record_kind"] = batch_record_kind
 
+
+def _post_audit_dim_first_choice(raw) -> str:
+    """_review_meta 中维度可能为「中国、美国」式拼接；下拉框取第一个可选项。"""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    for sep in ("、", ",", ";", "；"):
+        if sep in s:
+            return s.split(sep)[0].strip()
+    return s
+
+
+def _post_audit_form_meta_defaults(report: dict) -> dict:
+    """合并报告内 _review_meta 与当前「③ 文档审核」侧栏 review_context，避免从历史交接后栏位全空。"""
+    base = report.get("_review_meta") if isinstance(report.get("_review_meta"), dict) else {}
+    if (not base) and report.get("batch") and isinstance(report.get("reports"), list):
+        for sub in report.get("reports") or []:
+            if isinstance(sub, dict) and isinstance(sub.get("_review_meta"), dict) and sub.get("_review_meta"):
+                base = dict(sub["_review_meta"])
+                break
+    out: dict = {}
+    for k, v in dict(base).items():
+        if v is None:
+            out[k] = ""
+        elif isinstance(v, (dict, list)):
+            out[k] = v
+        else:
+            out[k] = str(v)
+    ctx = st.session_state.get("review_context") or {}
+
+    def _from_ctx_list(meta_key: str, ctx_key: str) -> str:
+        raw = ctx.get(ctx_key)
+        if isinstance(raw, list):
+            return "、".join(str(x).strip() for x in raw if str(x).strip())
+        return str(raw or "").strip()
+
+    pairs = (
+        ("registration_country", "registration_country"),
+        ("registration_type", "registration_type"),
+        ("registration_component", "registration_component"),
+        ("project_form", "project_form"),
+    )
+    for mk, ck in pairs:
+        if not str(out.get(mk) or "").strip():
+            out[mk] = _from_ctx_list(mk, ck)
+
+    if not str(out.get("document_language") or "").strip():
+        out["document_language"] = str(ctx.get("document_language") or "").strip()
+
+    for mk in ("project_name", "product_name", "model", "model_en"):
+        if not str(out.get(mk) or "").strip() and ctx.get(mk) is not None:
+            out[mk] = str(ctx.get(mk) or "").strip()
+
+    if not str(out.get("project_id") or "").strip():
+        pid = st.session_state.get("review_project_id")
+        if pid:
+            out["project_id"] = pid
+
+    return out
+
+
 ACTION_OPTIONS = ["立即修改", "延期修改", "无需修改"]
 
 def _get_multi_doc_default_action(severity: str) -> str:
@@ -5384,6 +5501,27 @@ def _get_multi_doc_default_action(severity: str) -> str:
         "info": "无需修改",
     }
     return defaults.get(severity, "无需修改")
+
+
+def _build_post_audit_handoff(report: dict, *, source_report_id: int = 0) -> dict:
+    """将审核报告转换为“审核后修改”交接结构；支持单份报告或 batch+reports 批次汇总（合并子报告审核点）。"""
+    rep = dict(report or {})
+    if source_report_id and not rep.get("id"):
+        rep["id"] = int(source_report_id)
+    payload = build_immediate_audit_remediation_by_target(
+        rep,
+        get_default_action=_get_multi_doc_default_action,
+    )
+    return {
+        "version": 1,
+        "source_report_id": int(source_report_id or rep.get("id") or 0),
+        "source_file_name": rep.get("original_filename") or rep.get("file_name") or "",
+        "report": rep,
+        "points_by_target": payload.get("points_by_target") or {},
+        "text_by_target": payload.get("text_by_target") or {},
+        "all_points": payload.get("all_points") or [],
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
 def _coerce_modify_docs_list(raw) -> list:
@@ -7821,6 +7959,20 @@ def _render_reports_table_layout(
                         mime="text/csv; charset=utf-8",
                         key=f"doc_todo_csv_{pk}{key_suffix}",
                     )
+                with c_doc2:
+                    if st.button(
+                        "➡️ 传到文档生成修改（审核后修改）",
+                        key=f"handoff_post_audit_{pk}{key_suffix}",
+                    ):
+                        handoff = _build_post_audit_handoff(
+                            report,
+                            source_report_id=int(history_id or 0),
+                        )
+                        st.session_state["_post_audit_handoff"] = handoff
+                        # 不可在顶部 radio 已绑定后再写 main_function_nav_page，改用下一轮脚本开头消费
+                        st.session_state["_pending_main_function_nav_page"] = "✍️ 文档初稿生成"
+                        st.session_state["_draft_page_mode_force"] = "审核后修改"
+                        _streamlit_rerun()
                 if st.session_state.get(_doc_heavy):
                     c2, c3, c4, c5 = st.columns(4)
                     with c2:
@@ -8106,374 +8258,1393 @@ def render_draft_page():
                 except Exception:
                     st.json(errors)
 
-    def _render_draft_history() -> None:
+    def _render_draft_history(*, post_audit_only: bool = False) -> None:
         st.markdown("---")
-        st.subheader("📜 历史生成记录（可下载 / 可重新生成）")
+        _hk = "postaudit_hist" if post_audit_only else "draft_hist"
+        if post_audit_only:
+            st.subheader("📜 审核后修改历史记录（可下载）")
+            st.caption(
+                "仅展示本流程写入库的记录（`source=post_audit` 或 `extra.post_audit`），与初稿生成历史分开展示。"
+            )
+        else:
+            st.subheader("📜 初稿生成历史记录（可下载 / 可重新生成）")
+            st.caption("不含审核后修改批次；审核后修改请在「审核后修改」模式查看专属历史。")
         _notice = st.session_state.get("_draft_regen_notice")
-        if _notice:
+        if _notice and (not post_audit_only):
             st.info(_notice)
+
+        _fetch_cap = 500
+
+        def _rec_is_post_audit(r: dict) -> bool:
+            ex = r.get("extra") if isinstance(r.get("extra"), dict) else {}
+            return bool(ex.get("post_audit")) or str(r.get("source") or "").strip() == "post_audit"
+
         try:
-            draft_logs = get_operation_logs(op_type="draft_generate", collection=collection, limit=100)
+            _raw_logs = get_operation_logs(
+                op_type="draft_generate", collection=collection, limit=_fetch_cap
+            )
         except Exception:
-            draft_logs = []
+            _raw_logs = []
+        if post_audit_only:
+            draft_logs = [r for r in (_raw_logs or []) if _rec_is_post_audit(r)][:100]
+        else:
+            draft_logs = [r for r in (_raw_logs or []) if not _rec_is_post_audit(r)][:100]
         if not draft_logs:
-            st.caption("暂无生成记录。")
+            st.caption("暂无审核后修改记录。" if post_audit_only else "暂无初稿生成记录。")
             return
 
-        for idx, rec in enumerate(draft_logs):
-            extra = rec.get("extra") or {}
-            out_files = extra.get("out_files") or []
-            fns = extra.get("generated_file_names") or list((extra.get("out_files_by_target") or {}).keys())
+        def _draft_hist_file_merge_key(nm: str) -> str:
+            """同一目标文件：out_map 用展示名，磁盘名常为 projectId_展示名，用于合并去重。"""
+            s = (nm or "").strip()
+            base = Path(s).name if s else ""
+            m = re.match(r"^(\d+)_(.+)$", base)
+            return m.group(2) if m else base
+
+        def _merge_draft_batch_extra(recs: list) -> dict:
+            """同一 batch_id 的多条操作日志合并为一条展示用的 extra（路径以后写为准）。"""
+            recs_sorted = sorted(recs, key=lambda r: str(r.get("created_at") or ""))
+            last_ex = dict(recs_sorted[-1].get("extra") or {})
+            out_files: list = []
+            seen_of = set()
+            out_map: dict = {}
+            summ_by_key: dict = {}
+            pv_merge: dict = {}
+            for r in recs_sorted:
+                ex = r.get("extra") or {}
+                pv = ex.get("postaudit_preview_text_by_target") or {}
+                if isinstance(pv, dict):
+                    for k, v in pv.items():
+                        kk = str(k or "").strip()
+                        if not kk or not isinstance(v, str):
+                            continue
+                        vv = v.strip()
+                        if not vv:
+                            continue
+                        old = pv_merge.get(kk) or ""
+                        if len(vv) > len(old):
+                            pv_merge[kk] = vv
+                for of in ex.get("out_files") or []:
+                    if not isinstance(of, str):
+                        continue
+                    s = of.strip()
+                    if not s or s.lower() in seen_of:
+                        continue
+                    seen_of.add(s.lower())
+                    out_files.append(s)
+                otm = ex.get("out_files_by_target") or {}
+                if isinstance(otm, dict):
+                    for k, v in otm.items():
+                        kk = str(k or "").strip()
+                        if not kk:
+                            continue
+                        if isinstance(v, str) and v.strip():
+                            out_map[kk] = v.strip()
+                for ent in ex.get("per_file_patch_summaries") or []:
+                    if not isinstance(ent, dict):
+                        continue
+                    fk = _draft_hist_file_merge_key(str(ent.get("file_name") or ""))
+                    if not fk:
+                        continue
+                    if fk not in summ_by_key:
+                        summ_by_key[fk] = dict(ent)
+                    else:
+                        summ_by_key[fk].update({k: v for k, v in ent.items() if v not in (None, "", [])})
+            last_ex["out_files"] = out_files
+            last_ex["out_files_by_target"] = out_map
+            last_ex["per_file_patch_summaries"] = list(summ_by_key.values())
+            last_ex["postaudit_preview_text_by_target"] = pv_merge
+            last_ex["generated_file_names"] = list(out_map.keys()) if out_map else (last_ex.get("generated_file_names") or [])
+            if len(recs_sorted) > 1:
+                tail = f"（已合并同批次 {len(recs_sorted)} 条进度记录）"
+                last_ex["summary"] = str(last_ex.get("summary") or "").strip() + tail
+            return last_ex
+
+        def _draft_history_display_groups(logs: list) -> list:
+            """按 batch_id 分组；无 batch_id 的每条单独成组。返回 [{display_rec, batch_id, merged_n}]。"""
+            by_bid: dict = {}
+            singles: list = []
+            for rec in logs or []:
+                if not isinstance(rec, dict):
+                    continue
+                bid = str((rec.get("extra") or {}).get("batch_id") or "").strip()
+                if bid:
+                    by_bid.setdefault(bid, []).append(rec)
+                else:
+                    singles.append(rec)
+            groups = []
+            for bid, recs in by_bid.items():
+                if not recs:
+                    continue
+                recs_sorted = sorted(recs, key=lambda r: str(r.get("created_at") or ""))
+                newest = dict(recs_sorted[-1])
+                newest["extra"] = _merge_draft_batch_extra(recs_sorted)
+                groups.append({"display_rec": newest, "batch_id": bid, "merged_n": len(recs)})
+            for rec in singles:
+                groups.append({"display_rec": dict(rec), "batch_id": "", "merged_n": 1})
+            groups.sort(key=lambda g: str(g["display_rec"].get("created_at") or ""), reverse=True)
+            return groups
+
+        _hist_groups = _draft_history_display_groups(draft_logs)
+        st.caption(
+            f"共 **{len(_hist_groups)}** 条（同批次已合并）；在下拉框选择一条后下方展示详情，交互与「③ 文档审核」历史列表一致。"
+        )
+
+        def _hist_draft_row_label(i: int) -> str:
+            g0 = _hist_groups[int(i)]
+            r0 = g0["display_rec"]
+            ex0 = r0.get("extra") or {}
+            fns = ex0.get("generated_file_names") or list((ex0.get("out_files_by_target") or {}).keys())
             fn_line = "、".join(fns) if fns else "（无）"
-            # 标题中展示全部文件名（过长截断），避免只看到第一个文件名
-            _title_fn = fn_line if len(fn_line) <= 160 else (fn_line[:157] + "…")
-            _bid = (extra.get("batch_id") or "").strip()
-            _bid_part = f" | 批次={_bid}" if _bid else ""
-            title = f"{rec.get('created_at','')}{_bid_part} | project_id={extra.get('project_id','')} | 生成文件：{_title_fn}"
-            with st.expander(title, expanded=(idx < 1)):
-                st.caption(extra.get("summary") or "")
-                if _bid:
-                    st.caption(f"批次ID：{_bid}")
-                st.caption(f"生成文件名：{fn_line}")
-                mid = (rec.get("model_info") or "").strip()
-                if mid:
-                    st.caption(f"调用模型：{mid}")
-                cols = st.columns([1, 3])
-                with cols[0]:
-                    if st.button("重新生成", key=f"draft_regen_{rec.get('id')}_{idx}"):
-                        # Streamlit 点击按钮本身就会触发 rerun；这里仅写入 session_state 作为“指令”。
-                        st.session_state["draft_regen_extra"] = dict(extra)
-                        st.session_state["_draft_regen_notice"] = (
-                            f"已触发历史记录重新生成：{rec.get('created_at','')} | project_id={extra.get('project_id','')}"
-                        )
-                with cols[1]:
-                    # 下载：恢复为“下拉选择文件”，并在文件名后标记是否产生修改；同时区分输出文件与 JSON 产物
-                    # 修改状态：以 patch.report.json 的 changes 数为准（比 out_file 映射更可靠）
-                    _changes_by_report: dict = {}
-                    _changes_by_out: dict = {}
-                    # 兜底：从历史记录的 per_file_patch_summaries 读取（即使 report 文件不可读也能标记）
+            if len(fn_line) > 120:
+                fn_line = fn_line[:117] + "…"
+            bid = (g0.get("batch_id") or "").strip()
+            bid_part = f"[批次·{bid}] " if bid else ""
+            post_part = "" if post_audit_only else ("[审核后修改] " if ex0.get("post_audit") else "")
+            merge_part = f" | 合并×{g0.get('merged_n')}" if int(g0.get("merged_n") or 1) > 1 else ""
+            return f"{r0.get('created_at', '')} | {post_part}{bid_part}project_id={ex0.get('project_id', '')} | {fn_line}{merge_part}"
+
+        _pick_g = st.selectbox(
+            "选择历史记录" if post_audit_only else "选择历史生成记录",
+            options=list(range(len(_hist_groups))),
+            format_func=_hist_draft_row_label,
+            key=f"{_hk}_group_pick",
+        )
+        _grp = _hist_groups[int(_pick_g)]
+        rec = _grp["display_rec"]
+        idx = int(_pick_g)
+
+        extra = rec.get("extra") or {}
+        out_files = extra.get("out_files") or []
+        fns = extra.get("generated_file_names") or list((extra.get("out_files_by_target") or {}).keys())
+        fn_line = "、".join(fns) if fns else "（无）"
+        # 标题中展示全部文件名（过长截断），避免只看到第一个文件名
+        _title_fn = fn_line if len(fn_line) <= 160 else (fn_line[:157] + "…")
+        _bid = (extra.get("batch_id") or "").strip()
+        _bid_part = f" | 批次={_bid}" if _bid else ""
+        title = f"{rec.get('created_at','')}{_bid_part} | project_id={extra.get('project_id','')} | 生成文件：{_title_fn}"
+        st.markdown("---")
+        st.markdown(f"##### {title}")
+        st.caption(extra.get("summary") or "")
+        if _bid:
+            st.caption(f"批次ID：{_bid}")
+        st.caption(f"生成文件名：{fn_line}")
+        mid = (rec.get("model_info") or "").strip()
+        if mid:
+            st.caption(f"调用模型：{mid}")
+        if post_audit_only:
+            _pv_map = extra.get("postaudit_preview_text_by_target") or {}
+            if not isinstance(_pv_map, dict):
+                _pv_map = {}
+            _otm_pv = extra.get("out_files_by_target") or {}
+            if isinstance(_otm_pv, dict):
+                for _dk, _dv in _otm_pv.items():
+                    _ds = str(_dv or "").strip()
+                    if not _ds.lower().endswith(".postaudit_preview.txt"):
+                        continue
                     try:
-                        _summ = extra.get("per_file_patch_summaries") or []
-                        if isinstance(_summ, list) and _summ:
-                            for ent in _summ:
-                                if not isinstance(ent, dict):
-                                    continue
-                                rp0 = (ent.get("patch_report_path") or "").strip()
-                                op0 = (ent.get("out_file") or "").strip()
-                                pc0 = ent.get("patch_counts") if isinstance(ent.get("patch_counts"), dict) else {}
-                                try:
-                                    n0 = int(pc0.get("changes") or 0) if isinstance(pc0, dict) else 0
-                                except Exception:
-                                    n0 = 0
-                                if rp0 and rp0 not in _changes_by_report:
-                                    _changes_by_report[rp0] = n0
-                                    try:
-                                        _changes_by_report[Path(rp0).name] = n0
-                                    except Exception:
-                                        pass
-                                if op0 and op0 not in _changes_by_out:
-                                    _changes_by_out[op0] = n0
-                                    try:
-                                        _changes_by_out[Path(op0).name] = n0
-                                    except Exception:
-                                        pass
+                        _pr = _resolve_draft_artifact_path(_ds)
+                        if _pr.is_file():
+                            _disk_txt = _pr.read_text(encoding="utf-8", errors="replace")
+                            _kk = str(_dk or "").strip() or Path(_ds).stem
+                            _old = _pv_map.get(_kk) or ""
+                            if len(_disk_txt) > len(_old):
+                                _pv_map[_kk] = _disk_txt
                     except Exception:
                         pass
-                    try:
-                        _rep_paths = [
-                            str(x).strip()
-                            for x in (out_files or [])
-                            if isinstance(x, str) and str(x).strip().endswith(".patch.report.json")
-                        ]
-                        for rp in _rep_paths:
-                            try:
-                                rp_path = _resolve_draft_artifact_path(rp)
-                                if not rp_path.is_file():
-                                    continue
-                                obj = json.loads(rp_path.read_text(encoding="utf-8"))
-                                if not isinstance(obj, dict):
-                                    continue
-                                ch = obj.get("changes") or []
-                                n_ch = len(ch) if isinstance(ch, list) else 0
-                                _changes_by_report[rp] = n_ch
-                                try:
-                                    _changes_by_report[Path(rp).name] = n_ch
-                                except Exception:
-                                    pass
-                                try:
-                                    out_guess = str(rp)[: -len(".patch.report.json")]
-                                    _changes_by_out[out_guess] = n_ch
-                                    _changes_by_out[Path(out_guess).name] = n_ch
-                                except Exception:
-                                    pass
-                            except Exception:
-                                continue
-                    except Exception:
-                        pass
-
-                    # 1) 输出文件（原格式文件）
-                    _out_map = extra.get("out_files_by_target") or {}
-                    _out_paths: list = []
-                    if isinstance(_out_map, dict) and _out_map:
-                        for _k, _v in _out_map.items():
-                            if isinstance(_v, str) and _v.strip():
-                                _out_paths.append(str(_v).strip())
-                    if not _out_paths:
-                        _out_paths = [
-                            str(x).strip()
-                            for x in (out_files or [])
-                            if isinstance(x, str)
-                            and str(x).strip()
-                            and (not str(x).endswith(".patch.json"))
-                            and (not str(x).endswith(".patch.report.json"))
-                            and (not str(x).endswith(".zip"))
-                        ]
-                    _out_paths = list(dict.fromkeys(_out_paths))
-                    if _out_paths:
-                        def _fmt_out(i: int) -> str:
-                            p = _out_paths[int(i)]
-                            n_ch = _changes_by_out.get(p) or _changes_by_out.get(Path(p).name)
-                            if isinstance(n_ch, int):
-                                tag = "（未修改）" if n_ch <= 0 else f"（已修改，changes={n_ch}）"
-                            else:
-                                tag = ""
-                            return f"{Path(p).name}{tag}"
-
-                        _picked_out = st.selectbox(
-                            "下载原格式文件（输出）",
-                            options=list(range(len(_out_paths))),
-                            format_func=_fmt_out,
-                            index=0,
-                            key=f"draft_hist_out_pick_{rec.get('id')}_{idx}",
-                        )
-                        _picked_out_path = _out_paths[int(_picked_out)]
-                        _draft_download_button(
-                            label=f"下载：{Path(_picked_out_path).name}",
-                            raw_path=_picked_out_path,
-                            mime="application/octet-stream",
-                            key=f"draft_hist_out_btn_{rec.get('id')}_{idx}_{Path(_picked_out_path).name}",
-                        )
-
-                    # 2) JSON 产物（patch / patch.report）
-                    _json_paths = [
-                        str(x).strip()
-                        for x in (out_files or [])
-                        if isinstance(x, str)
-                        and str(x).strip()
-                        and (str(x).endswith(".patch.json") or str(x).endswith(".patch.report.json"))
-                    ]
-                    _json_paths = list(dict.fromkeys(_json_paths))
-                    if _json_paths:
-                        def _fmt_json(i: int) -> str:
-                            p = _json_paths[int(i)]
-                            n_ch = _changes_by_report.get(p)
-                            if n_ch is None:
-                                try:
-                                    n_ch = _changes_by_report.get(Path(p).name)
-                                except Exception:
-                                    n_ch = None
-                            if p.endswith(".patch.report.json") and isinstance(n_ch, int):
-                                return f"{Path(p).name}（changes={int(n_ch)}）"
-                            return Path(p).name
-
-                        _picked_json = st.selectbox(
-                            "下载 JSON（patch / report）",
-                            options=list(range(len(_json_paths))),
-                            format_func=_fmt_json,
-                            index=0,
-                            key=f"draft_hist_json_pick_{rec.get('id')}_{idx}",
-                        )
-                        _picked_json_path = _json_paths[int(_picked_json)]
-                        _draft_download_button(
-                            label=f"下载：{Path(_picked_json_path).name}",
-                            raw_path=_picked_json_path,
-                            mime="application/json",
-                            key=f"draft_hist_json_btn_{rec.get('id')}_{idx}_{Path(_picked_json_path).name}",
-                        )
-
-                    # 3) 打包下载：输出文件/JSON/全部 三种 zip
-                    def _zip_download(paths: list, *, label: str, tag: str) -> None:
-                        try:
-                            _zip_members = []
-                            for of in paths or []:
-                                rpz = _resolve_draft_artifact_path(str(of))
-                                if rpz.is_file():
-                                    _zip_members.append(rpz)
-                            if len(_zip_members) < 2:
-                                return
-                            zdir = settings.uploads_path / "draft_outputs" / "_zip_exports"
-                            zdir.mkdir(parents=True, exist_ok=True)
-                            zname = f"draft_batch_{rec.get('id')}_{idx}_{tag}.zip"
-                            zpath = zdir / zname
-                            _reuse = False
-                            try:
-                                if zpath.is_file() and (time.time() - zpath.stat().st_mtime) < 600:
-                                    _reuse = True
-                            except Exception:
-                                _reuse = False
-                            if not _reuse:
-                                with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                                    for rpz in _zip_members:
-                                        zf.write(rpz, arcname=rpz.name)
-                            _draft_download_button(
-                                label=f"{label}（{len(_zip_members)} 个文件，ZIP）",
-                                raw_path=str(zpath),
-                                mime="application/zip",
-                                key=f"draft_hist_zip_{rec.get('id')}_{idx}_{tag}",
-                            )
-                        except Exception:
-                            return
-
-                    _zip_download(_out_paths, label="打包下载输出文件", tag="outputs")
-                    _zip_download(_json_paths, label="打包下载 JSON", tag="json")
-                    # 全部：包含输出文件 + JSON（如果存在）
-                    _zip_download((_out_paths or []) + (_json_paths or []), label="打包下载全部产物", tag="all")
-
-                # 修改日志：从落盘的 patch.report.json 分项展示（每文件一条，避免大批次只显示前几条）
-                # 目标：修改日志下拉列表与“下载产物”一致；即使某文件未产出 patch.report，也要在列表中可选并提示原因。
-                rep_candidates = [x for x in out_files if isinstance(x, str) and x.endswith(".patch.report.json")]
+            _pv_keys = [str(k) for k in _pv_map.keys() if str(k).strip()]
+            if _pv_keys:
+                st.markdown("##### 生成文本预览（历史内嵌，刷新后仍可查看）")
+                _pv_i = st.selectbox(
+                    "预览目标文件",
+                    options=list(range(len(_pv_keys))),
+                    format_func=lambda i: _pv_keys[int(i)],
+                    key=f"{_hk}_pv_pick_{rec.get('id')}_{idx}",
+                )
+                _pv_k = _pv_keys[int(_pv_i)]
+                _pv_val = str(_pv_map.get(_pv_k) or "")
+                st.text_area(
+                    "预览内容",
+                    value=_pv_val[:50000],
+                    height=280,
+                    key=f"{_hk}_pv_txt_{rec.get('id')}_{idx}_{_pv_i}",
+                )
+                if len(_pv_val) > 50000:
+                    st.caption("内容过长已截断；请下载落盘产物或原始输出文件查看全文。")
+        cols = st.columns([1, 3])
+        with cols[0]:
+            if post_audit_only:
+                st.caption(
+                    "审核后修改历史仅支持下载产物；不复用「初稿重新生成」链路（避免丢失审核待落实上下文）。"
+                    " 请在本页重新加载交接并执行。"
+                )
+            elif st.button("重新生成", key=f"{_hk}_regen_{rec.get('id')}_{idx}"):
+                # Streamlit 点击按钮本身就会触发 rerun；这里仅写入 session_state 作为“指令”。
+                st.session_state["draft_regen_extra"] = dict(extra)
+                st.session_state["_draft_regen_notice"] = (
+                    f"已触发历史记录重新生成：{rec.get('created_at','')} | project_id={extra.get('project_id','')}"
+                )
+        with cols[1]:
+            # 下载：恢复为“下拉选择文件”，并在文件名后标记是否产生修改；同时区分输出文件与 JSON 产物
+            # 修改状态：以 patch.report.json 的 changes 数为准（比 out_file 映射更可靠）
+            _changes_by_report: dict = {}
+            _changes_by_out: dict = {}
+            # 兜底：从历史记录的 per_file_patch_summaries 读取（即使 report 文件不可读也能标记）
+            try:
                 _summ = extra.get("per_file_patch_summaries") or []
-                _entries: list = []
-
-                # 1) 先以“输出产物”为主生成条目（与下载列表一致）
-                _out_map = extra.get("out_files_by_target") or {}
-                _out_paths = []
-                if isinstance(_out_map, dict) and _out_map:
-                    for _k, _v in _out_map.items():
-                        if isinstance(_v, str) and _v.strip():
-                            _out_paths.append(str(_v).strip())
-                # 兜底：从 out_files 中挑出“非 patch/json 的主产物”
-                if not _out_paths:
-                    for of in out_files or []:
-                        if not isinstance(of, str):
-                            continue
-                        s = of.strip()
-                        if not s:
-                            continue
-                        if s.endswith(".patch.json") or s.endswith(".patch.report.json"):
-                            continue
-                        _out_paths.append(s)
-                _out_paths = list(dict.fromkeys(_out_paths))  # 去重保序
-
-                for opath in _out_paths:
-                    try:
-                        rp_guess = str(Path(opath).with_suffix(Path(opath).suffix + ".patch.report.json"))
-                    except Exception:
-                        rp_guess = ""
-                    rp = rp_guess if (rp_guess and (rp_guess in (out_files or []) or rp_guess in rep_candidates)) else ""
-                    _entries.append({"file_name": Path(opath).name, "out_file": opath, "patch_report_path": rp})
-
-                # 2) 补充 per_file_patch_summaries（含 patch_counts 等信息）
                 if isinstance(_summ, list) and _summ:
                     for ent in _summ:
                         if not isinstance(ent, dict):
                             continue
                         rp0 = (ent.get("patch_report_path") or "").strip()
-                        if not rp0:
-                            continue
-                        fn0 = (
-                            (ent.get("file_name") or "").strip()
-                            or Path(str(rp0)).name
-                        )
-                        # 若同名条目已存在则合并信息，否则追加
-                        merged = False
-                        for ee in _entries:
-                            if (ee.get("file_name") or "").strip() == fn0:
-                                ee.update(ent)
-                                merged = True
-                                break
-                        if not merged:
-                            _entries.append(ent)
-
-                if _entries:
-                    st.markdown(
-                        f"**就地修改执行报告**（按输出文件列出，共 **{len(_entries)}** 条；在下拉框中选择文件查看详情）"
-                    )
-
-                    def _fmt_hist_pr_row(i: int) -> str:
-                        ent0 = _entries[int(i)]
-                        fn0 = (
-                            ent0.get("file_name")
-                            or Path(str(ent0.get("patch_report_path") or "")).name
-                        ).strip()
-                        pc0 = ent0.get("patch_counts") if isinstance(ent0.get("patch_counts"), dict) else {}
-                        s0 = fn0
-                        if pc0:
-                            s0 += (
-                                f" | applied={pc0.get('applied', '?')} changes={pc0.get('changes', '?')} "
-                                f"skipped={pc0.get('skipped', '?')} errors={pc0.get('errors', '?')}"
-                            )
-                        if not (ent0.get("patch_report_path") or "").strip():
-                            s0 += " | 无 patch.report（可能未启用就地修改或 patch 生成失败降级）"
-                        return s0
-
-                    _sel_i = st.selectbox(
-                        "选择文件查看就地修改明细",
-                        options=list(range(len(_entries))),
-                        format_func=_fmt_hist_pr_row,
-                        key=f"hist_pr_pick_{rec.get('id')}_{idx}",
-                    )
-                    j = int(_sel_i)
-                    ent = _entries[j]
-                    rp = (ent.get("patch_report_path") or "").strip()
-                    if rp:
+                        op0 = (ent.get("out_file") or "").strip()
+                        pc0 = ent.get("patch_counts") if isinstance(ent.get("patch_counts"), dict) else {}
                         try:
-                            rp_path = _resolve_draft_artifact_path(str(rp))
-                            if not rp_path.is_file():
-                                st.caption("报告文件不存在或路径已失效。")
-                            else:
-                                data = rp_path.read_text(encoding="utf-8")
-                                obj = json.loads(data)
-                                if not isinstance(obj, dict):
-                                    st.caption("报告 JSON 格式异常。")
-                                else:
-                                    changes = obj.get("changes") or []
-                                    skipped = obj.get("skipped") or []
-                                    errors = obj.get("errors") or []
-                                    _draft_show_patch_skipped_errors(
-                                        obj, key_prefix=f"histpr_{rec.get('id')}_{j}_"
-                                    )
-                                    if isinstance(changes, list) and changes:
-                                        st.caption(f"changes（截断展示前 80 条，共 {len(changes)} 条）")
-                                        st.code(
-                                            json.dumps(changes[:80], ensure_ascii=False, indent=2),
-                                            language="json",
-                                        )
-                                        if len(changes) > 80:
-                                            st.caption(
-                                                "changes 过长已截断；请下载本文件 patch.report.json 查看完整内容。"
-                                            )
-                                    elif isinstance(skipped, list) and skipped:
-                                        st.caption(
-                                            f"changes=0，skipped（截断前 80 条，共 {len(skipped)} 条）"
-                                        )
-                                        st.code(
-                                            json.dumps(skipped[:80], ensure_ascii=False, indent=2),
-                                            language="json",
-                                        )
-                                        if len(skipped) > 80:
-                                            st.caption(
-                                                "skipped 过长已截断；请下载 patch.report.json 查看完整内容。"
-                                            )
-                                    elif isinstance(errors, list) and errors:
-                                        st.caption("errors")
-                                        st.code(
-                                            json.dumps(errors[:80], ensure_ascii=False, indent=2),
-                                            language="json",
-                                        )
-                                    try:
-                                        _draft_download_button(
-                                            label=f"下载报告：{Path(rp).name}",
-                                            raw_path=str(rp_path),
-                                            mime="application/json",
-                                            key=f"draft_hist_pr_dl_{rec.get('id')}_{j}_{Path(rp).name}",
-                                        )
-                                    except Exception:
-                                        pass
-                        except Exception as _he:
-                            st.caption(f"读取失败：{_he}")
+                            n0 = int(pc0.get("changes") or 0) if isinstance(pc0, dict) else 0
+                        except Exception:
+                            n0 = 0
+                        if rp0 and rp0 not in _changes_by_report:
+                            _changes_by_report[rp0] = n0
+                            try:
+                                _changes_by_report[Path(rp0).name] = n0
+                            except Exception:
+                                pass
+                        if op0 and op0 not in _changes_by_out:
+                            _changes_by_out[op0] = n0
+                            try:
+                                _changes_by_out[Path(op0).name] = n0
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            try:
+                _rep_paths = [
+                    str(x).strip()
+                    for x in (out_files or [])
+                    if isinstance(x, str) and str(x).strip().endswith(".patch.report.json")
+                ]
+                for rp in _rep_paths:
+                    try:
+                        rp_path = _resolve_draft_artifact_path(rp)
+                        if not rp_path.is_file():
+                            continue
+                        obj = json.loads(rp_path.read_text(encoding="utf-8"))
+                        if not isinstance(obj, dict):
+                            continue
+                        ch = obj.get("changes") or []
+                        n_ch = len(ch) if isinstance(ch, list) else 0
+                        _changes_by_report[rp] = n_ch
+                        try:
+                            _changes_by_report[Path(rp).name] = n_ch
+                        except Exception:
+                            pass
+                        try:
+                            out_guess = str(rp)[: -len(".patch.report.json")]
+                            _changes_by_out[out_guess] = n_ch
+                            _changes_by_out[Path(out_guess).name] = n_ch
+                        except Exception:
+                            pass
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # 1) 输出文件（原格式文件）
+            _out_map = extra.get("out_files_by_target") or {}
+            _out_paths: list = []
+            if isinstance(_out_map, dict) and _out_map:
+                for _k, _v in _out_map.items():
+                    if isinstance(_v, str) and _v.strip():
+                        _out_paths.append(str(_v).strip())
+            if not _out_paths:
+                _out_paths = [
+                    str(x).strip()
+                    for x in (out_files or [])
+                    if isinstance(x, str)
+                    and str(x).strip()
+                    and (not str(x).endswith(".patch.json"))
+                    and (not str(x).endswith(".patch.report.json"))
+                    and (not str(x).endswith(".zip"))
+                ]
+            _out_paths = list(dict.fromkeys(_out_paths))
+            if _out_paths:
+                def _fmt_out(i: int) -> str:
+                    p = _out_paths[int(i)]
+                    n_ch = _changes_by_out.get(p) or _changes_by_out.get(Path(p).name)
+                    if isinstance(n_ch, int):
+                        tag = "（未修改）" if n_ch <= 0 else f"（已修改，changes={n_ch}）"
                     else:
-                        st.caption("该文件未生成 patch.report.json，因此没有可展示的修改日志。可在下载产物中查看输出文件内容。")
+                        tag = ""
+                    return f"{Path(p).name}{tag}"
+
+                _picked_out = st.selectbox(
+                    "下载原格式文件（输出）",
+                    options=list(range(len(_out_paths))),
+                    format_func=_fmt_out,
+                    index=0,
+                    key=f"{_hk}_out_pick_{rec.get('id')}_{idx}",
+                )
+                _picked_out_path = _out_paths[int(_picked_out)]
+                _draft_download_button(
+                    label=f"下载：{Path(_picked_out_path).name}",
+                    raw_path=_picked_out_path,
+                    mime="application/octet-stream",
+                    key=f"{_hk}_out_btn_{rec.get('id')}_{idx}_{Path(_picked_out_path).name}",
+                )
+
+            # 2) JSON 产物（patch / patch.report）
+            _json_paths = [
+                str(x).strip()
+                for x in (out_files or [])
+                if isinstance(x, str)
+                and str(x).strip()
+                and (str(x).endswith(".patch.json") or str(x).endswith(".patch.report.json"))
+            ]
+            _json_paths = list(dict.fromkeys(_json_paths))
+            if _json_paths:
+                def _fmt_json(i: int) -> str:
+                    p = _json_paths[int(i)]
+                    n_ch = _changes_by_report.get(p)
+                    if n_ch is None:
+                        try:
+                            n_ch = _changes_by_report.get(Path(p).name)
+                        except Exception:
+                            n_ch = None
+                    if p.endswith(".patch.report.json") and isinstance(n_ch, int):
+                        return f"{Path(p).name}（changes={int(n_ch)}）"
+                    return Path(p).name
+
+                _picked_json = st.selectbox(
+                    "下载 JSON（patch / report）",
+                    options=list(range(len(_json_paths))),
+                    format_func=_fmt_json,
+                    index=0,
+                    key=f"{_hk}_json_pick_{rec.get('id')}_{idx}",
+                )
+                _picked_json_path = _json_paths[int(_picked_json)]
+                _draft_download_button(
+                    label=f"下载：{Path(_picked_json_path).name}",
+                    raw_path=_picked_json_path,
+                    mime="application/json",
+                    key=f"{_hk}_json_btn_{rec.get('id')}_{idx}_{Path(_picked_json_path).name}",
+                )
+
+            # 3) 打包下载：输出文件/JSON/全部 三种 zip
+            def _zip_download(paths: list, *, label: str, tag: str) -> None:
+                try:
+                    _zip_members = []
+                    for of in paths or []:
+                        rpz = _resolve_draft_artifact_path(str(of))
+                        if rpz.is_file():
+                            _zip_members.append(rpz)
+                    if len(_zip_members) < 2:
+                        return
+                    zdir = settings.uploads_path / "draft_outputs" / "_zip_exports"
+                    zdir.mkdir(parents=True, exist_ok=True)
+                    _zip_ns = "postaudit" if post_audit_only else "draft"
+                    zname = f"{_zip_ns}_batch_{rec.get('id')}_{idx}_{tag}.zip"
+                    zpath = zdir / zname
+                    _reuse = False
+                    try:
+                        if zpath.is_file() and (time.time() - zpath.stat().st_mtime) < 600:
+                            _reuse = True
+                    except Exception:
+                        _reuse = False
+                    if not _reuse:
+                        with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                            for rpz in _zip_members:
+                                zf.write(rpz, arcname=rpz.name)
+                    _draft_download_button(
+                        label=f"{label}（{len(_zip_members)} 个文件，ZIP）",
+                        raw_path=str(zpath),
+                        mime="application/zip",
+                        key=f"{_hk}_zip_{rec.get('id')}_{idx}_{tag}",
+                    )
+                except Exception:
+                    return
+
+            _zip_download(_out_paths, label="打包下载输出文件", tag="outputs")
+            _zip_download(_json_paths, label="打包下载 JSON", tag="json")
+            # 全部：包含输出文件 + JSON（如果存在）
+            _zip_download((_out_paths or []) + (_json_paths or []), label="打包下载全部产物", tag="all")
+
+        # 修改日志：从落盘的 patch.report.json 分项展示（每文件一条，避免大批次只显示前几条）
+        # 目标：修改日志下拉列表与“下载产物”一致；即使某文件未产出 patch.report，也要在列表中可选并提示原因。
+        rep_candidates = [x for x in out_files if isinstance(x, str) and x.endswith(".patch.report.json")]
+        _summ = extra.get("per_file_patch_summaries") or []
+        _entries: list = []
+
+        # 1) 先以 out_files_by_target 的「展示名」为主生成条目（避免 8_xxx.docx 与 002_xxx.docx 重复两条）
+        _out_map = extra.get("out_files_by_target") or {}
+        _out_paths = []
+        if isinstance(_out_map, dict) and _out_map:
+            for disp_name, opath in _out_map.items():
+                if not isinstance(opath, str) or not opath.strip():
+                    continue
+                opath = opath.strip()
+                _out_paths.append(opath)
+                try:
+                    rp_guess = str(Path(opath).with_suffix(Path(opath).suffix + ".patch.report.json"))
+                except Exception:
+                    rp_guess = ""
+                rp = rp_guess if (rp_guess and (rp_guess in (out_files or []) or rp_guess in rep_candidates)) else ""
+                fn_disp = str(disp_name).strip() or Path(opath).name
+                _entries.append({"file_name": fn_disp, "out_file": opath, "patch_report_path": rp})
+        # 兜底：从 out_files 中挑出“非 patch/json 的主产物”
+        if not _out_paths:
+            for of in out_files or []:
+                if not isinstance(of, str):
+                    continue
+                s = of.strip()
+                if not s:
+                    continue
+                if s.endswith(".patch.json") or s.endswith(".patch.report.json"):
+                    continue
+                _out_paths.append(s)
+        _out_paths = list(dict.fromkeys(_out_paths))  # 去重保序
+
+        if not _entries:
+            for opath in _out_paths:
+                try:
+                    rp_guess = str(Path(opath).with_suffix(Path(opath).suffix + ".patch.report.json"))
+                except Exception:
+                    rp_guess = ""
+                rp = rp_guess if (rp_guess and (rp_guess in (out_files or []) or rp_guess in rep_candidates)) else ""
+                _entries.append({"file_name": Path(opath).name, "out_file": opath, "patch_report_path": rp})
+
+        # 2) 补充 per_file_patch_summaries（含 patch_counts 等信息），按展示名归并
+        if isinstance(_summ, list) and _summ:
+            for ent in _summ:
+                if not isinstance(ent, dict):
+                    continue
+                rp0 = (ent.get("patch_report_path") or "").strip()
+                if not rp0:
+                    continue
+                fn0 = (
+                    (ent.get("file_name") or "").strip()
+                    or Path(str(rp0)).name
+                )
+                mk0 = _draft_hist_file_merge_key(fn0)
+                merged = False
+                for ee in _entries:
+                    if _draft_hist_file_merge_key(str(ee.get("file_name") or "")) == mk0:
+                        ee.update(ent)
+                        merged = True
+                        break
+                if not merged:
+                    _entries.append(ent)
+
+        if _entries:
+            st.markdown(
+                f"**就地修改执行报告**（共 **{len(_entries)}** 份输出；按文件**直接展示**修改日志 JSON，无需下拉切换）"
+            )
+            _show_all_ch = st.checkbox(
+                "展开显示全部 changes（所有文件；可能较长）",
+                value=False,
+                key=f"{_hk}_pr_g{idx}_show_all_changes",
+            )
+
+            for j, ent in enumerate(_entries):
+                fn_head = (
+                    (ent.get("file_name") or Path(str(ent.get("patch_report_path") or "")).name).strip()
+                )
+                pc0 = ent.get("patch_counts") if isinstance(ent.get("patch_counts"), dict) else {}
+                _sub = fn_head
+                if pc0:
+                    _sub += (
+                        f" | applied={pc0.get('applied', '?')} changes={pc0.get('changes', '?')} "
+                        f"skipped={pc0.get('skipped', '?')} errors={pc0.get('errors', '?')}"
+                    )
+                if not (ent.get("patch_report_path") or "").strip():
+                    _sub += " | 无 patch.report（可能未启用就地修改或 patch 生成失败降级）"
+                st.markdown(f"##### {_sub}")
+
+                rp = (ent.get("patch_report_path") or "").strip()
+                if rp:
+                    try:
+                        rp_path = _resolve_draft_artifact_path(str(rp))
+                        if not rp_path.is_file():
+                            st.caption("报告文件不存在或路径已失效。")
+                        else:
+                            data = rp_path.read_text(encoding="utf-8")
+                            obj = json.loads(data)
+                            if not isinstance(obj, dict):
+                                st.caption("报告 JSON 格式异常。")
+                            else:
+                                changes = obj.get("changes") or []
+                                skipped = obj.get("skipped") or []
+                                errors = obj.get("errors") or []
+                                _draft_show_patch_skipped_errors(
+                                    obj, key_prefix=f"{_hk}_pr_{rec.get('id')}_{j}_"
+                                )
+                                if isinstance(changes, list) and changes:
+                                    st.caption(
+                                        f"修改日志 changes（共 {len(changes)} 条，JSON；默认每文件前 80 条）"
+                                    )
+                                    _cap = len(changes) if _show_all_ch else min(80, len(changes))
+                                    st.code(
+                                        json.dumps(changes[:_cap], ensure_ascii=False, indent=2),
+                                        language="json",
+                                    )
+                                    if not _show_all_ch and len(changes) > 80:
+                                        st.caption(
+                                            "changes 过长已截断；勾选本节上方「展开显示全部」或下载 patch.report.json。"
+                                        )
+                                elif isinstance(skipped, list) and skipped:
+                                    st.caption(
+                                        f"changes=0，skipped（截断前 80 条，共 {len(skipped)} 条）"
+                                    )
+                                    st.code(
+                                        json.dumps(skipped[:80], ensure_ascii=False, indent=2),
+                                        language="json",
+                                    )
+                                    if len(skipped) > 80:
+                                        st.caption(
+                                            "skipped 过长已截断；请下载 patch.report.json 查看完整内容。"
+                                        )
+                                elif isinstance(errors, list) and errors:
+                                    st.caption("errors")
+                                    st.code(
+                                        json.dumps(errors[:80], ensure_ascii=False, indent=2),
+                                        language="json",
+                                    )
+                                try:
+                                    _draft_download_button(
+                                        label=f"下载报告：{Path(rp).name}",
+                                        raw_path=str(rp_path),
+                                        mime="application/json",
+                                        key=f"{_hk}_pr_dl_{rec.get('id')}_{j}_{Path(rp).name}",
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception as _he:
+                        st.caption(f"读取失败：{_he}")
+                else:
+                    st.caption(
+                        "该文件未生成 patch.report.json，因此没有可展示的修改日志。可在下载产物中查看输出文件内容。"
+                    )
+
+    def _render_post_audit_mode() -> None:
+        st.markdown("---")
+        st.subheader("🩺 审核后修改")
+        st.caption("将审核报告中「立即修改」审核点按文件映射到生成流程；支持批量或单选后再修改。")
+
+        handoff = st.session_state.get("_post_audit_handoff")
+        if not isinstance(handoff, dict):
+            handoff = {}
+        if handoff:
+            st.caption(
+                f"已加载交接：{handoff.get('source_file_name') or '未知来源'} "
+                f"| 审核点 {len(handoff.get('all_points') or [])} 条"
+            )
+            _rp_sum = handoff.get("report") if isinstance(handoff.get("report"), dict) else {}
+            if _rp_sum.get("batch") and isinstance(_rp_sum.get("reports"), list):
+                st.caption(
+                    f"批次汇总：已合并 **{len(_rp_sum.get('reports') or [])}** 份子报告（含多文档一致性等）的「立即修改」审核点。"
+                )
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("清除当前交接", key="postaudit_clear_handoff"):
+                    st.session_state.pop("_post_audit_handoff", None)
+                    _streamlit_rerun()
+            with c2:
+                st.caption(f"交接时间：{handoff.get('created_at') or '-'}")
+        else:
+            st.info("暂无来自审核页的交接数据。可在「③ 文档审核」中点击“传到文档生成修改”。")
+            try:
+                recent = get_audit_reports(collection=collection, limit=30)
+            except Exception:
+                recent = []
+            if recent:
+                pick = st.selectbox(
+                    "或从历史报告加载",
+                    options=list(range(len(recent))),
+                    format_func=lambda i: f"{recent[i].get('created_at','')} | {(recent[i].get('file_name') or '')[:50]}",
+                    key="postaudit_hist_pick",
+                )
+                if st.button("加载该历史报告", key="postaudit_hist_load"):
+                    rec = dict(recent[int(pick)] or {})
+                    try:
+                        rec["report_json"] = json.loads(rec.get("report_json") or "{}")
+                    except Exception:
+                        rec["report_json"] = {}
+                    report_obj = rec.get("report_json") if isinstance(rec.get("report_json"), dict) else {}
+                    report_obj["id"] = int(rec.get("id") or 0)
+                    report_obj.setdefault("file_name", rec.get("file_name") or "")
+                    st.session_state["_post_audit_handoff"] = _build_post_audit_handoff(
+                        report_obj,
+                        source_report_id=int(rec.get("id") or 0),
+                    )
+                    _streamlit_rerun()
+            _render_draft_history(post_audit_only=True)
+            return
+
+        report_obj = handoff.get("report") if isinstance(handoff.get("report"), dict) else {}
+        if not report_obj:
+            st.warning("交接数据缺少报告内容。请回到审核页重新传递。")
+            _render_draft_history(post_audit_only=True)
+            return
+
+        points_all = build_immediate_audit_point_records(
+            report_obj,
+            get_default_action=_get_multi_doc_default_action,
+        )
+        if not points_all:
+            st.warning("当前报告中没有「立即修改」审核点。")
+            _render_draft_history(post_audit_only=True)
+            return
+        point_lookup = {str(p.get("audit_point_ref")): p for p in points_all}
+
+        targets = list((handoff.get("points_by_target") or {}).keys()) if isinstance(handoff.get("points_by_target"), dict) else []
+        if not targets:
+            _tmp = build_immediate_audit_remediation_by_target(
+                report_obj,
+                get_default_action=_get_multi_doc_default_action,
+            )
+            targets = list((_tmp.get("points_by_target") or {}).keys())
+        targets = [str(x).strip() for x in targets if str(x).strip()]
+        targets = list(dict.fromkeys(targets))
+        if not targets:
+            st.warning("未解析到需修改文档目标。")
+            _render_draft_history(post_audit_only=True)
+            return
+
+        selected_targets = st.multiselect(
+            "选择本次需要修改的目标文件（批量）",
+            options=targets,
+            default=targets,
+            key="postaudit_targets",
+        )
+        if not selected_targets:
+            st.info("请至少选择一个目标文件。")
+            _render_draft_history(post_audit_only=True)
+            return
+
+        st.markdown("#### 选择审核点（支持单个或多个）")
+        st.caption(
+            "仅传一条：在某个目标文件下的多选框中取消全选，只勾选需要的一条审核点即可；可多目标分别精简后再执行。"
+        )
+        selected_refs: set = set()
+        for t in selected_targets:
+            rows = [p for p in points_all if t in (p.get("targets") or [])]
+            if not rows:
+                st.caption(f"{t}：无可选审核点。")
+                continue
+            opts = [str(r.get("audit_point_ref") or "") for r in rows if str(r.get("audit_point_ref") or "").strip()]
+            labels = {}
+            for r in rows:
+                rr = str(r.get("audit_point_ref") or "")
+                labels[rr] = (
+                    f"{rr} | {r.get('location','')[:26]} | {r.get('description','')[:42]}"
+                )
+            picked = st.multiselect(
+                f"{t}（默认全选）",
+                options=opts,
+                default=opts,
+                format_func=lambda x: labels.get(x, x),
+                key=f"postaudit_pick_{abs(hash(t))}",
+            )
+            selected_refs.update(str(x).strip() for x in picked if str(x).strip())
+        if not selected_refs:
+            st.info("请至少选择一条审核点。")
+            _render_draft_history(post_audit_only=True)
+            return
+
+        selected_payload = build_immediate_audit_remediation_by_target(
+            report_obj,
+            get_default_action=_get_multi_doc_default_action,
+            selected_refs=selected_refs,
+        )
+        text_by_target_all = selected_payload.get("text_by_target") or {}
+        text_by_target = {
+            k: v for k, v in text_by_target_all.items()
+            if k in selected_targets and str(v or "").strip()
+        }
+        if not text_by_target:
+            st.warning("选中审核点未形成有效目标文本。")
+            _render_draft_history(post_audit_only=True)
+            return
+
+        preview_target = st.selectbox(
+            "预览某目标文件的审核待落实清单",
+            options=list(text_by_target.keys()),
+            key="postaudit_preview_target",
+        )
+        st.text_area(
+            "待落实清单预览",
+            value=text_by_target.get(preview_target, ""),
+            height=220,
+            key="postaudit_preview_text",
+        )
+
+        def _postaudit_target_key(nm: str) -> str:
+            s = str(nm or "").strip()
+            if not s:
+                return ""
+            base = Path(s).name
+            m = re.match(r"^\d+_(.+)$", base)
+            return (m.group(1) if m else base).strip().lower()
+
+        skip_tpl = st.checkbox(
+            "不使用案例模板（不读取案例库文档作结构/风格模板；仅用基础上传+参考+审核待落实文本）",
+            value=False,
+            key="postaudit_skip_case_template",
+        )
+
+        cases = _cached_list_project_cases(collection)
+        if not cases:
+            if not skip_tpl:
+                st.warning("当前知识库下没有项目案例，无法生成。请先上传案例，或勾选「不使用案例模板」。")
+                _render_draft_history(post_audit_only=True)
+                return
+            base_case_id = 0
+            case_file_names = []
+        else:
+            if skip_tpl:
+                base_case_id = int(cases[0].get("id") or 0)
+                case_file_names = []
+                st.caption(
+                    "不使用案例模板：已跳过案例库模板文档内容；项目维度占位仍使用知识库中的首个案例记录。"
+                )
+            else:
+                case_labels = [f"ID:{int(c.get('id'))} | {_format_case_option(c)}" for c in cases]
+                case_idx = st.selectbox(
+                    "模板案例（用于保持章节/编号风格）",
+                    options=list(range(len(cases))),
+                    format_func=lambda i: case_labels[int(i)],
+                    key="postaudit_base_case_idx",
+                )
+                base_case_id = int(cases[int(case_idx)].get("id"))
+                case_file_names = get_project_case_file_names(collection, base_case_id) or []
+
+        case_name_by_key = {}
+        for _cf in case_file_names:
+            _k = _postaudit_target_key(_cf)
+            if _k and _k not in case_name_by_key:
+                case_name_by_key[_k] = _cf
+
+        target_name_resolved: Dict[str, str] = {}
+        unresolved_targets: List[str] = []
+        for _t in text_by_target.keys():
+            _k = _postaudit_target_key(_t)
+            _resolved = ""
+            if _t in case_file_names:
+                _resolved = _t
+            elif _k and _k in case_name_by_key:
+                _resolved = case_name_by_key[_k]
+            if _resolved:
+                target_name_resolved[_t] = _resolved
+            else:
+                unresolved_targets.append(_t)
+        if unresolved_targets:
+            if skip_tpl:
+                st.caption(
+                    "已勾选不使用案例模板：审核点目标名未对齐到案例库文件（属预期）；将以基础上传与模糊匹配绑定 Base。"
+                )
+            else:
+                st.info(
+                    "以下目标文件未在模板案例中直接命中，将尝试按上传基础文件名继续生成："
+                    + "、".join(unresolved_targets[:8])
+                )
+
+        remediation_for_generate: Dict[str, str] = {}
+        for _src_t, _txt in text_by_target.items():
+            _dst_t = target_name_resolved.get(_src_t, _src_t)
+            if _dst_t in remediation_for_generate:
+                remediation_for_generate[_dst_t] = (
+                    remediation_for_generate[_dst_t].rstrip() + "\n\n" + str(_txt or "").strip()
+                ).strip()
+            else:
+                remediation_for_generate[_dst_t] = str(_txt or "").strip()
+
+        st.markdown("#### 上传基础文件与参考文件")
+        st.caption(
+            "基础文件请使用用户侧展示文件名；与审核点目标名尽量一致。"
+            " 若仅略有差异，系统会在归一化后做模糊匹配（相似度≥95%视为同一文件）。"
+        )
+        base_uploads = st.file_uploader(
+            "基础文件（可多选）",
+            accept_multiple_files=True,
+            key="postaudit_base_uploads",
+        )
+        ref_uploads = st.file_uploader(
+            "参考文件（可选，多选）",
+            accept_multiple_files=True,
+            key="postaudit_ref_uploads",
+        )
+        base_name_map = {}
+        for uf in (base_uploads or []):
+            n = str(getattr(uf, "name", "") or "").strip()
+            if n:
+                base_name_map[n] = uf
+        upload_by_key = {}
+        for _n, _uf in base_name_map.items():
+            _k = _postaudit_target_key(_n)
+            if _k and _k not in upload_by_key:
+                upload_by_key[_k] = (_n, _uf)
+        base_pick_for_target = {}
+        src_candidates_by_dst: Dict[str, List[str]] = {}
+        for _src_t in text_by_target.keys():
+            _dst_t = target_name_resolved.get(_src_t, _src_t)
+            src_candidates_by_dst.setdefault(_dst_t, [])
+            if _src_t not in src_candidates_by_dst[_dst_t]:
+                src_candidates_by_dst[_dst_t].append(_src_t)
+        for _dst_t in remediation_for_generate.keys():
+            _pick = None
+            if _dst_t in base_name_map:
+                _pick = (_dst_t, base_name_map[_dst_t])
+            else:
+                _k = _postaudit_target_key(_dst_t)
+                if _k and _k in upload_by_key:
+                    _pick = upload_by_key[_k]
+            if _pick is None:
+                for _src_t in (src_candidates_by_dst.get(_dst_t) or [_dst_t]):
+                    _k2 = _postaudit_target_key(_src_t)
+                    if _k2 and _k2 in upload_by_key:
+                        _pick = upload_by_key[_k2]
+                        break
+            if _pick is not None:
+                base_pick_for_target[_dst_t] = _pick
+        _fuzzy_min = 0.95
+        _upload_names = list(base_name_map.keys())
+        for _dst_t in list(remediation_for_generate.keys()):
+            if _dst_t in base_pick_for_target:
+                continue
+            if not _upload_names:
+                break
+            _best_u = None
+            _best_r = 0.0
+            _dn = _postaudit_target_key(_dst_t)
+            _dst_raw = str(_dst_t or "").strip().lower()
+            for _u in _upload_names:
+                _un = _postaudit_target_key(_u)
+                _u_raw = str(_u or "").strip().lower()
+                _r = 0.0
+                if _dn and _un:
+                    _r = max(_r, float(SequenceMatcher(None, _dn, _un).ratio()))
+                if _dst_raw and _u_raw:
+                    _r = max(_r, float(SequenceMatcher(None, _dst_raw, _u_raw).ratio()))
+                if _r > _best_r:
+                    _best_r = _r
+                    _best_u = _u
+            if _best_u is not None and _best_r >= _fuzzy_min:
+                base_pick_for_target[_dst_t] = (_best_u, base_name_map[_best_u])
+        missing = [t for t in remediation_for_generate.keys() if t not in base_pick_for_target]
+        st.caption(
+            f"目标文件 {len(remediation_for_generate)} 个；匹配到基础文件 {len(base_pick_for_target)} 个。"
+            + (f" 未匹配 {len(missing)} 个。" if missing else "")
+        )
+        if missing:
+            st.warning(
+                "以下目标未匹配到基础文件："
+                + "、".join(missing[:8])
+                + "。仍可执行（将按非就地方式生成文本），匹配到基础文件的目标会优先走就地修改。"
+            )
+
+        rmeta = _post_audit_form_meta_defaults(report_obj)
+
+        base_lang_val = str(rmeta.get("document_language") or "").strip()
+        base_lang_label = DOC_LANG_VALUE_TO_LABEL.get(base_lang_val, "不指定")
+        if base_lang_label not in DOC_LANG_OPTIONS:
+            base_lang_label = "不指定"
+        _pdl_idx = (
+            DOC_LANG_OPTIONS.index(base_lang_label)
+            if base_lang_label in DOC_LANG_OPTIONS
+            else 0
+        )
+        doc_lang = DOC_LANG_LABEL_TO_VALUE.get(
+            st.selectbox(
+                "文档语言",
+                DOC_LANG_OPTIONS,
+                index=_pdl_idx,
+                key="postaudit_doc_lang",
+            ),
+            base_lang_val,
+        )
+
+        dims_pa = _cached_dimension_options()
+        countries_pa = dims_pa.get("registration_countries", ["中国", "美国", "欧盟"]) or [
+            "中国",
+            "美国",
+            "欧盟",
+        ]
+        forms_pa = dims_pa.get("project_forms", ["Web", "APP", "PC"]) or ["Web", "APP", "PC"]
+
+        _cdef = _post_audit_dim_first_choice(rmeta.get("registration_country")) or (
+            countries_pa[0] if countries_pa else ""
+        )
+        reg_country = st.selectbox(
+            "注册国家",
+            countries_pa,
+            index=countries_pa.index(_cdef) if _cdef in countries_pa else 0,
+            key="postaudit_reg_country",
+        )
+
+        _tdef = _post_audit_dim_first_choice(rmeta.get("registration_type")) or (
+            REGISTRATION_TYPES[0] if REGISTRATION_TYPES else ""
+        )
+        reg_type = st.selectbox(
+            "注册类别",
+            REGISTRATION_TYPES,
+            index=REGISTRATION_TYPES.index(_tdef) if _tdef in REGISTRATION_TYPES else 0,
+            key="postaudit_reg_type",
+        )
+
+        _rcdef = _post_audit_dim_first_choice(rmeta.get("registration_component")) or (
+            REGISTRATION_COMPONENTS[0] if REGISTRATION_COMPONENTS else ""
+        )
+        reg_comp = st.selectbox(
+            "注册组成",
+            REGISTRATION_COMPONENTS,
+            index=REGISTRATION_COMPONENTS.index(_rcdef) if _rcdef in REGISTRATION_COMPONENTS else 0,
+            key="postaudit_reg_comp",
+        )
+
+        _pfdef = _post_audit_dim_first_choice(rmeta.get("project_form")) or (forms_pa[0] if forms_pa else "")
+        proj_form = st.selectbox(
+            "项目形态",
+            forms_pa,
+            index=forms_pa.index(_pfdef) if _pfdef in forms_pa else 0,
+            key="postaudit_proj_form",
+        )
+        inplace_mode = st.checkbox("就地修改（推荐）", value=True, key="postaudit_inplace")
+        if inplace_mode and (not base_pick_for_target):
+            st.warning(
+                "已勾选「就地修改」，但当前 0 个目标匹配到上传的基础文件："
+                "无法对 Base 做就地 patch，模型会按非就地方式生成文本，可能多耗 token。"
+                "是否继续由你自行判断；仍要执行可直接点下方「开始审核后修改」。"
+                "若需要 patch，请先补传或对齐文件名后再跑。"
+            )
+
+        if st.button("🚀 开始审核后修改", key="postaudit_run"):
+            try:
+                generator = DocumentDraftGenerator(collection)
+                with tempfile.TemporaryDirectory(prefix="aicheckword_postaudit_") as td:
+                    td_path = Path(td)
+                    existing_base_files = {}
+                    for fn, (_orig_name, uf) in base_pick_for_target.items():
+                        p = td_path / fn
+                        p.write_bytes(uf.getvalue())
+                        existing_base_files[fn] = str(p)
+                    input_files = []
+                    for uf in (ref_uploads or []):
+                        n = str(getattr(uf, "name", "") or "").strip() or f"ref_{uuid.uuid4().hex[:8]}.txt"
+                        p = td_path / n
+                        p.write_bytes(uf.getvalue())
+                        input_files.append((str(p), n))
+                    project_id_val = 0
+                    try:
+                        project_id_val = int(rmeta.get("project_id") or 0)
+                    except Exception:
+                        project_id_val = 0
+                    _progress_msg = st.empty()
+                    _supports_progress_text = {"ok": True}
+                    try:
+                        _progress_bar = st.progress(0, text="审核后修改：准备开始…")
+                    except TypeError:
+                        _supports_progress_text["ok"] = False
+                        _progress_bar = st.progress(0)
+                        _progress_msg.caption("审核后修改：准备开始…")
+
+                    def _on_postaudit_progress(msg: str, frac: float) -> None:
+                        _f = max(0.0, min(1.0, float(frac)))
+                        _pct = int(_f * 100)
+                        _txt = f"审核后修改：{msg or ''}（{_pct}%）"
+                        try:
+                            if _supports_progress_text["ok"]:
+                                _progress_bar.progress(_f, text=_txt)
+                            else:
+                                _progress_bar.progress(_f)
+                                _progress_msg.caption(_txt)
+                        except TypeError:
+                            _supports_progress_text["ok"] = False
+                            _progress_bar.progress(_f)
+                            _progress_msg.caption(_txt)
+
+                    with st.spinner("正在执行审核后修改…"):
+                        res = generator.generate(
+                            base_case_id=base_case_id,
+                            template_file_names=list(remediation_for_generate.keys()),
+                            project_id=(project_id_val or None),
+                            existing_base_files=existing_base_files,
+                            input_files=input_files,
+                            document_language=doc_lang,
+                            registration_country=reg_country,
+                            registration_type=reg_type,
+                            registration_component=reg_comp,
+                            project_form=proj_form,
+                            project_name=str(rmeta.get("project_name") or ""),
+                            product_name=str(rmeta.get("product_name") or ""),
+                            model=str(rmeta.get("model") or ""),
+                            persist_project_fields=False,
+                            skills_patch_text="",
+                            rules_patch_text="",
+                            provider=st.session_state.get("current_provider"),
+                            inplace_patch=bool(inplace_mode),
+                            save_as_case=False,
+                            draft_strategy="change",
+                            author_role="",
+                            audit_remediation_by_target=remediation_for_generate,
+                            progress_cb=_on_postaudit_progress,
+                            skip_case_template_text=bool(skip_tpl),
+                        )
+                    _on_postaudit_progress("完成", 1.0)
+
+                    out_prefix = f"postaudit_{res.project_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                    postaudit_job_id = uuid.uuid4().hex[:12]
+                    out_files_for_log: list = []
+                    out_files_by_target: dict = {}
+                    per_file_patch_summaries: list = []
+                    last_items: list = []
+                    _artifact_notes: list = []
+                    _track_changes_pa = bool(st.session_state.get("draft_docx_track_changes", True))
+                    _is_en_postaudit = str(doc_lang or "").strip().lower().startswith("en")
+                    for fn, txt in (res.generated_files or {}).items():
+                        st.markdown("---")
+                        st.markdown(f"#### 文件：{fn}")
+                        downloads: list = []
+                        patch_path_str = ""
+                        rep_path_str = ""
+                        patch_report_obj = None
+                        base_path = existing_base_files.get(fn)
+                        patch_json = (getattr(res, "generated_patches", {}) or {}).get(fn) if inplace_mode else None
+                        if base_path and inplace_mode and (patch_json or "").strip():
+                            base_suffix = Path(base_path).suffix.lower()
+                            out_name = Path(fn).stem + (base_suffix or Path(fn).suffix or ".docx")
+                            drafts_dir = settings.uploads_path / "draft_outputs"
+                            drafts_dir.mkdir(parents=True, exist_ok=True)
+                            out_path = _safe_out_path(base_path=base_path, out_path=drafts_dir / f"{out_prefix}_{out_name}")
+                            report_obj_patch = None
+                            saved = None
+                            meta_pa = {
+                                "project_id": res.project_id,
+                                "project_case_id": getattr(res, "project_case_id", None),
+                                "base_file": Path(base_path).name,
+                                "change_summary": (
+                                    "Post-audit remediation (in-place patch)"
+                                    if _is_en_postaudit and inplace_mode
+                                    else (
+                                        "审核后修改（就地 patch）"
+                                        if inplace_mode
+                                        else "审核后修改"
+                                    )
+                                ),
+                                "generated_by": (
+                                    "aicheckword post-audit revise"
+                                    if _is_en_postaudit
+                                    else "aicheckword 审核后修改"
+                                ),
+                            }
+                            if base_suffix == ".docx":
+                                from src.core.draft_export import export_docx_inplace_patch
+
+                                saved, report_obj_patch = export_docx_inplace_patch(
+                                    base_file_path=base_path,
+                                    out_path=str(out_path),
+                                    patch_json=patch_json,
+                                    meta=meta_pa,
+                                    track_changes=_track_changes_pa,
+                                )
+                            elif base_suffix in (".xlsx", ".xls"):
+                                from src.core.draft_export import export_xlsx_inplace_patch
+
+                                saved, report_obj_patch = export_xlsx_inplace_patch(
+                                    base_file_path=base_path,
+                                    out_path=str(out_path),
+                                    patch_json=patch_json,
+                                    meta=meta_pa,
+                                )
+                            else:
+                                saved = export_like_base(base_path=base_path, out_path=str(out_path), generated_text=txt)
+                            patch_report_obj = report_obj_patch
+                            if saved and inplace_mode and base_suffix == ".docx" and (patch_json or "").strip():
+                                patch_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.json")
+                                patch_path.write_text(patch_json, encoding="utf-8")
+                                rep_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.report.json")
+                                rep_path.write_text(
+                                    json.dumps(report_obj_patch, ensure_ascii=False, indent=2),
+                                    encoding="utf-8",
+                                )
+                                patch_path_str = str(patch_path)
+                                rep_path_str = str(rep_path)
+                                out_files_for_log.append(patch_path_str)
+                                out_files_for_log.append(rep_path_str)
+                                downloads.extend([saved, patch_path_str, rep_path_str])
+                                try:
+                                    per_file_patch_summaries.append(
+                                        {
+                                            "file_name": fn,
+                                            "out_file": str(saved),
+                                            "base_file": str(base_path),
+                                            "suffix": base_suffix,
+                                            "patch_report_path": rep_path_str,
+                                            "patch_json_path": patch_path_str,
+                                            "patch_counts": {
+                                                "applied": len((report_obj_patch or {}).get("applied") or [])
+                                                if isinstance(report_obj_patch, dict)
+                                                else None,
+                                                "changes": len((report_obj_patch or {}).get("changes") or [])
+                                                if isinstance(report_obj_patch, dict)
+                                                else None,
+                                                "skipped": len((report_obj_patch or {}).get("skipped") or [])
+                                                if isinstance(report_obj_patch, dict)
+                                                else None,
+                                                "errors": len((report_obj_patch or {}).get("errors") or [])
+                                                if isinstance(report_obj_patch, dict)
+                                                else None,
+                                            },
+                                            "no_change": (
+                                                isinstance(report_obj_patch, dict)
+                                                and len((report_obj_patch.get("applied") or [])) == 0
+                                                and len((report_obj_patch.get("changes") or [])) == 0
+                                            ),
+                                        }
+                                    )
+                                except Exception:
+                                    pass
+                            elif saved and inplace_mode and base_suffix in (".xlsx", ".xls") and (patch_json or "").strip():
+                                patch_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.json")
+                                patch_path.write_text(patch_json, encoding="utf-8")
+                                rep_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.report.json")
+                                rep_path.write_text(
+                                    json.dumps(report_obj_patch, ensure_ascii=False, indent=2),
+                                    encoding="utf-8",
+                                )
+                                patch_path_str = str(patch_path)
+                                rep_path_str = str(rep_path)
+                                out_files_for_log.append(patch_path_str)
+                                out_files_for_log.append(rep_path_str)
+                                downloads.extend([saved, patch_path_str, rep_path_str])
+                                try:
+                                    per_file_patch_summaries.append(
+                                        {
+                                            "file_name": fn,
+                                            "out_file": str(saved),
+                                            "base_file": str(base_path),
+                                            "suffix": base_suffix,
+                                            "patch_report_path": rep_path_str,
+                                            "patch_json_path": patch_path_str,
+                                            "patch_counts": {
+                                                "applied": len((report_obj_patch or {}).get("applied") or [])
+                                                if isinstance(report_obj_patch, dict)
+                                                else None,
+                                                "changes": len((report_obj_patch or {}).get("changes") or [])
+                                                if isinstance(report_obj_patch, dict)
+                                                else None,
+                                                "skipped": len((report_obj_patch or {}).get("skipped") or [])
+                                                if isinstance(report_obj_patch, dict)
+                                                else None,
+                                                "errors": len((report_obj_patch or {}).get("errors") or [])
+                                                if isinstance(report_obj_patch, dict)
+                                                else None,
+                                            },
+                                            "no_change": (
+                                                isinstance(report_obj_patch, dict)
+                                                and len((report_obj_patch.get("applied") or [])) == 0
+                                                and len((report_obj_patch.get("changes") or [])) == 0
+                                            ),
+                                        }
+                                    )
+                                except Exception:
+                                    pass
+                            elif saved:
+                                downloads.append(saved)
+                            if saved:
+                                out_files_by_target[fn] = str(saved)
+                                out_files_for_log.append(str(saved))
+                            if report_obj_patch:
+                                _draft_show_patch_skipped_errors(report_obj_patch, key_prefix=f"postaudit_{fn}_")
+                                changes = report_obj_patch.get("changes") or []
+                                if isinstance(changes, list) and changes:
+                                    st.caption(f"修改日志 changes（共 {len(changes)} 条，JSON）")
+                                    _show_all_pa = st.checkbox(
+                                        "展开显示全部 changes",
+                                        value=False,
+                                        key=f"postaudit_{fn}_show_all_changes",
+                                    )
+                                    _cap2 = len(changes) if _show_all_pa else min(80, len(changes))
+                                    st.code(
+                                        json.dumps(changes[:_cap2], ensure_ascii=False, indent=2),
+                                        language="json",
+                                    )
+                        else:
+                            st.text_area(
+                                "生成文本预览",
+                                value=str(txt or "")[:50000],
+                                height=240,
+                                key=f"postaudit_preview_{fn}",
+                            )
+                            _why: list = []
+                            if not base_path:
+                                _why.append("未匹配到本地上传的基础文件（文件名需与目标模板名一致）")
+                            elif not inplace_mode:
+                                _why.append("未勾选就地修改（仅预览文本；已尝试将预览落盘为 .txt 便于下载）")
+                            elif not (patch_json or "").strip():
+                                _why.append("就地修改已开启但本文件 patch 为空（模型未返回可执行修改块）")
+                            if _why:
+                                _artifact_notes.append("「" + str(fn) + "」" + "；".join(_why))
+                            try:
+                                drafts_dir = settings.uploads_path / "draft_outputs"
+                                drafts_dir.mkdir(parents=True, exist_ok=True)
+                                _stem = Path(str(fn or "output")).name or "output"
+                                _stem = re.sub(r'[<>:"/\\\\|?*]', "_", _stem).strip() or "output"
+                                _txt_name = f"{out_prefix}_{_stem}.postaudit_preview.txt"
+                                _txt_path = drafts_dir / _txt_name
+                                _txt_path.write_text(str(txt or ""), encoding="utf-8")
+                                _saved_txt = str(_txt_path.resolve())
+                                downloads.append(_saved_txt)
+                                out_files_by_target[str(fn)] = _saved_txt
+                                out_files_for_log.append(_saved_txt)
+                                st.caption(f"已保存预览文本：{Path(_saved_txt).name}（可在下方「下载产物」或历史中下载）")
+                            except Exception as _txe:
+                                st.caption(f"预览文本落盘失败：{_txe}")
+                        _dls = [str(x) for x in downloads if str(x).strip()]
+                        if _dls:
+                            _dl_labels = [Path(p).name for p in _dls]
+                            _picked = st.selectbox(
+                                "下载产物",
+                                options=list(range(len(_dls))),
+                                format_func=lambda i: _dl_labels[i],
+                                index=0,
+                                key=f"postaudit_cur_dl_pick_{fn}_{postaudit_job_id}",
+                            )
+                            _picked_path = _dls[int(_picked)]
+                            _mime = (
+                                "application/json"
+                                if _picked_path.endswith(".json")
+                                else (
+                                    "text/plain"
+                                    if _picked_path.endswith(".txt")
+                                    else "application/octet-stream"
+                                )
+                            )
+                            _draft_download_button(
+                                label=f"下载：{Path(_picked_path).name}",
+                                raw_path=str(_picked_path),
+                                mime=_mime,
+                                key=f"postaudit_cur_dl_btn_{fn}_{postaudit_job_id}_{Path(_picked_path).name}",
+                            )
+                        last_items.append(
+                            {
+                                "file_name": fn,
+                                "downloads": downloads,
+                                "patch_json_path": patch_path_str or "",
+                                "patch_report_path": rep_path_str or "",
+                                "per_file_skills_rules": None,
+                            }
+                        )
+
+                    if not (res.generated_files or {}):
+                        _artifact_notes.insert(
+                            0,
+                            "生成器返回的 generated_files 为空（未产出任何目标文本），请检查模型/模板案例/审核待落实文本是否过长或被截断。",
+                        )
+                    if out_files_by_target:
+                        st.success("审核后修改已完成；可下载产物已落盘并写入历史记录。")
+                    else:
+                        st.warning(
+                            "本次审核后修改未产生任何可下载的落盘路径（历史里可能显示「生成文件：无」）。"
+                            + (" 详情：" + "；".join(_artifact_notes[:8]) if _artifact_notes else "")
+                        )
+
+                    _sum_extra = (
+                        f"审核后修改：共 {len(list((out_files_by_target or {}).keys()))} 个目标文件；"
+                        f"{len(per_file_patch_summaries)} 份含就地修改执行报告（*.patch.report.json）。"
+                    )
+                    if _artifact_notes:
+                        _sum_extra += " 说明：" + " | ".join(_artifact_notes[:6])
+                        if len(_artifact_notes) > 6:
+                            _sum_extra += " …"
+
+                _pv_log: dict = {}
+                try:
+                    for _fn0, _txt0 in (res.generated_files or {}).items():
+                        _s0 = str(_txt0 or "").strip()
+                        if _s0:
+                            _pv_log[str(_fn0)] = _s0[:16000]
+                except Exception:
+                    _pv_log = {}
+
+                try:
+                    add_operation_log(
+                        op_type="draft_generate",
+                        collection=collection,
+                        file_name="draft_outputs",
+                        source="post_audit",
+                        extra={
+                            "batch_id": postaudit_job_id,
+                            "post_audit": True,
+                            "source_audit_report_id": int((handoff or {}).get("source_report_id") or 0),
+                            "base_case_id": base_case_id,
+                            "template_file_names": list(remediation_for_generate.keys()),
+                            "project_id": res.project_id,
+                            "project_case_id": getattr(res, "project_case_id", None),
+                            "save_as_case": False,
+                            "inplace_patch": bool(inplace_mode),
+                            "draft_strategy": "change",
+                            "author_role": "",
+                            "document_language": doc_lang,
+                            "registration_country": reg_country,
+                            "registration_type": reg_type,
+                            "registration_component": reg_comp,
+                            "project_form": proj_form,
+                            "project_name": str(rmeta.get("project_name") or ""),
+                            "product_name": str(rmeta.get("product_name") or ""),
+                            "model": str(rmeta.get("model") or ""),
+                            "out_files": out_files_for_log,
+                            "out_files_by_target": out_files_by_target,
+                            "generated_file_names": list((out_files_by_target or {}).keys()),
+                            "per_file_patch_summaries": per_file_patch_summaries,
+                            "artifact_notes": list(_artifact_notes[:30]),
+                            "generated_file_keys": list((res.generated_files or {}).keys()),
+                            "postaudit_preview_text_by_target": _pv_log,
+                            "skip_case_template": bool(skip_tpl),
+                            "summary": _sum_extra,
+                        },
+                        model_info=get_current_model_info(),
+                    )
+                except Exception as _postaudit_log_err:
+                    st.warning(
+                        f"审核后修改已完成，但写入操作记录失败（历史列表可能缺失本条）：{_postaudit_log_err}"
+                    )
+                else:
+                    _invalidate_operation_logs_cache()
+                try:
+                    _items_pa = list(last_items or [])
+                    _expand_pa = True if len(_items_pa) <= 3 else False
+                    st.session_state["_draft_last_result"] = {
+                        "summary": (
+                            f"审核后修改 | project_id={res.project_id}"
+                            + (
+                                f", source_audit_report_id={(handoff or {}).get('source_report_id') or ''}"
+                                if (handoff or {}).get("source_report_id")
+                                else ""
+                            )
+                        ).strip(),
+                        "batch_id": postaudit_job_id,
+                        "expand": _expand_pa,
+                        "items": _items_pa,
+                    }
+                except Exception:
+                    pass
+            except Exception as e:
+                st.error(f"审核后修改失败：{e}")
+                st.code(repr(e), language="text")
+
+        _render_draft_history(post_audit_only=True)
+
+    _force_mode = st.session_state.pop("_draft_page_mode_force", None)
+    _mode_opts = ["文档初稿生成", "审核后修改"]
+    if _force_mode in _mode_opts:
+        st.session_state["draft_page_mode_radio"] = _force_mode
+    draft_page_mode = _st_radio_compat(
+        "本页模式",
+        _mode_opts,
+        key="draft_page_mode_radio",
+        horizontal=True,
+    )
+    if draft_page_mode == "审核后修改":
+        _render_post_audit_mode()
+        return
 
     st.markdown(
         "依据训练知识库中的“项目案例文档”生成新项目初稿："
@@ -8528,7 +9699,7 @@ def render_draft_page():
     cases = _cached_list_project_cases(collection)
     if not cases:
         st.warning("当前知识库下没有项目案例。请先在「① 法规训练 & 生成审核点」→ 上传项目案例。")
-        _render_draft_history()
+        _render_draft_history(post_audit_only=False)
         return
 
     # 模板选择
@@ -9195,19 +10366,17 @@ def render_draft_page():
                             _draft_show_patch_skipped_errors(obj, key_prefix=f"draft_last_{fn}_")
                             _chg = obj.get("changes") or []
                             if isinstance(_chg, list) and _chg:
-                                st.caption(f"修改日志（changes，共 {len(_chg)} 条；改前/改后）")
-                                _show_all_changes = st.checkbox(
-                                    "展开显示全部 changes（可能较长）",
+                                st.caption(f"修改日志 changes（共 {len(_chg)} 条，JSON）")
+                                _show_last = st.checkbox(
+                                    "展开显示全部 changes",
                                     value=False,
                                     key=f"draft_last_show_changes_all_{fn}",
                                 )
-                                if _show_all_changes:
-                                    st.code(
-                                        json.dumps(_chg, ensure_ascii=False, indent=2),
-                                        language="json",
-                                    )
-                                else:
-                                    st.caption("已收起 changes 展示；勾选上方选项可展开查看全量内容。")
+                                _cap3 = len(_chg) if _show_last else min(80, len(_chg))
+                                st.code(
+                                    json.dumps(_chg[:_cap3], ensure_ascii=False, indent=2),
+                                    language="json",
+                                )
                     except Exception:
                         st.caption("patch.report.json 解析失败，可直接下载查看。")
 
@@ -9544,6 +10713,8 @@ def render_draft_page():
                 )
             except Exception:
                 pass
+            else:
+                _invalidate_operation_logs_cache()
 
             try:
                 for _it in last_items:
@@ -9815,14 +10986,17 @@ def render_draft_page():
                             patch_report_obj = patch_report
                             change_log_obj = patch_report.get("changes") if isinstance(patch_report, dict) else None
                             if change_log_obj:
-                                st.caption("修改日志（就地修改，改前/改后）")
-                                try:
-                                    st.code(
-                                        json.dumps(change_log_obj, ensure_ascii=False, indent=2),
-                                        language="json",
-                                    )
-                                except Exception:
-                                    st.json(change_log_obj)
+                                st.caption(f"修改日志 changes（共 {len(change_log_obj)} 条，JSON）")
+                                _show_now = st.checkbox(
+                                    "展开显示全部 changes",
+                                    value=False,
+                                    key=f"draft_now_show_all_{fn}",
+                                )
+                                _cap4 = len(change_log_obj) if _show_now else min(80, len(change_log_obj))
+                                st.code(
+                                    json.dumps(change_log_obj[:_cap4], ensure_ascii=False, indent=2),
+                                    language="json",
+                                )
                             # 同步保存 patch 与执行报告，便于审计/复盘
                             patch_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.json")
                             patch_path.write_text(patch_json, encoding="utf-8")
@@ -9877,14 +11051,17 @@ def render_draft_page():
                             patch_report_obj = patch_report
                             change_log_obj = patch_report.get("changes") if isinstance(patch_report, dict) else None
                             if change_log_obj:
-                                st.caption("修改日志（就地修改，改前/改后）")
-                                try:
-                                    st.code(
-                                        json.dumps(change_log_obj, ensure_ascii=False, indent=2),
-                                        language="json",
-                                    )
-                                except Exception:
-                                    st.json(change_log_obj)
+                                st.caption(f"修改日志 changes（共 {len(change_log_obj)} 条，JSON）")
+                                _show_now_x = st.checkbox(
+                                    "展开显示全部 changes",
+                                    value=False,
+                                    key=f"draft_now_show_all_xlsx_{fn}",
+                                )
+                                _cap5 = len(change_log_obj) if _show_now_x else min(80, len(change_log_obj))
+                                st.code(
+                                    json.dumps(change_log_obj[:_cap5], ensure_ascii=False, indent=2),
+                                    language="json",
+                                )
                             patch_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.json")
                             patch_path.write_text(patch_json, encoding="utf-8")
                             rep_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.report.json")
@@ -10043,6 +11220,8 @@ def render_draft_page():
                     )
                 except Exception:
                     pass
+                else:
+                    _invalidate_operation_logs_cache()
 
                 # 缓存本次结果（仅存轻量信息），避免页面重跑后丢失下载与日志展示
                 try:
@@ -10081,7 +11260,7 @@ def render_draft_page():
         st.error(f"生成任务失败/取消：{job.get('error')}")
 
     # 历史生成记录：放在“生成设置/生成结果”之后
-    _render_draft_history()
+    _render_draft_history(post_audit_only=False)
 
 
 def _reports_markdown_for_download(reports: list) -> str:
@@ -10877,6 +12056,8 @@ def _op_type_label(op_type):
         "draft_generate_job": "🧾 文档生成任务",
         "draft_generate": "🧾 文档生成",
         "draft_export": "📦 文档导出（同格式/就地修改）",
+        # 与 draft_generate 同表存储，extra.post_audit 或 source=post_audit 区分
+        "__post_audit_display__": "🩺 审核后修改",
     }
     return labels.get(op_type, op_type)
 
@@ -10939,6 +12120,7 @@ def render_operations_page():
                 "文档翻译",
                 "文档翻译失败",
                 "文档生成",
+                "审核后修改",
                 "文档导出",
                 "文档生成任务",
                 "训练失败",
@@ -10964,6 +12146,7 @@ def render_operations_page():
         "文档翻译": OP_TYPE_TRANSLATION,
         "文档翻译失败": OP_TYPE_TRANSLATION_ERROR,
         "文档生成": "draft_generate",
+        "审核后修改": "__post_audit__",
         "文档导出": "draft_export",
         "文档生成任务": "draft_generate_job",
         "训练失败": "train_error",
@@ -10973,8 +12156,24 @@ def render_operations_page():
 
     only_current = st.checkbox("仅当前知识库", value=False, key="op_only_collection")
     collection_filter = st.session_state.get("collection_name", "regulations") if only_current else None
+    st.caption(
+        "「审核后修改」与「文档初稿生成」在库中同为 `draft_generate`，通过 `extra.post_audit` / `source=post_audit` 区分；"
+        "写入后已自动失效操作记录缓存。"
+    )
 
-    logs = _cached_operation_logs(op_type, collection_filter, limit)
+    if op_type == "__post_audit__":
+        _fetch_n = max(int(limit or 50), 50) * 8
+        _raw_pa = get_operation_logs(
+            op_type="draft_generate", collection=collection_filter, limit=_fetch_n
+        )
+        logs = [
+            r
+            for r in (_raw_pa or [])
+            if (r.get("extra") or {}).get("post_audit")
+            or str(r.get("source") or "").strip() == "post_audit"
+        ][: int(limit or 50)]
+    else:
+        logs = _cached_operation_logs(op_type, collection_filter, limit)
 
     if not logs:
         st.info("暂无操作记录，完成一次训练或审核后会自动记录。")
@@ -11077,7 +12276,11 @@ def render_operations_page():
             project_id = extra.get("project_id", "")
             base_case_id = extra.get("base_case_id", "")
             inplace_lbl = "就地修改" if extra.get("inplace_patch") else "非就地"
-            title = f"{op_label} | 生成 {cnt} 份 | project_id={project_id} | base_case_id={base_case_id} | {inplace_lbl}"
+            _is_post_audit = bool(extra.get("post_audit")) or str(rec.get("source") or "").strip() == "post_audit"
+            _lbl = _op_type_label("__post_audit_display__") if _is_post_audit else op_label
+            _sar = int(extra.get("source_audit_report_id") or 0)
+            _sar_part = f" | 来源审核报告 id={_sar}" if _sar else ""
+            title = f"{_lbl} | 生成 {cnt} 份 | project_id={project_id} | base_case_id={base_case_id} | {inplace_lbl}{_sar_part}"
             _sum = (extra.get("summary") or "").strip()
             detail = _sum if _sum else f"来源：{rec.get('source','')} | 知识库：{rec.get('collection','')}"
         elif rec["op_type"] == "draft_export":
@@ -11269,6 +12472,11 @@ def main():
         initial_sidebar_state="expanded",
     )
     _maybe_warn_streamlit_version()
+
+    # 在绑定 main_function_nav_page 的 st.radio 之前应用跨页跳转（否则会 StreamlitAPIException）
+    _pend_nav = st.session_state.pop("_pending_main_function_nav_page", None)
+    if _pend_nav:
+        st.session_state["main_function_nav_page"] = _pend_nav
 
     render_sidebar()
 

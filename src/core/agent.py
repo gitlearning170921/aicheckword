@@ -165,15 +165,20 @@ class ReviewAgent:
         file_name: str = "",
         callback=None,
         on_loading=None,
+        force_ocr_refresh: bool = False,
     ) -> int:
         """将单个文件训练到项目专属向量库。on_loading(msg) 在加载/分块阶段回调，便于 UI 显示进度。"""
         from .document_loader import load_and_split
         if on_loading:
             on_loading("加载文件中...")
-        chunks = load_and_split(file_path)
+        name = file_name or Path(file_path).name
+        chunks = load_and_split(
+            file_path,
+            force_ocr_refresh=bool(force_ocr_refresh),
+            ocr_cache_file_name=name,
+        )
         if on_loading:
             on_loading(f"已分块 {len(chunks)} 块，正在向量化...")
-        name = file_name or Path(file_path).name
         pkb = self.get_project_kb(project_id)
         if callback:
             return pkb.add_documents_with_progress(chunks, batch_size=12, callback=callback, file_name=name)
@@ -343,7 +348,12 @@ class ReviewAgent:
         project_context_text = ""
         if project_id:
             try:
-                docs = load_single_file(file_path)
+                force_ocr_refresh = bool((review_context or {}).get("_force_ocr_refresh"))
+                docs = load_single_file(
+                    file_path,
+                    force_ocr_refresh=force_ocr_refresh,
+                    ocr_cache_file_name=(display_file_name or Path(file_path).name),
+                )
                 doc_text = "\n\n".join(d.page_content for doc in docs)
             except Exception:
                 doc_text = ""
@@ -424,9 +434,14 @@ class ReviewAgent:
         """
         from .document_loader import load_single_file
         doc_list = []
+        force_ocr_refresh = bool((review_context or {}).get("_force_ocr_refresh"))
         for path, display_name in items:
             try:
-                docs = load_single_file(path)
+                docs = load_single_file(
+                    path,
+                    force_ocr_refresh=force_ocr_refresh,
+                    ocr_cache_file_name=(display_name or Path(path).name),
+                )
                 text = "\n\n".join(d.page_content for d in docs)
             except Exception:
                 text = ""
@@ -446,9 +461,14 @@ class ReviewAgent:
         读取各文件正文后调用 reviewer 专项流程，并结合审核点知识库中可追溯性相关检索结果。
         """
         doc_list = []
+        force_ocr_refresh = bool((review_context or {}).get("_force_ocr_refresh"))
         for path, display_name in items:
             try:
-                docs = load_single_file(path)
+                docs = load_single_file(
+                    path,
+                    force_ocr_refresh=force_ocr_refresh,
+                    ocr_cache_file_name=(display_name or Path(path).name),
+                )
                 text = "\n\n".join(getattr(d, "page_content", str(d)) for d in docs) if docs else ""
             except Exception:
                 text = ""

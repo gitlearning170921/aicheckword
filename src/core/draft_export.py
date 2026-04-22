@@ -2112,6 +2112,16 @@ def export_docx_inplace_patch(
 
     ops: List[Dict[str, Any]] = list(patch_obj.get("operations") or [])
     tc_rules = _compile_tc_id_rules((patch_obj or {}).get("tc_id_rules") or (meta or {}).get("tc_id_rules"))
+    def _change_meta(op_obj: Dict[str, Any]) -> Dict[str, Any]:
+        refs = op_obj.get("audit_point_refs")
+        if not isinstance(refs, list):
+            refs = []
+        refs = [str(x).strip() for x in refs if str(x).strip()]
+        out = {"audit_point_refs": refs}
+        note = str(op_obj.get("audit_point_note") or "").strip()
+        if note:
+            out["audit_point_note"] = note
+        return out
 
     def _para_heading_context(p_idx: int) -> str:
         # 粗定位“章节标题”：向上找最近的标题样式段落
@@ -2269,6 +2279,7 @@ def export_docx_inplace_patch(
                             "before": before,
                             "after": after,
                             "paragraphs_written": len(chunks),
+                            **_change_meta(op),
                         }
                     )
                 report["applied"].append({"op": op, "hits": len(hits)})
@@ -2297,6 +2308,7 @@ def export_docx_inplace_patch(
                             "paragraph_index": p_idx,
                             "before": before,
                             "after": after,
+                            **_change_meta(op),
                         }
                     )
                 report["applied"].append({"op": op, "hits": len(hits)})
@@ -2346,6 +2358,7 @@ def export_docx_inplace_patch(
                             "anchor": anchor,
                             "before": before,
                             "after": after,
+                            **_change_meta(op),
                         }
                     )
                 report["applied"].append({"op": op, "hits": len(hits)})
@@ -2406,6 +2419,7 @@ def export_docx_inplace_patch(
                                 "after": joined_after,
                                 "paragraphs_written": len(chunks),
                                 "note": "由 insert_paragraph_after_contains 去重改写后续段落",
+                                **_change_meta(op),
                             }
                         )
                         continue
@@ -2429,6 +2443,7 @@ def export_docx_inplace_patch(
                             "before": "",
                             "after": joined_after,
                             "paragraphs_inserted": len(chunks),
+                            **_change_meta(op),
                         }
                     )
                 report["applied"].append({"op": op, "hits": len(hits)})
@@ -2503,6 +2518,7 @@ def export_docx_inplace_patch(
                                         "after": "\t".join(written_cells2),
                                         "cells_preview": [str(x).strip() for x in written_cells2],
                                         "note": "检测到源文档附近已存在高度相似行，已原地更新（避免重复插入）",
+                                        **_change_meta(op),
                                     }
                                 )
                                 insert_ok += 1
@@ -2551,6 +2567,7 @@ def export_docx_inplace_patch(
                                             "note": (
                                                 f"首列编号已存在且整行相似度≥{_TC_ROW_SIMILARITY_UPDATE_THRESHOLD}，已原地更新该行"
                                             ),
+                                            **_change_meta(op),
                                         }
                                     )
                                     insert_ok += 1
@@ -2593,6 +2610,7 @@ def export_docx_inplace_patch(
                             ch["note"] = (
                                 "首列已按表内同模块（前缀）最大编号 +1 分配，避免与已有编号冲突"
                             )
+                        ch.update(_change_meta(op))
                         report["changes"].append(ch)
                         insert_ok += 1
                     except Exception as _ie:
@@ -2623,7 +2641,14 @@ def export_docx_inplace_patch(
                         report["skipped"].append({"op": op, "reason": "图示替换/插入失败（未找到可写入位置）"})
                         continue
                     report["changes"].append(
-                        {"type": t, "anchor": anchor, "heading": _para_heading_context(p_idx), "before": "", "after": f"[diagram modules={len(mods)}]"}
+                        {
+                            "type": t,
+                            "anchor": anchor,
+                            "heading": _para_heading_context(p_idx),
+                            "before": "",
+                            "after": f"[diagram modules={len(mods)}]",
+                            **_change_meta(op),
+                        }
                     )
                     report["applied"].append({"op": op, "hits": 1})
                 except Exception as e:
@@ -2684,6 +2709,16 @@ def export_xlsx_inplace_patch(
 
     ops: List[Dict[str, Any]] = list((patch_obj or {}).get("operations") or [])
     tc_rules = _compile_tc_id_rules((patch_obj or {}).get("tc_id_rules") or (meta or {}).get("tc_id_rules"))
+    def _change_meta(op_obj: Dict[str, Any]) -> Dict[str, Any]:
+        refs = op_obj.get("audit_point_refs")
+        if not isinstance(refs, list):
+            refs = []
+        refs = [str(x).strip() for x in refs if str(x).strip()]
+        out = {"audit_point_refs": refs}
+        note = str(op_obj.get("audit_point_note") or "").strip()
+        if note:
+            out["audit_point_note"] = note
+        return out
 
     def _iter_cells():
         for ws in wb.worksheets:
@@ -2809,6 +2844,7 @@ def export_xlsx_inplace_patch(
                             "cell": cell.coordinate,
                             "before": before,
                             "after": rep_after,
+                            **_change_meta(op),
                         }
                     )
                 report["applied"].append({"op": op, "hits": len(hits)})
@@ -2873,6 +2909,7 @@ def export_xlsx_inplace_patch(
                                         "after": joined2,
                                         "cells_preview": [str(x).strip() for x in vals],
                                         "note": "首列编号/风险号已存在，已原地更新整行（避免重复插入）",
+                                        **_change_meta(op),
                                     }
                                 )
                                 report["applied"].append({"op": op, "hits": 1})
@@ -2912,6 +2949,7 @@ def export_xlsx_inplace_patch(
                                         "note": (
                                             f"首列编号已存在且整行相似度≥{_TC_ROW_SIMILARITY_UPDATE_THRESHOLD}，已原地更新该行"
                                         ),
+                                        **_change_meta(op),
                                     }
                                 )
                                 report["applied"].append({"op": op, "hits": 1})
@@ -2936,6 +2974,7 @@ def export_xlsx_inplace_patch(
                     if parsed:
                         chx["tc_id_assigned"] = (vals[0] or "").strip()
                         chx["note"] = "首列已按表内同模块（前缀）最大编号 +1 分配"
+                    chx.update(_change_meta(op))
                     report["changes"].append(chx)
                     report["applied"].append({"op": op, "hits": 1})
                 except Exception as _ie:
