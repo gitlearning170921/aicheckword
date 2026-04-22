@@ -5,11 +5,55 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import TypeAdapter
 
 from config import settings
+
+# 库内 runtime_settings_json 常存「空串」占位；若用空串 setattr 会抹掉启动时已从 .env 读入的密钥。
+_API_KEY_FIELD_NAMES = frozenset(
+    {
+        "dashscope_api_key",
+        "openai_api_key",
+        "gemini_api_key",
+        "google_api_key",
+        "deepseek_api_key",
+        "lingyi_api_key",
+        "qianfan_ak",
+        "qianfan_sk",
+        "cursor_api_key",
+    }
+)
+# 与 pydantic-settings / 常见 .env 命名兼容的额外环境变量名（字段名 upper 仍优先检查）
+_EXTRA_ENV_NAMES: Dict[str, Tuple[str, ...]] = {
+    "gemini_api_key": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "google_api_key": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+}
+
+# 库内 JSON 存了空串时，勿覆盖进程已从 .env 读入的非空可选配置（与 _API_KEY_FIELD_NAMES 同理）
+_PRESERVE_ON_EMPTY_JSON_WHEN_ENV: Dict[str, Tuple[str, ...]] = {
+    "pdf_ocr_llm_model": ("PDF_OCR_LLM_MODEL",),
+}
+
+
+def _process_environ_has_nonempty_for_field(field_name: str) -> bool:
+    """字段在环境变量中是否有非空值（含 pdf_ocr 等扩展名）。"""
+    for n in _PRESERVE_ON_EMPTY_JSON_WHEN_ENV.get(field_name, ()):
+        if (os.environ.get(n) or "").strip():
+            return True
+    return False
+
+
+def _process_environ_has_nonempty_api_key(field_name: str) -> bool:
+    """进程环境（含 python-dotenv 已注入）是否仍有关键字，用于避免 JSON 空串覆盖 .env。"""
+    names: List[str] = [field_name.upper()]
+    names.extend(_EXTRA_ENV_NAMES.get(field_name, ()))
+    for n in names:
+        if (os.environ.get(n) or "").strip():
+            return True
+    return False
 
 
 def list_persistable_setting_keys() -> List[str]:
@@ -42,6 +86,19 @@ def apply_runtime_config_dict(data: Optional[Dict[str, Any]]) -> int:
         try:
             ta = TypeAdapter(field.annotation)
             val = ta.validate_python(raw)
+            if (
+                key in _API_KEY_FIELD_NAMES
+                and val == ""
+                and _process_environ_has_nonempty_api_key(key)
+            ):
+                # 不覆盖：保留 .env / 系统环境变量中已注入的非空密钥
+                continue
+            if (
+                key in _PRESERVE_ON_EMPTY_JSON_WHEN_ENV
+                and val == ""
+                and _process_environ_has_nonempty_for_field(key)
+            ):
+                continue
             setattr(settings, key, val)
             n += 1
         except Exception:

@@ -115,14 +115,29 @@ def _is_chroma_remote() -> bool:
     return bool((settings.chroma_server_host or "").strip())
 
 
+def _embedding_provider_for_backend() -> str:
+    """
+    决定向量化走 Ollama 还是 OpenAI 兼容接口。
+    仅在 Streamlit 主脚本线程可读 session_state；后台线程（如 draft-job ThreadPoolExecutor）无 ScriptRunContext，须回退 settings.provider。
+    """
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except ImportError:
+        return (settings.provider or "").strip().lower()
+    try:
+        if get_script_run_ctx() is None:
+            return (settings.provider or "").strip().lower()
+        import streamlit as _st
+
+        return (_st.session_state.get("current_provider") or settings.provider or "").strip().lower()
+    except Exception:
+        return (settings.provider or "").strip().lower()
+
+
 def _create_embeddings():
     # DeepSeek/零一 不提供 /v1/embeddings，若用其 base_url 会 404；统一用 Ollama 做向量化
-    # 优先用 session 中的当前 provider（Streamlit 侧栏选择），否则用 settings.provider
-    try:
-        import streamlit as _st
-        p = (_st.session_state.get("current_provider") or settings.provider or "").strip().lower()
-    except Exception:
-        p = (settings.provider or "").strip().lower()
+    # 主线程侧栏可覆盖 current_provider；后台任务仅用 settings.provider
+    p = _embedding_provider_for_backend()
     use_ollama = (
         settings.is_ollama
         or (settings.is_cursor and (settings.cursor_embedding or "").lower() == "ollama")

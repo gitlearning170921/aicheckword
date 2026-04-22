@@ -11,6 +11,7 @@ from pymysql.cursors import DictCursor
 from pymysql.err import InterfaceError, OperationalError
 
 from config import settings
+from config.settings import get_pdf_ocr_llm_model
 
 from .display_filename import (
     effective_audit_report_display_name,
@@ -283,6 +284,12 @@ def init_db() -> None:
                 _add_column_if_missing(cur, "app_settings", "dashscope_api_key", "VARCHAR(1024) DEFAULT ''")
                 _add_column_if_missing(cur, "app_settings", "qianfan_ak", "VARCHAR(512) DEFAULT ''")
                 _add_column_if_missing(cur, "app_settings", "qianfan_sk", "VARCHAR(512) DEFAULT ''")
+                _add_column_if_missing(
+                    cur,
+                    "app_settings",
+                    "pdf_ocr_llm_model",
+                    "VARCHAR(128) DEFAULT '' COMMENT 'PDF AI OCR 多模态模型，空则回退 llm_model'",
+                )
                 _add_column_if_missing(cur, "projects", "basic_info_text", "TEXT COMMENT '从项目资料中提取的基本信息，审核时与待审文档一致性核对'")
                 _add_column_if_missing(cur, "projects", "system_functionality_text", "TEXT COMMENT '从安装包或URL识别的系统功能描述，审核时与待审文档一致性核对'")
                 _add_column_if_missing(cur, "projects", "system_functionality_source", "VARCHAR(64) DEFAULT '' COMMENT 'package|url|空'")
@@ -432,6 +439,7 @@ def persist_settings_dual_write() -> None:
         cursor_verify_ssl=bool(getattr(settings, "llm_verify_ssl", getattr(settings, "cursor_verify_ssl", True))),
         cursor_trust_env=bool(getattr(settings, "llm_trust_env", getattr(settings, "cursor_trust_env", True))),
         llm_model=settings.llm_model or "",
+        pdf_ocr_llm_model=get_pdf_ocr_llm_model(),
         embedding_model=settings.embedding_model or "",
         deepseek_api_key=getattr(settings, "deepseek_api_key", "") or "",
         deepseek_base_url=getattr(settings, "deepseek_base_url", "") or "",
@@ -611,6 +619,7 @@ def save_app_settings(
     cursor_verify_ssl: bool = True,
     cursor_trust_env: bool = True,
     llm_model: str = "",
+    pdf_ocr_llm_model: str = "",
     embedding_model: str = "",
     deepseek_api_key: str = "",
     deepseek_base_url: str = "",
@@ -631,11 +640,11 @@ def save_app_settings(
                 INSERT INTO app_settings (
                     id, provider, openai_api_key, openai_base_url, ollama_base_url,
                     cursor_api_key, cursor_api_base, cursor_repository, cursor_ref, cursor_embedding,
-                    cursor_verify_ssl, cursor_trust_env, llm_model, embedding_model,
+                    cursor_verify_ssl, cursor_trust_env, llm_model, pdf_ocr_llm_model, embedding_model,
                     deepseek_api_key, deepseek_base_url, lingyi_api_key, lingyi_base_url,
                     gemini_api_key, dashscope_api_key, qianfan_ak, qianfan_sk
                 ) VALUES (
-                    1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s
                 ) ON DUPLICATE KEY UPDATE
                     provider = VALUES(provider),
@@ -650,6 +659,7 @@ def save_app_settings(
                     cursor_verify_ssl = VALUES(cursor_verify_ssl),
                     cursor_trust_env = VALUES(cursor_trust_env),
                     llm_model = VALUES(llm_model),
+                    pdf_ocr_llm_model = VALUES(pdf_ocr_llm_model),
                     embedding_model = VALUES(embedding_model),
                     deepseek_api_key = VALUES(deepseek_api_key),
                     deepseek_base_url = VALUES(deepseek_base_url),
@@ -663,7 +673,7 @@ def save_app_settings(
             """, (
                 provider, openai_api_key, openai_base_url, ollama_base_url,
                 cursor_api_key, cursor_api_base, cursor_repository, cursor_ref, cursor_embedding,
-                verify_ssl_int, trust_env_int, llm_model, embedding_model,
+                verify_ssl_int, trust_env_int, llm_model, pdf_ocr_llm_model or "", embedding_model,
                 deepseek_api_key or "", deepseek_base_url or "", lingyi_api_key or "", lingyi_base_url or "",
                 gemini_api_key or "", dashscope_api_key or "", qianfan_ak or "", qianfan_sk or "",
             ))

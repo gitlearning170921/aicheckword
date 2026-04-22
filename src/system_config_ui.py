@@ -113,6 +113,8 @@ def _all_ai_related_setting_keys() -> Set[str]:
     for p in _PROVIDER_OPTION_VALUES:
         keys.update(_ai_keys_for_provider(p))
     keys.update({"llm_model", "embedding_model"})
+    if "pdf_ocr_llm_model" in settings.model_fields:
+        keys.add("pdf_ocr_llm_model")
     return keys
 
 
@@ -120,7 +122,7 @@ def _refresh_session_ai_fields_from_settings(provider: str) -> None:
     """切换提供方后：用当前内存 settings 覆盖 AI 区块相关 session_state，便于自动带出各服务已保存的 Key/URL。"""
     prov = _coerce_provider_to_valid(provider)
     for k in _all_ai_related_setting_keys():
-        if k in ("llm_model", "embedding_model") and not _show_llm_embedding_fields(prov):
+        if k in ("llm_model", "embedding_model", "pdf_ocr_llm_model") and not _show_llm_embedding_fields(prov):
             continue
         st.session_state[_widget_key(k)] = getattr(settings, k)
 
@@ -171,7 +173,9 @@ def _ai_keys_for_provider(provider: str) -> List[str]:
 
 
 def _all_ai_tab_keys_union() -> Set[str]:
-    s: Set[str] = {"provider", "llm_model", "embedding_model"}
+    s: Set[str] = {"provider", "llm_model", "embedding_model", "provider_sidebar_presets"}
+    if "pdf_ocr_llm_model" in settings.model_fields:
+        s.add("pdf_ocr_llm_model")
     for pv in _PROVIDER_OPTION_VALUES:
         s.update(_ai_keys_for_provider(pv))
     return s
@@ -229,6 +233,7 @@ FIELD_LABELS: Dict[str, str] = {
     "cursor_verify_ssl": "cursor_verify_ssl（兼容项，保存时与上一项同步）",
     "cursor_trust_env": "cursor_trust_env（兼容项，保存时与上一项同步）",
     "llm_model": "对话模型名（须与当前提供方一致，如 qwen2.5 / gpt-4o / deepseek-chat）",
+    "provider_sidebar_presets": "侧栏按提供方预设（JSON；侧栏切换保存时自动维护，一般勿手改）",
     "embedding_model": "嵌入模型名（各客户端需一致）",
     "chroma_server_host": "Chroma 服务地址（留空=本机目录）",
     "chroma_server_port": "Chroma HTTP 端口",
@@ -330,6 +335,8 @@ def _collect_from_widgets() -> Dict[str, Any]:
     if not _show_llm_embedding_fields(out["provider"]):
         out["llm_model"] = getattr(settings, "llm_model")
         out["embedding_model"] = getattr(settings, "embedding_model")
+        if "pdf_ocr_llm_model" in settings.model_fields:
+            out["pdf_ocr_llm_model"] = str(settings.pdf_ocr_llm_model or "")
     # 兼容库列与旧逻辑：与侧栏一致，cursor_* 跟随 llm_*
     out["cursor_verify_ssl"] = bool(out.get("llm_verify_ssl", True))
     out["cursor_trust_env"] = bool(out.get("llm_trust_env", True))
@@ -456,6 +463,8 @@ def _render_ai_tab() -> None:
     if _show_llm_embedding_fields(prov):
         st.markdown("**模型**")
         _render_field("llm_model")
+        if "pdf_ocr_llm_model" in settings.model_fields:
+            _render_field("pdf_ocr_llm_model")
         _render_field("embedding_model")
     else:
         st.caption(

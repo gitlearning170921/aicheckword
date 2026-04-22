@@ -139,6 +139,17 @@ def _st_run_tabs_or_pick(labels: list, *, radio_label: str, session_key: str, ta
 
 
 from config import settings
+from config.settings import (
+    get_pdf_ocr_llm_model,
+    get_provider_sidebar_slot,
+    maybe_seed_provider_sidebar_presets_from_legacy,
+    openai_form_base_url_default_from_settings,
+    pdf_ocr_llm_model_field_available,
+    repair_provider_sidebar_presets_urls,
+    sanitize_openai_form_base_url,
+    set_pdf_ocr_llm_model,
+    upsert_provider_sidebar_slot,
+)
 from src.core.agent import ReviewAgent
 from src.core.document_draft_generator import DocumentDraftGenerator
 from src.core.display_filename import sanitize_audit_report_dict
@@ -661,6 +672,135 @@ def init_agent():
     return st.session_state.agent
 
 
+def _default_llm_for_provider(p: str) -> str:
+    return {
+        "ollama": "qwen2.5",
+        "openai": "gpt-4o-mini",
+        "deepseek": "deepseek-chat",
+        "lingyi": "yi-large",
+        "gemini": "gemini-1.5-flash",
+        "tongyi": "qwen-plus",
+        "baidu": "ERNIE-Bot-4",
+        "cursor": "gpt-4o-mini",
+    }.get((p or "").strip().lower(), "qwen2.5")
+
+
+def _default_embed_for_provider(p: str) -> str:
+    return "text-embedding-3-small" if (p or "").strip().lower() == "openai" else "nomic-embed-text"
+
+
+def _default_pdf_ocr_for_provider(p: str) -> str:
+    return "qwen-vl-plus" if (p or "").strip().lower() in ("tongyi", "deepseek") else ""
+
+
+def _sidebar_repair_openai_form_base_url_session(provider: str) -> None:
+    """同 tab 下 session 里曾缓存错误 Base URL 时纠正（切换逻辑已跳过 hydrate 的情况）。"""
+    if provider not in ("openai", "deepseek", "lingyi"):
+        return
+    bk = f"sidebar_base_url_{provider}_v2"
+    cur = (st.session_state.get(bk) or "").strip()
+    cand = cur or openai_form_base_url_default_from_settings(provider)
+    fixed = sanitize_openai_form_base_url(provider, cand)
+    if fixed != cur:
+        st.session_state[bk] = fixed
+    if provider == "deepseek":
+        if (settings.deepseek_base_url or "").strip() != fixed:
+            settings.deepseek_base_url = fixed
+    elif provider == "lingyi":
+        if (settings.lingyi_base_url or "").strip() != fixed:
+            settings.lingyi_base_url = fixed
+    else:
+        if (settings.openai_base_url or "").strip() != fixed:
+            settings.openai_base_url = fixed
+
+
+def _sidebar_hydrate_on_provider_tab_change(provider: str) -> None:
+    """切换侧栏「服务提供方」时：从 provider_sidebar_presets 整槽恢复到 session_state 与 settings。"""
+    st.session_state["_sidebar_provider_tab"] = provider
+    slot = get_provider_sidebar_slot(provider)
+    if provider == "cursor":
+        dlm = (slot.get("llm_model") or "").strip() or (settings.llm_model or _default_llm_for_provider("cursor")).strip()
+        dem = (slot.get("embedding_model") or "").strip() or (settings.embedding_model or _default_embed_for_provider("cursor")).strip()
+        settings.llm_model = dlm
+        settings.embedding_model = dem
+        if pdf_ocr_llm_model_field_available():
+            docr = (slot.get("pdf_ocr_llm_model") or "").strip()
+            if not docr:
+                docr = (get_pdf_ocr_llm_model() or "").strip()
+            if not docr:
+                _emb = (settings.cursor_embedding or "ollama").strip().lower()
+                docr = _default_pdf_ocr_for_provider("openai") if _emb == "openai" else ""
+            st.session_state[f"sidebar_pdf_ocr_llm_model_{provider}_v2"] = docr
+            set_pdf_ocr_llm_model(docr)
+        return
+
+    dlm = (slot.get("llm_model") or "").strip() or _default_llm_for_provider(provider)
+    dem = (slot.get("embedding_model") or "").strip() or _default_embed_for_provider(provider)
+    st.session_state[f"sidebar_llm_model_{provider}_v2"] = dlm
+    st.session_state[f"sidebar_embed_model_{provider}_v2"] = dem
+    settings.llm_model = dlm
+    settings.embedding_model = dem
+
+    if pdf_ocr_llm_model_field_available() and provider in ("ollama", "openai", "deepseek", "lingyi", "tongyi"):
+        docr = (slot.get("pdf_ocr_llm_model") or "").strip()
+        if not docr:
+            docr = (get_pdf_ocr_llm_model() or "").strip() or _default_pdf_ocr_for_provider(provider)
+        st.session_state[f"sidebar_pdf_ocr_llm_model_{provider}_v2"] = docr
+        set_pdf_ocr_llm_model(docr)
+
+    if provider == "ollama":
+        ou = (slot.get("ollama_base_url") or "").strip() or (settings.ollama_base_url or "http://localhost:11434").strip()
+        st.session_state[f"sidebar_ollama_base_url_{provider}_v2"] = ou
+        settings.ollama_base_url = ou
+
+    if provider in ("openai", "deepseek", "lingyi"):
+        bu_raw = (slot.get("base_url") or "").strip() or openai_form_base_url_default_from_settings(provider)
+        bu = sanitize_openai_form_base_url(provider, bu_raw)
+        st.session_state[f"sidebar_base_url_{provider}_v2"] = bu
+        if provider == "deepseek":
+            settings.deepseek_base_url = bu
+        elif provider == "lingyi":
+            settings.lingyi_base_url = bu
+        else:
+            settings.openai_base_url = bu
+
+
+def _sidebar_fill_missing_widget_keys(provider: str) -> None:
+    """同提供方下热重载等导致 session 丢键时，用预设补全，不覆盖已有输入。"""
+    if provider == "cursor":
+        if pdf_ocr_llm_model_field_available():
+            ok = f"sidebar_pdf_ocr_llm_model_{provider}_v2"
+            if ok not in st.session_state:
+                slot_c = get_provider_sidebar_slot(provider)
+                docr = (slot_c.get("pdf_ocr_llm_model") or "").strip() or (get_pdf_ocr_llm_model() or "").strip()
+                if not docr:
+                    _emb = (settings.cursor_embedding or "ollama").strip().lower()
+                    docr = _default_pdf_ocr_for_provider("openai") if _emb == "openai" else ""
+                st.session_state[ok] = docr
+        return
+    slot = get_provider_sidebar_slot(provider)
+    lk = f"sidebar_llm_model_{provider}_v2"
+    if lk not in st.session_state:
+        st.session_state[lk] = (slot.get("llm_model") or "").strip() or _default_llm_for_provider(provider)
+    ek = f"sidebar_embed_model_{provider}_v2"
+    if ek not in st.session_state:
+        st.session_state[ek] = (slot.get("embedding_model") or "").strip() or _default_embed_for_provider(provider)
+    if pdf_ocr_llm_model_field_available() and provider in ("ollama", "openai", "deepseek", "lingyi", "tongyi"):
+        ok = f"sidebar_pdf_ocr_llm_model_{provider}_v2"
+        if ok not in st.session_state:
+            docr = (slot.get("pdf_ocr_llm_model") or "").strip() or (get_pdf_ocr_llm_model() or "").strip() or _default_pdf_ocr_for_provider(provider)
+            st.session_state[ok] = docr
+    if provider == "ollama":
+        bk = f"sidebar_ollama_base_url_{provider}_v2"
+        if bk not in st.session_state:
+            st.session_state[bk] = (slot.get("ollama_base_url") or "").strip() or (settings.ollama_base_url or "http://localhost:11434").strip()
+    if provider in ("openai", "deepseek", "lingyi"):
+        bk = f"sidebar_base_url_{provider}_v2"
+        if bk not in st.session_state:
+            _raw = (slot.get("base_url") or "").strip() or openai_form_base_url_default_from_settings(provider)
+            st.session_state[bk] = sanitize_openai_form_base_url(provider, _raw)
+
+
 def render_sidebar():
     """渲染侧边栏"""
     with st.sidebar:
@@ -685,6 +825,11 @@ def render_sidebar():
                 settings.cursor_ref = db_conf.get("cursor_ref") or settings.cursor_ref
                 settings.cursor_embedding = db_conf.get("cursor_embedding") or settings.cursor_embedding
                 settings.llm_model = db_conf.get("llm_model") or settings.llm_model
+                # 库列常为历史空串：勿用 "" 覆盖 pydantic-settings 已从 .env 注入的 PDF_OCR_LLM_MODEL
+                if pdf_ocr_llm_model_field_available():
+                    _db_ocr = db_conf.get("pdf_ocr_llm_model")
+                    if _db_ocr is not None and str(_db_ocr).strip():
+                        set_pdf_ocr_llm_model(str(_db_ocr).strip())
                 settings.embedding_model = db_conf.get("embedding_model") or settings.embedding_model
                 settings.deepseek_api_key = db_conf.get("deepseek_api_key") or settings.deepseek_api_key
                 settings.deepseek_base_url = db_conf.get("deepseek_base_url") or settings.deepseek_base_url
@@ -721,8 +866,15 @@ def render_sidebar():
                             sync_cursor_overrides_from_settings()
                     except Exception:
                         pass
+            try:
+                repair_provider_sidebar_presets_urls()
+            except Exception:
+                pass
             st.session_state["db_settings_loaded"] = True
             st.session_state["current_provider"] = (settings.provider or "ollama").strip().lower()
+            if not st.session_state.get("_presets_seeded_from_legacy"):
+                maybe_seed_provider_sidebar_presets_from_legacy()
+                st.session_state["_presets_seeded_from_legacy"] = True
 
         # --- AI 服务配置 ---
         st.subheader("AI 服务")
@@ -755,6 +907,12 @@ def render_sidebar():
 
         settings.provider = _provider
         st.session_state["current_provider"] = _provider
+        _prev_tab = st.session_state.get("_sidebar_provider_tab")
+        if _prev_tab != _provider:
+            _sidebar_hydrate_on_provider_tab_change(_provider)
+        _sidebar_fill_missing_widget_keys(_provider)
+        if _provider in ("openai", "deepseek", "lingyi"):
+            _sidebar_repair_openai_form_base_url_session(_provider)
 
         # 所有 AI 服务通用：不校验 SSL、不使用系统代理（代理/证书异常导致 SSLEOFError 时可勾选）
         from config.cursor_overrides import _cursor_overrides, get_llm_verify_ssl, get_llm_trust_env
@@ -817,28 +975,21 @@ def render_sidebar():
         elif is_ollama:
             ollama_url = st.text_input(
                 "Ollama 地址",
-                value=settings.ollama_base_url,
-                key=f"sidebar_base_url_{_provider}",
+                key=f"sidebar_ollama_base_url_{_provider}_v2",
                 help="默认 http://localhost:11434，通常不用改",
             )
+            _lm_key = f"sidebar_llm_model_{_provider}_v2"
             llm_model = st.text_input(
                 "审核模型",
-                value=settings.llm_model,
-                key=f"sidebar_llm_model_{_provider}",
+                key=_lm_key,
                 help="推荐 qwen2.5（中文好）、llama3.1、mistral 等",
             )
             embed_model = st.text_input(
                 "向量化模型",
-                value=settings.embedding_model,
-                key=f"sidebar_embed_model_{_provider}",
+                key=f"sidebar_embed_model_{_provider}_v2",
                 help="推荐 nomic-embed-text、bge-m3 等",
             )
         elif is_openai_form:
-            _default_base = settings.openai_base_url
-            if _provider == "deepseek":
-                _default_base = settings.deepseek_base_url or "https://api.deepseek.com/v1"
-            elif _provider == "lingyi":
-                _default_base = settings.lingyi_base_url or "https://api.lingyiwanwu.com/v1"
             # 按 provider 使用独立 key，避免切换提供方时 DeepSeek/零一/OpenAI 的 API Key 互相填充
             _api_key_value = settings.deepseek_api_key if _provider == "deepseek" else (settings.lingyi_api_key if _provider == "lingyi" else settings.openai_api_key)
             api_key = st.text_input(
@@ -850,15 +1001,14 @@ def render_sidebar():
             )
             base_url = st.text_input(
                 "API Base URL",
-                value=_default_base,
-                key=f"sidebar_base_url_{_provider}",
+                key=f"sidebar_base_url_{_provider}_v2",
                 help="DeepSeek 填 https://api.deepseek.com/v1（404 时请确认无误）；零一默认 https://api.lingyiwanwu.com/v1",
             )
             _model_help = "DeepSeek 填 deepseek-chat 或 deepseek-chat-v2 等（404 多为模型名或 Base URL 错误）；零一如 yi-large 等"
+            _lm_key = f"sidebar_llm_model_{_provider}_v2"
             llm_model = st.text_input(
                 "审核模型",
-                value=settings.llm_model or ("deepseek-chat" if _provider == "deepseek" else "yi-large"),
-                key=f"sidebar_llm_model_{_provider}",
+                key=_lm_key,
                 help=_model_help,
             )
             _embed_help = "向量化仍用 Ollama 或 OpenAI；选 Cursor 时可在 Cursor 区块选择。"
@@ -868,57 +1018,76 @@ def render_sidebar():
                 _embed_help = "零一万物向量化将使用 **Ollama**；请确保 Ollama 已启动并在此填写向量化模型（如 nomic-embed-text）。"
             embed_model = st.text_input(
                 "向量化模型",
-                value=settings.embedding_model,
-                key=f"sidebar_embed_model_{_provider}",
+                key=f"sidebar_embed_model_{_provider}_v2",
                 help=_embed_help,
             )
         elif _provider == "gemini":
             st.caption("密钥请配置环境变量 GEMINI_API_KEY 或 GOOGLE_API_KEY（.env）。")
+            _lm_key = f"sidebar_llm_model_{_provider}_v2"
             llm_model = st.text_input(
                 "审核模型",
-                value=settings.llm_model or "gemini-1.5-flash",
+                key=_lm_key,
                 help="如 gemini-1.5-flash、gemini-1.5-pro",
-                key=f"sidebar_llm_model_{_provider}",
             )
             embed_model = st.text_input(
                 "向量化模型",
-                value=settings.embedding_model,
                 help="向量建议仍用 Ollama 或 OpenAI Embedding",
-                key=f"sidebar_embed_model_{_provider}",
+                key=f"sidebar_embed_model_{_provider}_v2",
             )
         elif _provider == "tongyi":
             st.caption("密钥请配置 DASHSCOPE_API_KEY（.env 或系统环境变量）。")
+            _lm_key = f"sidebar_llm_model_{_provider}_v2"
             llm_model = st.text_input(
                 "审核模型",
-                value=settings.llm_model or "qwen-plus",
+                key=_lm_key,
                 help="如 qwen-plus、qwen-max",
-                key=f"sidebar_llm_model_{_provider}",
             )
             embed_model = st.text_input(
                 "向量化模型",
-                value=settings.embedding_model,
                 help="通义向量可用 text-embedding-v3，需单独接 Embedding API；当前可先 Ollama",
-                key=f"sidebar_embed_model_{_provider}",
+                key=f"sidebar_embed_model_{_provider}_v2",
             )
         elif _provider == "baidu":
             st.caption("密钥请配置 QIANFAN_AK、QIANFAN_SK（.env）。")
+            _lm_key = f"sidebar_llm_model_{_provider}_v2"
             llm_model = st.text_input(
                 "审核模型",
-                value=settings.llm_model or "ERNIE-Bot-4",
+                key=_lm_key,
                 help="千帆模型名",
-                key=f"sidebar_llm_model_{_provider}",
             )
             embed_model = st.text_input(
                 "向量化模型",
-                value=settings.embedding_model,
                 help="向量可继续用 Ollama/OpenAI",
-                key=f"sidebar_embed_model_{_provider}",
+                key=f"sidebar_embed_model_{_provider}_v2",
+            )
+
+        # 扫描件 PDF：OCR 使用独立多模态模型（可与「审核模型」不同）；仅当 Settings 含该字段时展示
+        pdf_ocr_llm_model = ""
+        _pdf_ocr_providers = ("ollama", "openai", "deepseek", "lingyi", "tongyi", "cursor")
+        if pdf_ocr_llm_model_field_available() and _provider in _pdf_ocr_providers:
+            _ocr_help = (
+                "文本层为空的 PDF 会逐页调用多模态做 OCR；各提供方独立保存（与审核模型可不同，点「保存配置」写入预设）。"
+                "留空时：通义/DeepSeek（需配 DASHSCOPE_API_KEY）用 qwen-vl-plus；Ollama 用上方审核模型；OpenAI/零一用上方审核模型。"
+                " 建议通义/DeepSeek OCR 填 qwen-vl-plus 或 qwen-vl-max；Ollama：qwen2.5vl；OpenAI：gpt-4o-mini。"
+            )
+            if _provider == "cursor":
+                _ocr_help += (
+                    " Cursor：OCR 实际走「向量化使用」— 选 **ollama** 时用本地多模态；选 **openai** 时用 OpenAI 兼容 Vision（需 OPENAI_API_KEY）。"
+                )
+            if _provider == "deepseek":
+                _ocr_help += " DeepSeek 本身不支持传图 OCR，已自动走通义 VL（需 DASHSCOPE_API_KEY）。"
+            _ocr_widget_key = f"sidebar_pdf_ocr_llm_model_{_provider}_v2"
+            pdf_ocr_llm_model = st.text_input(
+                "PDF / 扫描件 OCR 模型（多模态）",
+                key=_ocr_widget_key,
+                help=_ocr_help,
             )
 
         if st.button("💾 保存配置"):
             from config.cursor_overrides import _cursor_overrides as _co
             settings.provider = _provider
             settings.llm_model = llm_model
+            set_pdf_ocr_llm_model(pdf_ocr_llm_model or "")
             settings.embedding_model = embed_model
             # 通用 HTTP 选项：写入 settings 并持久化到 DB（仍用 cursor_* 列存）
             _v = _co.get("verify_ssl") if _co.get("verify_ssl") is not None else get_llm_verify_ssl()
@@ -933,15 +1102,34 @@ def render_sidebar():
             elif is_ollama:
                 settings.ollama_base_url = ollama_url
             elif is_openai_form:
+                _bu_save = sanitize_openai_form_base_url(_provider, (base_url or "").strip())
                 if _provider == "deepseek":
                     settings.deepseek_api_key = api_key
-                    settings.deepseek_base_url = base_url
+                    settings.deepseek_base_url = _bu_save
                 elif _provider == "lingyi":
                     settings.lingyi_api_key = api_key
-                    settings.lingyi_base_url = base_url
+                    settings.lingyi_base_url = _bu_save
                 else:
                     settings.openai_api_key = api_key
-                    settings.openai_base_url = base_url
+                    settings.openai_base_url = _bu_save
+            _preset_updates = {
+                "llm_model": (llm_model or "").strip(),
+                "embedding_model": (embed_model or "").strip(),
+            }
+            if pdf_ocr_llm_model_field_available() and _provider in (
+                "ollama",
+                "openai",
+                "deepseek",
+                "lingyi",
+                "tongyi",
+                "cursor",
+            ):
+                _preset_updates["pdf_ocr_llm_model"] = (pdf_ocr_llm_model or "").strip()
+            if is_ollama:
+                _preset_updates["ollama_base_url"] = (ollama_url or "").strip()
+            if is_openai_form:
+                _preset_updates["base_url"] = sanitize_openai_form_base_url(_provider, (base_url or "").strip())
+            upsert_provider_sidebar_slot(_provider, _preset_updates)
             save_app_settings(
                 provider=settings.provider,
                 openai_api_key=settings.openai_api_key,
@@ -955,6 +1143,7 @@ def render_sidebar():
                 cursor_verify_ssl=_v,
                 cursor_trust_env=_t,
                 llm_model=settings.llm_model,
+                pdf_ocr_llm_model=get_pdf_ocr_llm_model(),
                 embedding_model=settings.embedding_model,
                 deepseek_api_key=getattr(settings, "deepseek_api_key", "") or "",
                 deepseek_base_url=getattr(settings, "deepseek_base_url", "") or "",
@@ -965,6 +1154,12 @@ def render_sidebar():
                 qianfan_ak=getattr(settings, "qianfan_ak", "") or "",
                 qianfan_sk=getattr(settings, "qianfan_sk", "") or "",
             )
+            try:
+                from src.core.db import persist_settings_dual_write
+
+                persist_settings_dual_write()
+            except Exception as _pe:
+                st.warning(f"全量配置写入 runtime_settings_json 失败（兼容列已保存），可稍后在系统配置页重试：{_pe}")
             if "agent" in st.session_state:
                 st.session_state.agent.reset_clients()
             st.success("配置已保存，页面将刷新。")
@@ -1852,7 +2047,7 @@ def render_step1_page():
             type=["pdf", "docx", "doc", "xlsx", "xls", "txt", "md", "zip", "tar", "gz", "tgz"],
             accept_multiple_files=True,
             key="train_uploader",
-            help="PDF 仅支持文本型（可复制文字）；扫描件/纯图片 PDF 无法提取文字会报错或卡住，建议先 OCR 或换用文本型 PDF。单文件最多处理前 500 页。",
+            help="PDF 优先读取文本层；若为扫描件/图片版且文本极少，将自动尝试 AI OCR 识别后再入库（兜底最多前 30 页）。单文件最多处理前 500 页。",
         )
 
         # 有待处理的重复文件时（上传来源），在稳定位置渲染覆盖/跳过按钮
@@ -7956,6 +8151,34 @@ def render_draft_page():
                     # 修改状态：以 patch.report.json 的 changes 数为准（比 out_file 映射更可靠）
                     _changes_by_report: dict = {}
                     _changes_by_out: dict = {}
+                    # 兜底：从历史记录的 per_file_patch_summaries 读取（即使 report 文件不可读也能标记）
+                    try:
+                        _summ = extra.get("per_file_patch_summaries") or []
+                        if isinstance(_summ, list) and _summ:
+                            for ent in _summ:
+                                if not isinstance(ent, dict):
+                                    continue
+                                rp0 = (ent.get("patch_report_path") or "").strip()
+                                op0 = (ent.get("out_file") or "").strip()
+                                pc0 = ent.get("patch_counts") if isinstance(ent.get("patch_counts"), dict) else {}
+                                try:
+                                    n0 = int(pc0.get("changes") or 0) if isinstance(pc0, dict) else 0
+                                except Exception:
+                                    n0 = 0
+                                if rp0 and rp0 not in _changes_by_report:
+                                    _changes_by_report[rp0] = n0
+                                    try:
+                                        _changes_by_report[Path(rp0).name] = n0
+                                    except Exception:
+                                        pass
+                                if op0 and op0 not in _changes_by_out:
+                                    _changes_by_out[op0] = n0
+                                    try:
+                                        _changes_by_out[Path(op0).name] = n0
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
                     try:
                         _rep_paths = [
                             str(x).strip()
@@ -7973,6 +8196,10 @@ def render_draft_page():
                                 ch = obj.get("changes") or []
                                 n_ch = len(ch) if isinstance(ch, list) else 0
                                 _changes_by_report[rp] = n_ch
+                                try:
+                                    _changes_by_report[Path(rp).name] = n_ch
+                                except Exception:
+                                    pass
                                 try:
                                     out_guess = str(rp)[: -len(".patch.report.json")]
                                     _changes_by_out[out_guess] = n_ch
@@ -8040,8 +8267,13 @@ def render_draft_page():
                         def _fmt_json(i: int) -> str:
                             p = _json_paths[int(i)]
                             n_ch = _changes_by_report.get(p)
+                            if n_ch is None:
+                                try:
+                                    n_ch = _changes_by_report.get(Path(p).name)
+                                except Exception:
+                                    n_ch = None
                             if p.endswith(".patch.report.json") and isinstance(n_ch, int):
-                                return f"{Path(p).name}（changes={n_ch}）"
+                                return f"{Path(p).name}（changes={int(n_ch)}）"
                             return Path(p).name
 
                         _picked_json = st.selectbox(
@@ -8849,8 +9081,20 @@ def render_draft_page():
             st.caption(job.get("progress_msg") or "处理中…")
             if st.button("取消本次生成（尽力取消）", key="draft_cancel_job"):
                 try:
-                    fut.cancel()
-                    job["error"] = "已请求取消（若任务已开始执行可能无法立即停止）。"
+                    # 取消：无论 future 是否已开始执行，都先让 UI 停止“正在生成”与自动刷新；
+                    # 若 future 尚未开始执行，cancel 会成功；若已开始则无法立即停止，但不应让页面一直显示 running。
+                    _cancelled = False
+                    try:
+                        _cancelled = bool(fut.cancel())
+                    except Exception:
+                        _cancelled = False
+                    job["error"] = (
+                        "已取消本次生成。"
+                        if _cancelled
+                        else "已请求取消（若任务已开始执行可能无法立即停止）；已停止前端刷新。"
+                    )
+                    job["running"] = False
+                    job["future"] = None
                 except Exception:
                     pass
 
@@ -8905,7 +9149,8 @@ def render_draft_page():
                 pass
 
         # 自动刷新页面以更新进度/完成状态
-        if job.get("running"):
+        # 若已出现错误或已请求取消，则停止自动刷新，避免“失败/取消仍显示正在生成”
+        if job.get("running") and not (job.get("error") or "").strip():
             try:
                 import time as _time
 
@@ -8928,58 +9173,61 @@ def render_draft_page():
             if st.button("清空上一次结果", key="draft_clear_last"):
                 st.session_state.pop("_draft_last_result", None)
                 _streamlit_rerun()
-            for it in last.get("items", []):
+            # Streamlit 禁止 expander 嵌套：此处在外层「上一次生成结果」内，不得再包 st.expander
+            for idx, it in enumerate(last.get("items", []) or []):
                 fn = it.get("file_name") or ""
-                with st.expander(f"文件：{fn}", expanded=False):
-                    _pfsr = it.get("per_file_skills_rules")
-                    if _pfsr is True:
-                        st.caption("单文件 Skills/Rules：已从数据库注入本次提示词（优先生效）。")
-                    elif _pfsr is False:
-                        st.caption("单文件 Skills/Rules：未检测到该文件名的数据库配置，或内容为空。")
+                if idx:
+                    st.divider()
+                st.markdown(f"##### 文件：{fn}")
+                _pfsr = it.get("per_file_skills_rules")
+                if _pfsr is True:
+                    st.caption("单文件 Skills/Rules：已从数据库注入本次提示词（优先生效）。")
+                elif _pfsr is False:
+                    st.caption("单文件 Skills/Rules：未检测到该文件名的数据库配置，或内容为空。")
 
-                    # 修改日志：优先从 patch.report.json 展示（避免把超大 changes 塞进 session_state 导致前端不稳）
-                    _rep = (it.get("patch_report_path") or "").strip()
-                    _rep_path = _resolve_draft_artifact_path(_rep) if _rep else Path("")
-                    if _rep and _rep_path.is_file():
-                        try:
-                            obj = json.loads(_rep_path.read_text(encoding="utf-8"))
-                            if isinstance(obj, dict):
-                                _draft_show_patch_skipped_errors(obj, key_prefix=f"draft_last_{fn}_")
-                                _chg = obj.get("changes") or []
-                                if isinstance(_chg, list) and _chg:
-                                    st.caption(f"修改日志（changes，共 {len(_chg)} 条；改前/改后）")
-                                    _show_all_changes = st.checkbox(
-                                        "展开显示全部 changes（可能较长）",
-                                        value=False,
-                                        key=f"draft_last_show_changes_all_{fn}",
+                # 修改日志：优先从 patch.report.json 展示（避免把超大 changes 塞进 session_state 导致前端不稳）
+                _rep = (it.get("patch_report_path") or "").strip()
+                _rep_path = _resolve_draft_artifact_path(_rep) if _rep else Path("")
+                if _rep and _rep_path.is_file():
+                    try:
+                        obj = json.loads(_rep_path.read_text(encoding="utf-8"))
+                        if isinstance(obj, dict):
+                            _draft_show_patch_skipped_errors(obj, key_prefix=f"draft_last_{fn}_")
+                            _chg = obj.get("changes") or []
+                            if isinstance(_chg, list) and _chg:
+                                st.caption(f"修改日志（changes，共 {len(_chg)} 条；改前/改后）")
+                                _show_all_changes = st.checkbox(
+                                    "展开显示全部 changes（可能较长）",
+                                    value=False,
+                                    key=f"draft_last_show_changes_all_{fn}",
+                                )
+                                if _show_all_changes:
+                                    st.code(
+                                        json.dumps(_chg, ensure_ascii=False, indent=2),
+                                        language="json",
                                     )
-                                    if _show_all_changes:
-                                        st.code(
-                                            json.dumps(_chg, ensure_ascii=False, indent=2),
-                                            language="json",
-                                        )
-                                    else:
-                                        st.caption("已收起 changes 展示；勾选上方选项可展开查看全量内容。")
-                        except Exception:
-                            st.caption("patch.report.json 解析失败，可直接下载查看。")
+                                else:
+                                    st.caption("已收起 changes 展示；勾选上方选项可展开查看全量内容。")
+                    except Exception:
+                        st.caption("patch.report.json 解析失败，可直接下载查看。")
 
-                    _dls = [str(x) for x in (it.get("downloads", []) or []) if str(x).strip()]
-                    if _dls:
-                        _dl_labels = [Path(p).name for p in _dls]
-                        _picked = st.selectbox(
-                            "下载产物",
-                            options=list(range(len(_dls))),
-                            format_func=lambda i: _dl_labels[i],
-                            index=0,
-                            key=f"draft_last_dl_pick_{fn}",
-                        )
-                        _picked_path = _dls[int(_picked)]
-                        _draft_download_button(
-                            label=f"下载：{Path(_picked_path).name}",
-                            raw_path=_picked_path,
-                            mime="application/octet-stream",
-                            key=f"draft_last_dl_btn_{fn}_{Path(_picked_path).name}",
-                        )
+                _dls = [str(x) for x in (it.get("downloads", []) or []) if str(x).strip()]
+                if _dls:
+                    _dl_labels = [Path(p).name for p in _dls]
+                    _picked = st.selectbox(
+                        "下载产物",
+                        options=list(range(len(_dls))),
+                        format_func=lambda i: _dl_labels[i],
+                        index=0,
+                        key=f"draft_last_dl_pick_{fn}",
+                    )
+                    _picked_path = _dls[int(_picked)]
+                    _draft_download_button(
+                        label=f"下载：{Path(_picked_path).name}",
+                        raw_path=_picked_path,
+                        mime="application/octet-stream",
+                        key=f"draft_last_dl_btn_{fn}_{Path(_picked_path).name}",
+                    )
             st.markdown("---")
 
     # 若来自历史记录“重新生成”，允许不上传输入文件：复用项目中已保存的 basic_info/system_functionality

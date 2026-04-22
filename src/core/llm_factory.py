@@ -169,18 +169,75 @@ def provider_display_name(provider: str) -> str:
     return m.get((provider or "").lower(), provider or "unknown")
 
 
+def _dashscope_generation_text(resp) -> str:
+    """从 DashScope Generation.call 的响应中取助手文本；失败则抛 RuntimeError。"""
+    sc = int(getattr(resp, "status_code", 0) or 0)
+    if sc != 200:
+        raise RuntimeError(getattr(resp, "message", None) or str(resp))
+    code = (getattr(resp, "code", None) or "").strip()
+    if code:
+        raise RuntimeError(f"{code}: {getattr(resp, 'message', '') or '请求失败'}")
+    out = getattr(resp, "output", None)
+    if not out:
+        return ""
+    tx = getattr(out, "text", None)
+    if isinstance(tx, str) and tx.strip():
+        return tx.strip()
+    choices = getattr(out, "choices", None) or []
+    if choices:
+        msg = getattr(choices[0], "message", None)
+        if msg is not None:
+            c = getattr(msg, "content", None)
+            if isinstance(c, str):
+                return c.strip()
+    return ""
+
+
 def invoke_chat_direct(
     prompt_text: str,
     temperature: float = 0.1,
     provider: Optional[str] = None,
 ) -> str:
     """
-    直接 HTTP 调用当前配置的聊天接口，返回助手回复内容。
+    直接调用当前配置的聊天接口，返回助手回复内容。
     用于多文档一致性等场景，避免 LangChain 将 content 当模板解析导致 {\"category\"} 报错。
-    支持：openai / deepseek / lingyi（OpenAI 兼容）、ollama。
+    支持：openai / deepseek / lingyi（OpenAI 兼容）、ollama、tongyi（DashScope Generation）。
     provider: 若传入（如从 Streamlit current_provider），则优先使用，否则用 settings.provider。
     """
     p = (provider or settings.provider or "").strip().lower()
+
+    if p == "tongyi":
+        # 通义走 DashScope 官方域名，与 OpenAI 兼容服务的 Base URL 无关；侧栏也无「通义 Base URL」项。
+        api_key = (settings.dashscope_api_key or "").strip()
+        if not api_key:
+            raise RuntimeError("通义模式下请先配置 DASHSCOPE_API_KEY")
+        try:
+            from dashscope import Generation
+        except ImportError as e:
+            raise RuntimeError("请安装 dashscope：pip install dashscope") from e
+        try:
+            resp = Generation.call(
+                model=settings.llm_model or "qwen-plus",
+                messages=[{"role": "user", "content": prompt_text}],
+                api_key=api_key,
+                temperature=temperature,
+                result_format="message",
+            )
+        except OSError as e:
+            raise RuntimeError(
+                "通义 DashScope 网络连接失败（与是否填写 OpenAI Base URL 无关）。"
+                "请检查：本机/服务器能否访问阿里云、防火墙与代理、DASHSCOPE_API_KEY 是否有效；"
+                "若走 HTTPS 拦截代理，可尝试系统信任证书或在可直连环境运行。"
+            ) from e
+        except Exception as e:
+            el = str(e).lower()
+            if any(x in el for x in ("connection", "timeout", "10054", "ssl", "certificate")):
+                raise RuntimeError(
+                    "通义 DashScope 请求异常（多为网络/SSL/超时）。通义无需配置 Base URL；"
+                    "请核对 Key、出网策略及本机时间同步。"
+                ) from e
+            raise
+        return _dashscope_generation_text(resp)
 
     with _openai_http_client() as client:
         if p in ("openai", "deepseek", "lingyi"):
@@ -221,5 +278,7 @@ def invoke_chat_direct(
             msg = data.get("message") or {}
             return msg.get("content") or ""
 
-    # 其他 provider 暂不实现直接 HTTP，由调用方处理
-    raise RuntimeError(f"invoke_chat_direct 暂不支持 provider={p}，请使用 Cursor / OpenAI / DeepSeek / 零一 / Ollama")
+    # 其他 provider 暂不实现，由调用方处理
+    raise RuntimeError(
+        f"invoke_chat_direct 暂不支持 provider={p}，请使用 Cursor / OpenAI / DeepSeek / 零一 / Ollama / 通义"
+    )

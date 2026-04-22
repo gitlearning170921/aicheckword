@@ -7,9 +7,11 @@ import subprocess
 import zipfile
 import tempfile
 import tarfile
+import base64
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import httpx
 from .langchain_compat import Document, RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
     PyPDFLoader,
@@ -21,6 +23,8 @@ from langchain_community.document_loaders import (
 )
 
 from config import settings
+from config.settings import get_pdf_ocr_llm_model
+from config.cursor_overrides import get_llm_verify_ssl, get_llm_trust_env
 
 LOADER_MAP = {
     ".pdf": PyPDFLoader,
@@ -86,6 +90,247 @@ def extract_section_outline_from_texts(texts: List[str], max_sections: int = 80)
 # PDF：仅支持文本型；含图片/扫描版无法提取文字。限制最大页数避免大文件卡死
 MAX_PDF_PAGES = 500
 MIN_PDF_TEXT_LEN = 20  # 提取文字少于此长度视为“图片版/扫描版”
+MAX_PDF_OCR_PAGES = 30  # AI OCR 兜底最多识别前 N 页，避免超时与费用失控
+
+# DashScope 多模态 OCR 默认模型（与纯文本审核模型 qwen-plus 等不同）
+_DASHSCOPE_OCR_VL_DEFAULT = "qwen-vl-plus"
+
+
+def _dashscope_ocr_vl_model(ocr_field: str, chat_model: str) -> str:
+    """从侧栏「OCR 模型」或审核模型名中选出可用的通义 VL 模型名；非 VL 时回退默认。"""
+    for candidate in ((ocr_field or "").strip(), (chat_model or "").strip()):
+        if not candidate:
+            continue
+        cl = candidate.lower()
+        if "vl" in cl or "qwen-vl" in cl or "qwen2.5-vl" in cl or "qwen2-vl" in cl:
+            return candidate
+    return _DASHSCOPE_OCR_VL_DEFAULT
+
+
+def _parse_dashscope_multimodal_text(resp) -> Tuple[str, str]:
+    """解析 MultiModalConversation.call 返回值，成功 (text, '')，失败 ('', err)。"""
+    try:
+        sc = int(getattr(resp, "status_code", 0) or 0)
+        if sc != 200:
+            return "", f"HTTP {sc}: {getattr(resp, 'message', '') or resp}"
+        code = (getattr(resp, "code", None) or "").strip()
+        if code:
+            return "", f"{code}: {getattr(resp, 'message', '') or '请求失败'}"
+        out = getattr(resp, "output", None)
+        if not out:
+            return "", "DashScope 返回无 output"
+        tx = getattr(out, "text", None)
+        if isinstance(tx, str) and tx.strip():
+            return tx.strip(), ""
+        choices = getattr(out, "choices", None) or []
+        if choices:
+            msg = getattr(choices[0], "message", None)
+            if msg is not None:
+                c = getattr(msg, "content", None)
+                if isinstance(c, str) and c.strip():
+                    return c.strip(), ""
+                if isinstance(c, list):
+                    parts = []
+                    for it in c:
+                        if isinstance(it, dict):
+                            t = (it.get("text") or "").strip()
+                            if t:
+                                parts.append(t)
+                    if parts:
+                        return "\n".join(parts).strip(), ""
+        return "", "模型未返回可解析文本"
+    except Exception as e:
+        return "", str(e)
+
+
+def _dashscope_ocr_one_page(img_b64: str, api_key: str, vl_model: str) -> Tuple[str, str]:
+    """通义 DashScope 多模态单页 OCR（content 为 image + text，非 OpenAI image_url）。"""
+    try:
+        from dashscope import MultiModalConversation
+    except Exception as e:
+        return "", f"未安装 dashscope，无法调用通义多模态 OCR：{e!s}"
+    try:
+        resp = MultiModalConversation.call(
+            model=vl_model,
+            api_key=api_key,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"image": f"data:image/png;base64,{img_b64}"},
+                        {
+                            "text": (
+                                "请做 OCR，仅输出图片中的正文文字。要求：1) 保留原有换行；"
+                                "2) 不要解释；3) 看不清处写[不清晰]。"
+                            ),
+                        },
+                    ],
+                }
+            ],
+        )
+    except Exception as e:
+        return "", str(e)
+    return _parse_dashscope_multimodal_text(resp)
+
+
+def _extract_openai_choice_text(data: dict) -> str:
+    """兼容 OpenAI 风格返回：message.content 可能是字符串或分段数组。"""
+    try:
+        choice = (data.get("choices") or [None])[0] or {}
+        msg = (choice.get("message") or {})
+        c = msg.get("content")
+        if isinstance(c, str):
+            return c.strip()
+        if isinstance(c, list):
+            parts = []
+            for it in c:
+                if isinstance(it, dict):
+                    t = (it.get("text") or "").strip()
+                    if t:
+                        parts.append(t)
+            return "\n".join(parts).strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _pdf_ocr_with_multimodal_llm(path: Path, max_pages: int = MAX_PDF_OCR_PAGES) -> Tuple[List[Document], str]:
+    """
+    当 PDF 文本层几乎为空时，尝试用多模态模型 OCR。
+    返回 (docs, err_msg)：成功时 err_msg 为空；失败时 docs 为空并给出可读错误。
+    """
+    p = (settings.provider or "").strip().lower()
+    # Cursor 主对话不走本函数；扫描 PDF 的 OCR 按「向量化使用」走 Ollama 多模态或 OpenAI Vision
+    if p == "cursor":
+        emb = (getattr(settings, "cursor_embedding", None) or "ollama").strip().lower()
+        p = "openai" if emb == "openai" else "ollama"
+    _vision = get_pdf_ocr_llm_model()
+    # OpenAI 兼容多模态（含零一）；DeepSeek 公网 Chat 不支持 image_url，见下方分支
+    model = _vision or (settings.llm_model or "").strip() or ("deepseek-chat" if p == "deepseek" else "gpt-4o-mini")
+
+    try:
+        import fitz  # PyMuPDF
+    except Exception:
+        return [], "未安装 PyMuPDF（fitz），无法将 PDF 渲染为图片做 AI OCR。请先安装：pip install pymupdf"
+
+    try:
+        pdf = fitz.open(str(path))
+    except Exception as e:
+        return [], f"PDF 打开失败，无法执行 AI OCR：{e!s}"
+
+    docs: List[Document] = []
+    timeout = httpx.Timeout(180.0, connect=45.0)
+    err_detail = ""
+    with httpx.Client(verify=get_llm_verify_ssl(), trust_env=get_llm_trust_env(), timeout=timeout) as client:
+        try:
+            total = min(len(pdf), max_pages)
+            for i in range(total):
+                page = pdf.load_page(i)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                img_b64 = base64.b64encode(pix.tobytes("png")).decode("ascii")
+                text = ""
+                if p == "tongyi":
+                    ds_key = (settings.dashscope_api_key or "").strip()
+                    if not ds_key:
+                        err_detail = "provider=tongyi 未配置 DASHSCOPE_API_KEY，无法执行 AI OCR。"
+                        break
+                    vl_model = _dashscope_ocr_vl_model(_vision, settings.llm_model or "")
+                    text, page_err = _dashscope_ocr_one_page(img_b64, ds_key, vl_model)
+                    if page_err:
+                        err_detail = page_err
+                        break
+                elif p == "deepseek":
+                    # DeepSeek Chat Completions 不接受 OpenAI Vision 的 image_url 块，否则会 HTTP 400。
+                    ds_key = (settings.dashscope_api_key or "").strip()
+                    if not ds_key:
+                        err_detail = (
+                            "DeepSeek 接口不支持多模态 OCR（image_url）。"
+                            "请在 .env 配置 DASHSCOPE_API_KEY，系统将用通义千问 VL 识别扫描页；"
+                            "或改用 Ollama 多模态（如 qwen2.5vl），或侧栏切换为「通义」提供方。"
+                        )
+                        break
+                    vl_model = _dashscope_ocr_vl_model(_vision, settings.llm_model or "")
+                    text, page_err = _dashscope_ocr_one_page(img_b64, ds_key, vl_model)
+                    if page_err:
+                        err_detail = page_err
+                        break
+                elif p in ("openai", "lingyi"):
+                    api_key = (
+                        (settings.lingyi_api_key if p == "lingyi" else settings.openai_api_key)
+                        or settings.openai_api_key
+                        or ""
+                    ).strip()
+                    if not api_key:
+                        err_detail = f"provider={p} 未配置 API Key，无法执行 AI OCR。"
+                        break
+                    base_url = (
+                        settings.lingyi_base_url if p == "lingyi" else settings.openai_base_url
+                    ) or "https://api.openai.com/v1"
+                    base_url = base_url.rstrip("/")
+                    payload = {
+                        "model": model,
+                        "temperature": 0,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "请做 OCR，仅输出图片中的正文文字。要求：1) 保留原有换行；2) 不要解释；3) 看不清处写[不清晰]。",
+                                    },
+                                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                                ],
+                            }
+                        ],
+                    }
+                    r = client.post(
+                        f"{base_url}/chat/completions",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    )
+                    if r.status_code >= 400:
+                        err_detail = f"HTTP {r.status_code}: {(r.text or '')[:300]}"
+                        break
+                    text = _extract_openai_choice_text(r.json())
+                elif p == "ollama":
+                    # Ollama 多模态：需使用支持图像输入的模型（如 qwen2.5vl/llava 等）
+                    base_url = (settings.ollama_base_url or "http://localhost:11434").rstrip("/")
+                    payload = {
+                        "model": model,
+                        "stream": False,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": "请做 OCR，仅输出图片中的正文文字。要求：保留原有换行，不要解释，看不清处写[不清晰]。",
+                                "images": [img_b64],
+                            }
+                        ],
+                    }
+                    r = client.post(f"{base_url}/api/chat", json=payload)
+                    if r.status_code >= 400:
+                        err_detail = f"HTTP {r.status_code}: {(r.text or '')[:300]}"
+                        break
+                    data = r.json() or {}
+                    text = ((data.get("message") or {}).get("content") or "").strip()
+                else:
+                    err_detail = f"当前 provider={p or 'unknown'} 未实现图像 OCR 兜底。"
+                    break
+                if not text:
+                    text = "[该页 OCR 未识别到可用文本]"
+                docs.append(
+                    Document(
+                        page_content=text,
+                        metadata={"source_file": path.name, "file_type": ".pdf", "page": i + 1, "ocr_fallback": True},
+                    )
+                )
+        except Exception as e:
+            err_detail = str(e)
+        finally:
+            pdf.close()
+
+    if not docs:
+        return [], f"AI OCR 失败：{err_detail or '模型未返回可用内容'}"
+    return docs, ""
 
 
 def _xlsx_cell_to_text(c) -> str:
@@ -1050,10 +1295,14 @@ def load_single_file(file_path) -> List[Document]:
                 )
             total_text = "".join(d.page_content for d in docs)
             if len(total_text.strip()) < MIN_PDF_TEXT_LEN:
-                raise RuntimeError(
-                    f"该 PDF 几乎未提取到文字（仅 {len(total_text.strip())} 字），可能为扫描件/图片版。"
-                    "当前仅支持文本型 PDF，建议先 OCR 转成文本或使用可复制文字的 PDF。"
-                )
+                # 先尝试 AI OCR 兜底，避免扫描版直接失败
+                ocr_docs, ocr_err = _pdf_ocr_with_multimodal_llm(path, max_pages=MAX_PDF_OCR_PAGES)
+                if ocr_docs:
+                    docs = ocr_docs
+                else:
+                    raise RuntimeError(
+                        f"该 PDF 几乎未提取到文字（仅 {len(total_text.strip())} 字），已尝试 AI OCR 兜底但失败：{ocr_err}"
+                    )
         except Exception as e:
             if "无法解析" in str(e) or "几乎未提取" in str(e):
                 raise
