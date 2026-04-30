@@ -1031,18 +1031,9 @@ def quiz_sets_delete(set_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/quiz/exams/{set_id}/start")
+@app.post("/quiz/exams/{set_id}/start", include_in_schema=False)
 def quiz_start_exam(set_id: int, request: QuizAttemptStartRequest):
-    try:
-        data = quiz_service.start_attempt(
-            collection=request.collection,
-            set_id=set_id,
-            user_id=request.user_id or "",
-            mode=request.mode or "exam",
-        )
-        return {"ok": True, "data": data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(status_code=404, detail="已迁移到 aiword 本地考试：请改用 aiword /api/exam-center/student/exams/start-local")
 
 
 @app.post("/quiz/practice/submit")
@@ -1076,24 +1067,15 @@ def quiz_submit_practice(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/quiz/exams/{attempt_id}/submit")
+@app.post("/quiz/exams/{attempt_id}/submit", include_in_schema=False)
 def quiz_submit_exam(attempt_id: int, request: QuizSubmitAnswersRequest):
-    try:
-        coll = None
-        if getattr(request, "collection", None) not in (None, ""):
-            coll = str(request.collection).strip() or None
-        data = quiz_service.submit_answers_and_grade(
-            attempt_id=attempt_id,
-            answers=request.answers or [],
-            collection=coll,
-        )
-        return {"ok": True, "data": data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(status_code=404, detail="已迁移到 aiword 本地考试：请改用 aiword /api/exam-center/student/exams/submit-local")
 
 
 @app.post("/quiz/attempts/{attempt_id}/grade-by-cache")
 def quiz_grade_by_cache(attempt_id: int, collection: str = Query("regulations"), paper_id: Optional[int] = Query(None)):
+    if quiz_service.is_exam_attempt(attempt_id=attempt_id):
+        raise HTTPException(status_code=404, detail="exam attempt 已迁移到 aiword 本地考试，当前接口不再提供")
     try:
         data = quiz_service.grade_attempt_by_cache(collection=collection, attempt_id=attempt_id, paper_id=paper_id)
         return {"ok": True, "data": data}
@@ -1103,6 +1085,8 @@ def quiz_grade_by_cache(attempt_id: int, collection: str = Query("regulations"),
 
 @app.post("/quiz/attempts/{attempt_id}/auto-grade")
 def quiz_auto_grade(attempt_id: int, collection: str = Query("regulations"), paper_id: Optional[int] = Query(None)):
+    if quiz_service.is_exam_attempt(attempt_id=attempt_id):
+        raise HTTPException(status_code=404, detail="exam attempt 已迁移到 aiword 本地考试，当前接口不再提供")
     try:
         data = quiz_service.auto_grade_attempt(collection=collection, attempt_id=attempt_id, paper_id=paper_id)
         return {"ok": True, "data": data}
@@ -1113,6 +1097,8 @@ def quiz_auto_grade(attempt_id: int, collection: str = Query("regulations"), pap
 @app.get("/quiz/attempts/{attempt_id}/grading-status")
 def quiz_attempt_grading_status(attempt_id: int):
     """异步主观题阅卷进度：阅卷中 grading / 完成后 state=graded 且含总分。"""
+    if quiz_service.is_exam_attempt(attempt_id=attempt_id):
+        raise HTTPException(status_code=404, detail="exam attempt 已迁移到 aiword 本地考试，当前接口不再提供")
     try:
         return {"ok": True, "data": quiz_service.get_attempt_grading_status(attempt_id=attempt_id)}
     except ValueError as e:
@@ -1130,6 +1116,8 @@ def quiz_attempt_answers(attempt_id: int, collection: str = Query("regulations")
     - is_correct 可能为空/不准确（若未触发自动判分）；前端可优先展示“标准答案 vs 学生答案”。
     - collection 参数仅用于兼容未来按 collection 分库的扩展；当前实现从题库表聚合即可。
     """
+    if quiz_service.is_exam_attempt(attempt_id=attempt_id):
+        raise HTTPException(status_code=404, detail="exam attempt 已迁移到 aiword 本地考试，当前接口不再提供")
     try:
         _ = collection  # 预留参数，避免上层固定传参导致 422
         return {"ok": True, "data": quiz_service.get_attempt_answers_with_questions(attempt_id=attempt_id)}
@@ -1151,6 +1139,53 @@ def quiz_upsert_grading_rules(request: QuizUpsertGradingRuleRequest):
         return {"ok": True, "data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class QuizPaperGradeByAIItem(BaseModel):
+    question_id: str = Field(..., description="题目ID")
+    question_type: str = Field(default="", description="题型（可空）")
+    stem: str = Field(default="", description="题干")
+    options: List[Any] = Field(default_factory=list, description="选项（可空）")
+    user_answer: Any = Field(default=None, description="学生答案")
+
+
+class QuizPaperGradeByAIRequest(BaseModel):
+    collection: str = Field(default="regulations")
+    exam_track: str = Field(default="cn")
+    attempt_id: str = Field(..., description="aiword 本地 attempt_id（用于回传）")
+    assignment_id: str = Field(default="", description="可选：aiword assignment_id")
+    items: List[QuizPaperGradeByAIItem] = Field(default_factory=list)
+
+
+@app.post("/quiz/grading/paper-by-ai")
+def quiz_grade_paper_by_ai(request: QuizPaperGradeByAIRequest):
+    """整卷主观判分：创建异步 job，返回 job_id。证据定位仅需文件名。"""
+    if request.exam_track not in EXAM_TRACKS:
+        raise HTTPException(status_code=400, detail=f"exam_track 不支持: {request.exam_track}")
+    if not request.items:
+        raise HTTPException(status_code=422, detail="items 不能为空")
+    try:
+        data = quiz_service.start_paper_grading_job(
+            collection=request.collection,
+            exam_track=request.exam_track,
+            attempt_id=request.attempt_id,
+            items=[dict(x) for x in request.items],
+        )
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/grading/jobs/{job_id}")
+def quiz_grade_paper_job(job_id: str):
+    """查询整卷主观判分 job 状态与结果。"""
+    try:
+        data = quiz_service.get_paper_grading_job(job_id=str(job_id))
+        return {"ok": True, "data": data}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/quiz/bank/tracks")
@@ -1257,43 +1292,25 @@ def quiz_bank_question_delete(question_id: int, collection: str = Query("regulat
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/quiz/stats/overview")
+@app.get("/quiz/stats/overview", include_in_schema=False)
 def quiz_stats_overview(collection: str = "regulations"):
-    try:
-        return {"ok": True, "data": quiz_service.get_overview_stats(collection)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(status_code=404, detail="统计已迁移到 aiword：请改用 /api/exam-center/stats/overview")
 
 
-@app.get("/quiz/stats/options")
+@app.get("/quiz/stats/options", include_in_schema=False)
 def quiz_stats_options(collection: str = "regulations"):
     """统计端下拉：学生列表、考试任务（assignment_id）列表，来源为 quiz_attempts 聚合。"""
-    try:
-        return {"ok": True, "data": quiz_service.get_stats_options(collection)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(status_code=404, detail="统计已迁移到 aiword：请改用 /api/exam-center/stats/options")
 
 
-@app.get("/quiz/stats/student/{student_id}")
+@app.get("/quiz/stats/student/{student_id}", include_in_schema=False)
 def quiz_stats_student(student_id: str, collection: str = "regulations"):
-    # v1 先返回 overview + student_id 占位；后续可拓展为个人趋势统计
-    try:
-        data = quiz_service.get_overview_stats(collection)
-        data["student_id"] = student_id
-        return {"ok": True, "data": data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(status_code=404, detail="统计已迁移到 aiword：请改用 /api/exam-center/stats/student/{student_id}")
 
 
-@app.get("/quiz/stats/exam/{assignment_id}")
+@app.get("/quiz/stats/exam/{assignment_id}", include_in_schema=False)
 def quiz_stats_exam(assignment_id: int, collection: str = "regulations"):
-    # v1 先返回 overview + assignment_id 占位；后续可拓展为单考试维度指标
-    try:
-        data = quiz_service.get_overview_stats(collection)
-        data["assignment_id"] = assignment_id
-        return {"ok": True, "data": data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(status_code=404, detail="统计已迁移到 aiword：请改用 /api/exam-center/stats/exam/{assignment_id}")
 
 
 @app.get("/quiz/config/effective")

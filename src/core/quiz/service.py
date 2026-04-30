@@ -345,8 +345,49 @@ def _ensure_question_shape(question: Dict[str, Any], fallback_category: str = ""
         opts = ["正确", "错误"]
     if q_type == "multiple_choice" and not isinstance(answer, list):
         answer = [answer] if answer is not None else []
+    if q_type == "case_analysis":
+        # 案例分析题：不应有选项；答案为参考要点文本（学生端文本作答）
+        opts = []
+        if isinstance(answer, list):
+            answer = "\n".join([str(x).strip() for x in answer if str(x).strip()])[:1200] or ""
+        if isinstance(answer, (dict, int, float, bool)):
+            answer = str(answer)
+        answer = str(answer or "").strip()
+        if not answer or len(answer) <= 1 or answer.upper() in ("A", "B", "C", "D", "E", "F"):
+            answer = "参考作答要点：结论 + 依据文件名 + 与摘录内容的对应关系。"
     if q_type != "case_analysis" and not opts:
         opts = ["A", "B", "C", "D"]
+    if q_type == "multiple_choice":
+        # 多选题：必须有多个正确项（>=2）。若不足，则兜底补足，避免生成“伪多选”。
+        arr = answer if isinstance(answer, list) else []
+        cleaned: List[str] = []
+        for x in arr:
+            s = str(x or "").strip().upper()
+            if not s:
+                continue
+            if "," in s or "、" in s or "，" in s:
+                parts = re.split(r"[，,、\s]+", s)
+                for p in parts:
+                    p2 = str(p or "").strip().upper()
+                    if p2:
+                        cleaned.append(p2)
+            else:
+                cleaned.append(s)
+        uniq: List[str] = []
+        for s in cleaned:
+            if len(s) == 1 and "A" <= s <= "Z" and s not in uniq:
+                uniq.append(s)
+        max_opt = len(opts) if isinstance(opts, list) else 0
+        if max_opt > 0:
+            uniq = [x for x in uniq if (ord(x) - ord("A")) < max_opt]
+        if len(uniq) < 2:
+            cand = [chr(ord("A") + i) for i in range(max(2, min(6, max_opt or 4)))]
+            for c in cand:
+                if c not in uniq:
+                    uniq.append(c)
+                if len(uniq) >= 2:
+                    break
+        answer = uniq
     return {
         "question_type": q_type,
         "stem": str(question.get("stem") or "").strip(),
@@ -521,6 +562,8 @@ def _generate_questions_by_ai(
 7) evidence[].source_file 必须填写为具体可读的文件名（程序文件/法规文件/项目案例文件名）；如果无法确定，填空字符串，并在 explanation 中写“来源文件未标注”。不得使用 tmp 临时文件名。
 8) JSON 格式：{{"questions":[{{"question_type":"single_choice|multiple_choice|true_false|case_analysis","stem":"...","options":[...],"answer":...,"explanation":"...","category":"...","difficulty":"easy|medium|hard","evidence":[{{"content_snippet":"...","source_file":"..."}}]}}]}}
 9) 单选/多选：`options` 为**纯陈述文本数组**（2～6 项），**不要**在每项前加 `A./B.` 等字母前缀（系统会统一编号）。单选 `answer` 为单个大写字母（如 `C`）；多选 `answer` 为字母数组（如 `["A","D"]`）。
+9.1) 多选题（multiple_choice）必须至少有 **2 个**正确选项（`answer` 数组长度 ≥ 2），不得只给一个正确项。
+9.2) 案例分析题（case_analysis）必须满足：`options` 为空数组；`answer` 为**参考作答要点文本**（不是 A/B/C/D），学生端会用文本框输入。
 10) 干扰项质量（本批共 {count} 题）：其中至少 **{min_plausible}** 题须标为 `medium` 或 `hard`，且这些题的**错误选项**须与正确选项在句式长度、术语层级上**尽量平行**，呈现**易混淆结论**；**禁止**整批题都靠「仅…」「只需要…」「不需要…」「绝不是…」「与审核无关」等一眼可排除的标语式否定句凑满四个选项。
 11) 约 **60%** 题目可为 `easy`：允许轻度否定或排除语气，但**不要**让四个错误项共用同一种开头模板；**不得**出现「明显三项都错、只剩一项像真命题」的凑数结构。
 12) 正确答案在命制时不要刻意总落在同一字母位；落库前系统会打乱选项顺序并重写 `answer`，你仍须保证**每个错误选项本身像合理结论**而非「反着说就对了」的口号。
@@ -740,24 +783,78 @@ def _save_questions_to_bank(
     return out
 
 
-def _score_objective_answer(question_type: str, answer: Any, user_answer: Any) -> Dict[str, Any]:
-    def _to_bool(v: Any) -> bool:
-        if isinstance(v, str):
-            t = v.strip().lower()
-            return t in ("true", "1", "yes", "y", "对", "正确")
-        return bool(v)
+def _letter_choice_index(raw: Any) -> Optional[int]:
+    if raw is None or isinstance(raw, (dict, list)):
+        return None
+    s = str(raw).strip().upper()
+    if len(s) != 1 or s < "A" or s > "Z":
+        return None
+    return ord(s) - ord("A")
+
+
+def _resolve_choice_letter_to_option_value(value: Any, options: Optional[List[Any]]) -> Any:
+    """单选/多选/判断：若作答为 A–Z 且题干有 options，则解析为对应选项原文再比较。"""
+    if not isinstance(options, list) or not options:
+        return value
+    ix = _letter_choice_index(value)
+    if ix is None or ix >= len(options):
+        return value
+    return options[ix]
+
+
+def _norm_single_choice_cmp_key(value: Any, options: Optional[List[Any]]) -> str:
+    v = _resolve_choice_letter_to_option_value(value, options)
+    if v is None:
+        return ""
+    return str(v).strip().lower()
+
+
+def _norm_multiple_choice_set(raw: Any, options: Optional[List[Any]]) -> set[str]:
+    if raw is None:
+        return set()
+    items = raw if isinstance(raw, list) else [raw]
+    out: set[str] = set()
+    for x in items:
+        v = _resolve_choice_letter_to_option_value(x, options)
+        out.add(str(v).strip().lower() if v is not None else "")
+    return {x for x in out if x}
+
+
+def _true_false_to_bool(v: Any) -> bool:
+    """判断题：bool / 数字 / 常见中英文真假字面量 → bool（禁止对任意字符串用 Python bool()）。"""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return float(v) != 0.0
+    if isinstance(v, str):
+        t = v.strip().lower()
+        if t in ("false", "0", "no", "n", "f", "wrong", "错误", "错", "否", "不正确", "不对"):
+            return False
+        if t in ("true", "1", "yes", "y", "t", "对", "正确", "是", "√"):
+            return True
+        return False
+    return False
+
+
+def _score_objective_answer(
+    question_type: str,
+    answer: Any,
+    user_answer: Any,
+    options: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    opts = options if isinstance(options, list) else None
 
     if question_type == "single_choice":
-        ok = str(answer).strip().lower() == str(user_answer).strip().lower()
+        ok = _norm_single_choice_cmp_key(answer, opts) == _norm_single_choice_cmp_key(user_answer, opts)
         return {"is_correct": ok, "score": 1.0 if ok else 0.0}
     if question_type == "true_false":
-        av = _to_bool(answer)
-        uv = _to_bool(user_answer)
-        ok = av == uv
+        aa = _resolve_choice_letter_to_option_value(answer, opts)
+        ua = _resolve_choice_letter_to_option_value(user_answer, opts)
+        ok = _true_false_to_bool(aa) == _true_false_to_bool(ua)
         return {"is_correct": ok, "score": 1.0 if ok else 0.0}
     if question_type == "multiple_choice":
-        as_set = {str(x).strip().lower() for x in (answer or [])}
-        us_set = {str(x).strip().lower() for x in (user_answer or [])}
+        as_set = _norm_multiple_choice_set(answer, opts)
+        us_set = _norm_multiple_choice_set(user_answer, opts)
         ok = as_set == us_set and len(as_set) > 0
         return {"is_correct": ok, "score": 1.0 if ok else 0.0}
     return {"is_correct": False, "score": 0.0}
@@ -1377,6 +1474,181 @@ def submit_answers_and_grade(*, attempt_id: int, answers: List[Dict[str, Any]], 
     return out
 
 
+def is_exam_attempt(*, attempt_id: int) -> bool:
+    """用于网关下线判断：exam 链路已迁移到 aiword，本接口仅识别 attempt 的 mode。"""
+    try:
+        row = repo.get_attempt_by_id(int(attempt_id))
+    except Exception:
+        row = None
+    if not row or not isinstance(row, dict):
+        return False
+    mode = str(row.get("mode") or "").strip().lower()
+    return mode == "exam"
+
+
+# -----------------------------
+# 整卷主观判分 Job（供 aiword 本地考试调用）
+# -----------------------------
+_paper_grade_lock = threading.Lock()
+_paper_grade_jobs: dict[str, dict[str, Any]] = {}
+
+
+def _evidence_for_subjective(agent: ReviewAgent, exam_track: str, stem: str, top_k: int = 6) -> List[Dict[str, Any]]:
+    q = f"{EXAM_TRACKS.get(exam_track, exam_track)} {stem}".strip()
+    try:
+        rows = agent.search_knowledge(q, top_k=int(top_k), use_checkpoints=True)
+    except Exception:
+        rows = []
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        content = str(r.get("content") or "").strip()
+        if not content:
+            continue
+        meta = r.get("metadata") or {}
+        src = str(meta.get("source_file") or meta.get("title") or r.get("source") or "").strip()
+        out.append({"source_file": src, "snippet": content[:500]})
+        if len(out) >= int(top_k):
+            break
+    return out
+
+
+def _grade_subjective_question_llm(
+    *,
+    exam_track: str,
+    stem: str,
+    user_answer: Any,
+    evidence: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """返回 {score(0~1), reason, recommendation, evidence_used[]}；证据只要求文件名定位。"""
+    ev_lines = "\n".join(
+        [f"- {str(e.get('source_file') or '').strip()}: {str(e.get('snippet') or '')[:240]}" for e in (evidence or [])]
+    )
+    prompt = f"""
+你是医疗器械注册资料相关考试的阅卷老师。请对“学生答案”按 0~1 评分并返回 JSON：
+{{
+  "score": 0.0,
+  "reason": "...",
+  "recommendation": "...",
+  "evidence_used": [{{"source_file":"...","snippet":"..."}}]
+}}
+
+体考类型: {EXAM_TRACKS.get(exam_track, exam_track)}
+题干: {stem}
+学生答案: {json.dumps(user_answer, ensure_ascii=False)}
+
+可用证据（仅供参考，优先引用其中内容）：\n{ev_lines}
+
+要求：
+- score 为 0~1 浮点数
+- evidence_used 至少返回 1 条（仅需要 source_file 文件名；snippet 可截断）
+- 不要输出除 JSON 外的任何文本
+""".strip()
+    try:
+        prov = (settings.quiz_provider or settings.provider or "").strip().lower()
+        model = (settings.quiz_llm_model or settings.llm_model or "").strip()
+        temp = float(getattr(settings, "quiz_temperature", 0.2) or 0.2)
+        raw = invoke_chat_direct(prompt, temperature=temp, provider=prov, model=model)
+        data = json.loads(_norm_json_text(raw))
+        score = max(0.0, min(1.0, float(data.get("score") or 0.0)))
+        reason = str(data.get("reason") or "").strip()[:2000]
+        reco = str(data.get("recommendation") or "").strip()[:2000]
+        used = data.get("evidence_used") if isinstance(data.get("evidence_used"), list) else []
+        used2: List[Dict[str, Any]] = []
+        for u in used:
+            if not isinstance(u, dict):
+                continue
+            sf = str(u.get("source_file") or "").strip()
+            sn = str(u.get("snippet") or "").strip()
+            if not sf:
+                continue
+            used2.append({"source_file": sf, "snippet": sn[:500]})
+            if len(used2) >= 6:
+                break
+        if not used2 and evidence:
+            used2 = [{"source_file": str(evidence[0].get("source_file") or "").strip(), "snippet": str(evidence[0].get("snippet") or "")[:500]}]
+        return {"score": score, "reason": reason, "recommendation": reco, "evidence_used": used2}
+    except Exception:
+        # 失败兜底：保留证据文件名，便于审计与排查
+        used_fallback = []
+        for e in (evidence or [])[:1]:
+            sf = str(e.get("source_file") or "").strip()
+            if sf:
+                used_fallback.append({"source_file": sf, "snippet": str(e.get("snippet") or "")[:300]})
+        return {"score": 0.0, "reason": "ai_score_failed", "recommendation": "", "evidence_used": used_fallback}
+
+
+def start_paper_grading_job(
+    *,
+    collection: str,
+    exam_track: str,
+    attempt_id: str,
+    items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    job_id = uuid.uuid4().hex
+    now_ts = datetime.utcnow().isoformat()
+    with _paper_grade_lock:
+        _paper_grade_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "pending",
+            "created_at": now_ts,
+            "updated_at": now_ts,
+            "attempt_id": attempt_id,
+            "items": [],
+            "error": None,
+        }
+
+    def _runner():
+        with _paper_grade_lock:
+            if job_id in _paper_grade_jobs:
+                _paper_grade_jobs[job_id]["status"] = "running"
+                _paper_grade_jobs[job_id]["updated_at"] = datetime.utcnow().isoformat()
+        try:
+            agent = ReviewAgent(collection)
+            out_items: List[Dict[str, Any]] = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                qid = str(it.get("question_id") or it.get("questionId") or "").strip()
+                stem = str(it.get("stem") or "").strip()
+                ua = it.get("user_answer")
+                evidence = _evidence_for_subjective(agent, exam_track, stem, top_k=6)
+                graded = _grade_subjective_question_llm(exam_track=exam_track, stem=stem, user_answer=ua, evidence=evidence)
+                out_items.append(
+                    {
+                        "question_id": qid,
+                        "score": graded.get("score"),
+                        "reason": graded.get("reason"),
+                        "recommendation": graded.get("recommendation"),
+                        "evidence_used": graded.get("evidence_used") or [],
+                    }
+                )
+            with _paper_grade_lock:
+                if job_id in _paper_grade_jobs:
+                    _paper_grade_jobs[job_id]["status"] = "done"
+                    _paper_grade_jobs[job_id]["items"] = out_items
+                    _paper_grade_jobs[job_id]["updated_at"] = datetime.utcnow().isoformat()
+        except Exception as e:
+            with _paper_grade_lock:
+                if job_id in _paper_grade_jobs:
+                    _paper_grade_jobs[job_id]["status"] = "failed"
+                    _paper_grade_jobs[job_id]["error"] = str(e)[:800]
+                    _paper_grade_jobs[job_id]["updated_at"] = datetime.utcnow().isoformat()
+
+    threading.Thread(target=_runner, name=f"quiz_paper_grade_{job_id[:8]}", daemon=True).start()
+    return {"job_id": job_id, "status": "pending", "attempt_id": attempt_id}
+
+
+def get_paper_grading_job(*, job_id: str) -> Dict[str, Any]:
+    jid = str(job_id or "").strip()
+    if not jid:
+        raise ValueError("job_id required")
+    with _paper_grade_lock:
+        job = _paper_grade_jobs.get(jid)
+        if not job:
+            raise ValueError(f"job not found: {jid}")
+        return dict(job)
+
+
 def get_attempt_answers_with_questions(*, attempt_id: int) -> Dict[str, Any]:
     rows = repo.list_attempt_answers_with_questions(attempt_id)
     # 直接返回题目+作答，用于 aiword 详情展示（未必已自动判分）
@@ -1415,7 +1687,9 @@ def grade_attempt_by_cache(*, collection: str, attempt_id: int, paper_id: Option
         rule = repo.get_grading_rule(collection=collection, paper_id=paper_id, question_id=qid, version=1)
         if not rule:
             continue
-        ev = _score_objective_answer(r["question_type"], rule.get("answer_key"), r.get("user_answer"))
+        ev = _score_objective_answer(
+            r["question_type"], rule.get("answer_key"), r.get("user_answer"), r.get("options")
+        )
         score = float(ev["score"])
         hit += 1
         if bool(ev["is_correct"]):
@@ -1465,14 +1739,18 @@ def auto_grade_attempt(*, collection: str, attempt_id: int, paper_id: Optional[i
         qid = int(r["question_id"])
         rule = repo.get_grading_rule(collection=collection, paper_id=paper_id, question_id=qid, version=1)
         if rule:
-            ev = _score_objective_answer(r["question_type"], rule.get("answer_key"), r.get("user_answer"))
+            ev = _score_objective_answer(
+                r["question_type"], rule.get("answer_key"), r.get("user_answer"), r.get("options")
+            )
             score = float(ev["score"])
             repo.log_grading_cache_hit(attempt_id, qid, "rule", 1.0)
             graded_by_cache = True
             comment = "cache_rule"
         else:
             if r["question_type"] in ("single_choice", "multiple_choice", "true_false"):
-                ev = _score_objective_answer(r["question_type"], r.get("answer"), r.get("user_answer"))
+                ev = _score_objective_answer(
+                    r["question_type"], r.get("answer"), r.get("user_answer"), r.get("options")
+                )
                 score = float(ev["score"])
                 comment = "direct_answer"
                 repo.upsert_grading_rule(
