@@ -197,6 +197,7 @@ def invoke_chat_direct(
     prompt_text: str,
     temperature: float = 0.1,
     provider: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> str:
     """
     直接调用当前配置的聊天接口，返回助手回复内容。
@@ -205,6 +206,7 @@ def invoke_chat_direct(
     provider: 若传入（如从 Streamlit current_provider），则优先使用，否则用 settings.provider。
     """
     p = (provider or settings.provider or "").strip().lower()
+    m = (model or settings.llm_model or "").strip()
 
     if p == "tongyi":
         # 通义走 DashScope 官方域名，与 OpenAI 兼容服务的 Base URL 无关；侧栏也无「通义 Base URL」项。
@@ -217,7 +219,7 @@ def invoke_chat_direct(
             raise RuntimeError("请安装 dashscope：pip install dashscope") from e
         try:
             resp = Generation.call(
-                model=settings.llm_model or "qwen-plus",
+                model=m or "qwen-plus",
                 messages=[{"role": "user", "content": prompt_text}],
                 api_key=api_key,
                 temperature=temperature,
@@ -247,7 +249,7 @@ def invoke_chat_direct(
                 raise RuntimeError(f"{p} 模式下请先配置 API Key")
             url = f"{base_url}/chat/completions"
             payload = {
-                "model": settings.llm_model or ("deepseek-chat" if p == "deepseek" else "gpt-4o-mini"),
+                "model": m or ("deepseek-chat" if p == "deepseek" else "gpt-4o-mini"),
                 "messages": [{"role": "user", "content": prompt_text}],
                 "temperature": temperature,
             }
@@ -268,7 +270,7 @@ def invoke_chat_direct(
             base_url = (settings.ollama_base_url or "http://localhost:11434").rstrip("/")
             url = f"{base_url}/api/chat"
             payload = {
-                "model": settings.llm_model or "qwen2.5",
+                "model": m or "qwen2.5",
                 "messages": [{"role": "user", "content": prompt_text}],
                 "stream": False,
             }

@@ -1,14 +1,24 @@
 @echo off
 chcp 65001 >nul
-title AI审核工具 - 重启API
-setlocal enabledelayedexpansion
+title AI��˹��� - ����API
+setlocal
+
+REM Ensure a persistent log window when double-clicked.
+REM If not already running inside a dedicated console, relaunch in a new cmd /k window.
+if /i not "%~1"=="--in-window" (
+    rem Relaunch in a persistent window; avoid tricky nested quotes.
+    start "aicheckword-api-logs" cmd /k call "%~f0" --in-window %*
+    exit /b 0
+)
 
 REM Usage:
-REM   restart_api.bat            -> restart API on port 8000
-REM   restart_api.bat 9000       -> restart API on port 9000
+REM   restart_api.bat                 -> restart API on port 8000
+REM   restart_api.bat 9000            -> restart API on port 9000
 
-set "PORT=%~1"
+set "PORT=%~2"
 if "%PORT%"=="" set "PORT=8000"
+set "PORT=%PORT:"=%"
+set "PORT=%PORT:"=%"
 
 echo [INFO] Target API port: %PORT%
 
@@ -33,28 +43,31 @@ if not "%HAS_PYTHON%"=="0" if not "%HAS_PY%"=="0" (
     exit /b 1
 )
 
-echo [INFO] Looking for existing process on port %PORT%...
-set "FOUND_PID="
-for /f "tokens=5" %%p in ('netstat -ano ^| findstr /r /c:":%PORT% .*LISTENING"') do (
-    set "FOUND_PID=%%p"
-    echo [INFO] Stopping PID !FOUND_PID! ...
-    taskkill /PID !FOUND_PID! /F >nul 2>&1
-    if !errorlevel! equ 0 (
-        echo [OK] PID !FOUND_PID! stopped.
-    ) else (
-        echo [WARN] Failed to stop PID !FOUND_PID! (may already exit).
-    )
+echo [INFO] Stopping API on port %PORT% (if any)...
+call "%~dp0stop_api.bat" "%PORT%" 1
+
+echo.
+echo ========================================
+echo   Starting API (logs in this window)
+echo ========================================
+echo [INFO] API_PORT=%PORT%
+echo [INFO] Base URL: http://127.0.0.1:%PORT%
+echo [INFO] Swagger:  http://127.0.0.1:%PORT%/docs
+echo [INFO] Health:   http://127.0.0.1:%PORT%/status
+echo ========================================
+echo.
+
+set API_PORT=%PORT%
+set PYTHONUTF8=1
+
+echo [INFO] Starting: python -m src.api.server
+python -m src.api.server
+if errorlevel 1 (
+    echo [WARN] python failed, trying: py -3 -m src.api.server
+    py -3 -m src.api.server
 )
 
-if "%FOUND_PID%"=="" (
-    echo [INFO] No listening process found on port %PORT%.
-)
-
-echo [INFO] Opening API log window...
-echo [INFO] Keep that window open to view logs.
-
-start "aicheckword-api-logs" cmd /k "cd /d %~dp0 && set API_PORT=%PORT% && set PYTHONUTF8=1 && echo [INFO] API_PORT=%PORT% && echo [INFO] Starting: python -m src.api.server && (python -m src.api.server || (echo [WARN] python failed, trying py -3 ... && py -3 -m src.api.server)) & echo. & echo [WARN] API process exited. & pause"
-
-echo [DONE] API restart command executed.
+echo.
+echo [WARN] API process exited.
 endlocal
 pause

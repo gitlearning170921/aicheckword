@@ -23,6 +23,10 @@ _audit_reports_list_cache: Dict[Tuple[str, int, int], Tuple[float, list]] = {}
 _audit_reports_list_cache_lock = threading.Lock()
 _AUDIT_REPORTS_LIST_TTL_SEC = 12.0
 
+# init_db() 原实现会在每次调用时跑大量 CREATE/ALTER 探测；API 长运行后会被动拖慢甚至“假死”
+_db_schema_initialized = False
+_db_schema_init_lock = threading.Lock()
+
 
 def invalidate_audit_reports_list_cache(collection: Optional[str] = None) -> None:
     """使 get_audit_reports 的进程内缓存失效。collection 为 None 时清空全部。"""
@@ -83,7 +87,18 @@ def _ensure_database():
 
 
 def init_db() -> None:
-    """初始化数据库与表结构"""
+    """初始化数据库与表结构（同一进程内仅完整执行一次；升级 schema 后请重启 API 再跑一次）。"""
+    global _db_schema_initialized
+    if _db_schema_initialized:
+        return
+    with _db_schema_init_lock:
+        if _db_schema_initialized:
+            return
+        _init_db_schema_locked()
+        _db_schema_initialized = True
+
+
+def _init_db_schema_locked() -> None:
     _ensure_database()
     max_attempts = 3
     for attempt in range(max_attempts):
@@ -279,6 +294,201 @@ def init_db() -> None:
                         INDEX idx_draft_file_case (collection, base_case_id)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_questions (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        exam_track VARCHAR(32) NOT NULL DEFAULT 'cn',
+                        question_hash VARCHAR(128) NOT NULL DEFAULT '',
+                        question_type VARCHAR(32) NOT NULL DEFAULT 'single_choice',
+                        difficulty VARCHAR(16) NOT NULL DEFAULT 'medium',
+                        category VARCHAR(128) NOT NULL DEFAULT '',
+                        knowledge_scope_hash VARCHAR(128) NOT NULL DEFAULT '',
+                        stem TEXT NOT NULL,
+                        options_json LONGTEXT,
+                        answer_json LONGTEXT NOT NULL,
+                        explanation TEXT,
+                        evidence_json LONGTEXT,
+                        origin VARCHAR(64) NOT NULL DEFAULT 'practice_runtime_generated',
+                        status VARCHAR(32) NOT NULL DEFAULT 'active',
+                        version INT NOT NULL DEFAULT 1,
+                        created_by VARCHAR(128) NOT NULL DEFAULT '',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY uq_quiz_question_hash (collection, question_hash),
+                        INDEX idx_quiz_q_track_type (collection, exam_track, question_type),
+                        INDEX idx_quiz_q_status (status)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_question_bank (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        exam_track VARCHAR(32) NOT NULL DEFAULT 'cn',
+                        category VARCHAR(128) NOT NULL DEFAULT '',
+                        question_type VARCHAR(32) NOT NULL DEFAULT 'single_choice',
+                        difficulty VARCHAR(16) NOT NULL DEFAULT 'medium',
+                        knowledge_scope_hash VARCHAR(128) NOT NULL DEFAULT '',
+                        question_id BIGINT NOT NULL,
+                        quality_score DECIMAL(6,2) NOT NULL DEFAULT 0,
+                        is_active TINYINT(1) NOT NULL DEFAULT 1,
+                        use_count INT NOT NULL DEFAULT 0,
+                        last_used_at DATETIME NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY uq_quiz_bank_q (collection, exam_track, knowledge_scope_hash, question_id),
+                        INDEX idx_quiz_bank_filter (collection, exam_track, category, question_type, difficulty, is_active),
+                        INDEX idx_quiz_bank_used (last_used_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_sets (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        set_type VARCHAR(32) NOT NULL DEFAULT 'practice',
+                        exam_track VARCHAR(32) NOT NULL DEFAULT 'cn',
+                        title VARCHAR(256) NOT NULL DEFAULT '',
+                        set_config_json LONGTEXT,
+                        status VARCHAR(32) NOT NULL DEFAULT 'draft',
+                        created_by VARCHAR(128) NOT NULL DEFAULT '',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_quiz_sets_lookup (collection, set_type, exam_track, status),
+                        INDEX idx_quiz_sets_created (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_set_items (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        set_id BIGINT NOT NULL,
+                        question_id BIGINT NOT NULL,
+                        order_no INT NOT NULL DEFAULT 0,
+                        score DECIMAL(8,2) NOT NULL DEFAULT 1,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY uq_quiz_set_item (set_id, question_id),
+                        INDEX idx_quiz_set_items_set (set_id, order_no),
+                        INDEX idx_quiz_set_items_q (question_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_attempts (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        set_id BIGINT DEFAULT NULL,
+                        assignment_id BIGINT DEFAULT NULL,
+                        user_id VARCHAR(128) NOT NULL DEFAULT '',
+                        mode VARCHAR(32) NOT NULL DEFAULT 'practice',
+                        state VARCHAR(32) NOT NULL DEFAULT 'in_progress',
+                        score_json LONGTEXT,
+                        started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        submitted_at DATETIME NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_quiz_attempts_user (user_id, created_at),
+                        INDEX idx_quiz_attempts_set (set_id),
+                        INDEX idx_quiz_attempts_state (state)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_answers (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        attempt_id BIGINT NOT NULL,
+                        question_id BIGINT NOT NULL,
+                        user_answer_json LONGTEXT,
+                        auto_score DECIMAL(8,2) NOT NULL DEFAULT 0,
+                        final_score DECIMAL(8,2) NOT NULL DEFAULT 0,
+                        is_correct TINYINT(1) NOT NULL DEFAULT 0,
+                        teacher_comment TEXT,
+                        graded_by_cache TINYINT(1) NOT NULL DEFAULT 0,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY uq_quiz_answer_attempt_q (attempt_id, question_id),
+                        INDEX idx_quiz_answers_attempt (attempt_id),
+                        INDEX idx_quiz_answers_q (question_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_grading_rules (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        paper_id BIGINT DEFAULT NULL,
+                        question_id BIGINT NOT NULL,
+                        version INT NOT NULL DEFAULT 1,
+                        answer_key_json LONGTEXT NOT NULL,
+                        rubric_json LONGTEXT,
+                        updated_by VARCHAR(128) NOT NULL DEFAULT '',
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY uq_quiz_grading_rule (collection, paper_id, question_id, version),
+                        INDEX idx_quiz_grading_q (question_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_grading_cache_hits (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        attempt_id BIGINT NOT NULL,
+                        question_id BIGINT NOT NULL,
+                        hit_type VARCHAR(32) NOT NULL DEFAULT 'rule',
+                        confidence DECIMAL(6,2) NOT NULL DEFAULT 0,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_quiz_gch_attempt (attempt_id),
+                        INDEX idx_quiz_gch_question (question_id),
+                        INDEX idx_quiz_gch_created (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_bank_ingest_jobs (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        exam_track VARCHAR(32) NOT NULL DEFAULT 'cn',
+                        target_count INT NOT NULL DEFAULT 0,
+                        generated_count INT NOT NULL DEFAULT 0,
+                        review_mode VARCHAR(32) NOT NULL DEFAULT 'auto_apply',
+                        status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                        created_by VARCHAR(128) NOT NULL DEFAULT '',
+                        message TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_quiz_ingest_lookup (collection, exam_track, status),
+                        INDEX idx_quiz_ingest_created (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_set_review_jobs (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        set_id BIGINT NOT NULL,
+                        status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                        created_by VARCHAR(128) NOT NULL DEFAULT '',
+                        message TEXT,
+                        result_json LONGTEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_quiz_review_set (collection, set_id, status),
+                        INDEX idx_quiz_review_created (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_wrongbook (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        user_id VARCHAR(128) NOT NULL DEFAULT '',
+                        question_id BIGINT NOT NULL,
+                        wrong_count INT NOT NULL DEFAULT 1,
+                        last_wrong_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY uq_quiz_wrong_user_q (collection, user_id, question_id),
+                        INDEX idx_quiz_wrong_user (user_id, last_wrong_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_favorites (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT 'regulations',
+                        user_id VARCHAR(128) NOT NULL DEFAULT '',
+                        question_id BIGINT NOT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY uq_quiz_fav_user_q (collection, user_id, question_id),
+                        INDEX idx_quiz_fav_user (user_id, created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
                 _add_column_if_missing(cur, "project_cases", "case_name_en", "VARCHAR(512) DEFAULT '' COMMENT '案例名称英文'")
                 _add_column_if_missing(cur, "project_cases", "product_name_en", "VARCHAR(512) DEFAULT '' COMMENT '产品名称英文'")
                 _add_column_if_missing(cur, "project_cases", "registration_country_en", "VARCHAR(256) DEFAULT '' COMMENT '注册国家英文'")
@@ -287,6 +497,7 @@ def init_db() -> None:
                 _add_column_if_missing(cur, "operation_logs", "model_info", "VARCHAR(256) DEFAULT ''")
                 _add_column_if_missing(cur, "knowledge_docs", "category", "VARCHAR(32) DEFAULT 'regulation'")
                 _add_column_if_missing(cur, "knowledge_docs", "case_id", "BIGINT DEFAULT NULL COMMENT '关联 project_cases.id，仅 category=project_case 时有值'")
+                _add_column_if_missing(cur, "quiz_bank_ingest_jobs", "set_id", "BIGINT DEFAULT NULL COMMENT 'AI 录题生成的套题 id（draft）'")
                 _add_column_if_missing(cur, "app_settings", "cursor_verify_ssl", "TINYINT(1) DEFAULT 1")
                 _add_column_if_missing(cur, "app_settings", "cursor_trust_env", "TINYINT(1) DEFAULT 1")
                 _add_column_if_missing(cur, "app_settings", "deepseek_api_key", "VARCHAR(1024) DEFAULT ''")

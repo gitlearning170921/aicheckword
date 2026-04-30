@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     # 侧栏「按服务提供方」独立保存的模型等（JSON 字符串，键为 provider）；与全局 llm_model 等双写，切换提供方时各自恢复。
     provider_sidebar_presets: str = "{}"
 
+    # ─── 刷题/题库专用 AI（可在系统配置页单独设置；空=跟随全局 provider/llm_model）───
+    quiz_provider: str = ""  # 例：ollama/openai/deepseek/lingyi/tongyi；空表示跟随 provider
+    quiz_llm_model: str = ""  # 空表示跟随 llm_model
+    quiz_temperature: float = 0.2
+
     # 向量库与分块
     # 本地模式：数据在 chroma_persist_dir。多机共享：在一台机器上部署 Chroma Server，各客户端填写 chroma_server_host（非空则走 HTTP，忽略本地目录作为存储位置）。
     chroma_persist_dir: str = "./knowledge_store"

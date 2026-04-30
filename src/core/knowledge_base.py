@@ -150,8 +150,13 @@ def _create_embeddings():
         from langchain_ollama import OllamaEmbeddings
         from config.cursor_overrides import get_llm_verify_ssl, get_llm_trust_env
         client_kwargs = {"verify": get_llm_verify_ssl(), "trust_env": get_llm_trust_env()}
+        # 防御：Ollama embedding_model 若误填 OpenAI 的 text-embedding-* 会导致 404（提示 pull it first）。
+        # 这里自动回退到本项目默认 embedding（避免 quiz/检索链路直接 500）。
+        emb_model = (settings.embedding_model or "").strip() or "nomic-embed-text"
+        if emb_model.lower().startswith("text-embedding-"):
+            emb_model = "nomic-embed-text"
         return OllamaEmbeddings(
-            model=settings.embedding_model,
+            model=emb_model,
             base_url=settings.ollama_base_url,
             client_kwargs=client_kwargs,
         )

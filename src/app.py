@@ -256,7 +256,7 @@ from src.core.report_export import (
     report_todo_to_docx,
     report_todo_to_excel,
 )
-from src.core.draft_export import export_like_base
+from src.core.draft_export import export_like_base, sniff_word_processing_suffix
 from src.streamlit_compat import streamlit_divider, streamlit_rerun
 from src.system_config_ui import render_system_config_page
 
@@ -431,6 +431,25 @@ def _invalidate_operation_logs_cache() -> None:
 @_make_ttl_cache(ttl_sec=12)
 def _cached_list_projects(collection: str):
     return list_projects(collection)
+
+
+def _project_option_label(p: dict) -> str:
+    """项目下拉展示：名称 + 主键 ID（+ 项目编号），便于区分库中多条同名项目。"""
+    try:
+        nm = str((p or {}).get("name") or "").strip() or "未命名"
+    except Exception:
+        nm = "未命名"
+    try:
+        pid = int((p or {}).get("id") or 0)
+    except Exception:
+        pid = 0
+    pc = ""
+    try:
+        pc = str((p or {}).get("project_code") or "").strip()
+    except Exception:
+        pc = ""
+    suf = f" · {pc}" if pc else ""
+    return f"{nm} (ID:{pid}){suf}"
 
 
 @_make_ttl_cache(ttl_sec=12)
@@ -3826,9 +3845,15 @@ def render_step3_page():
             dims = _cached_dimension_options()
             countries = dims.get("registration_countries", ["中国", "美国", "欧盟"]) or ["中国", "美国", "欧盟"]
             forms = dims.get("project_forms", ["Web", "APP", "PC"]) or ["Web", "APP", "PC"]
-            proj_names = [p["name"] for p in projects]
-            selected_name = st.selectbox("选择项目", proj_names, key="review_proj_name")
-            proj = next((p for p in projects if p["name"] == selected_name), None)
+            _proj_lab = [_project_option_label(p) for p in projects]
+            _pj_i = st.selectbox(
+                "选择项目",
+                options=list(range(len(projects))),
+                format_func=lambda i: _proj_lab[int(i)],
+                key="review_proj_idx",
+                help="同名出现多行表示数据库中有多条「名称相同」的项目记录，请按 ID 选择正确的一条。",
+            )
+            proj = projects[int(_pj_i)] if projects else None
             if proj:
                 project_id = proj["id"]
                 st.caption("审核维度（可多选、可临时修改，用于识别适用的法规/程序/项目案例）")
@@ -3848,7 +3873,7 @@ def render_step3_page():
                     "registration_type": sel_types or [_type or ""],
                     "registration_component": sel_components or [_comp or ""],
                     "project_form": sel_forms or [_form or ""],
-                    "_project_name": selected_name,
+                    "_project_name": (proj.get("name") or ""),
                     "_product_name": proj.get("product_name") or "",
                     "_model": proj.get("model") or "",
                     "_model_en": proj.get("model_en") or "",
@@ -8439,21 +8464,57 @@ def render_draft_page():
             if isinstance(_otm_pv, dict):
                 for _dk, _dv in _otm_pv.items():
                     _ds = str(_dv or "").strip()
-                    if not _ds.lower().endswith(".postaudit_preview.txt"):
+                    if not _ds:
                         continue
+                    _kk = str(_dk or "").strip() or Path(_ds).stem
+                    _lower = _ds.lower()
                     try:
                         _pr = _resolve_draft_artifact_path(_ds)
-                        if _pr.is_file():
+                        if not _pr.is_file():
+                            continue
+                        if _lower.endswith(".postaudit_preview.txt"):
                             _disk_txt = _pr.read_text(encoding="utf-8", errors="replace")
-                            _kk = str(_dk or "").strip() or Path(_ds).stem
                             _old = _pv_map.get(_kk) or ""
                             if len(_disk_txt) > len(_old):
                                 _pv_map[_kk] = _disk_txt
+                        elif _lower.endswith(".docx") and not (_pv_map.get(_kk) or "").strip():
+                            # 旧记录未存 postaudit_preview_text_by_target：尽量从落盘 docx 抽正文作预览
+                            _docs = load_single_file(str(_pr))
+                            _ex = "\n\n".join(
+                                (d.page_content or "").strip()
+                                for d in (_docs or [])
+                                if (getattr(d, "page_content", None) or "").strip()
+                            ).strip()
+                            if _ex:
+                                _pv_map[_kk] = _ex[:25000]
                     except Exception:
                         pass
+            for _of in out_files or []:
+                if not isinstance(_of, str):
+                    continue
+                _os = str(_of).strip()
+                if not _os.lower().endswith(".docx"):
+                    continue
+                _kk2 = Path(_os).name
+                if (_pv_map.get(_kk2) or "").strip():
+                    continue
+                try:
+                    _pr2 = _resolve_draft_artifact_path(_os)
+                    if not _pr2.is_file():
+                        continue
+                    _docs2 = load_single_file(str(_pr2))
+                    _ex2 = "\n\n".join(
+                        (d.page_content or "").strip()
+                        for d in (_docs2 or [])
+                        if (getattr(d, "page_content", None) or "").strip()
+                    ).strip()
+                    if _ex2:
+                        _pv_map[_kk2] = _ex2[:25000]
+                except Exception:
+                    pass
             _pv_keys = [str(k) for k in _pv_map.keys() if str(k).strip()]
             if _pv_keys:
-                st.markdown("##### 生成文本预览（历史内嵌，刷新后仍可查看）")
+                st.markdown("##### 生成文本预览（库内摘要或从落盘文件恢复）")
                 _pv_i = st.selectbox(
                     "预览目标文件",
                     options=list(range(len(_pv_keys))),
@@ -9221,10 +9282,14 @@ def render_draft_page():
                 with tempfile.TemporaryDirectory(prefix="aicheckword_postaudit_") as td:
                     td_path = Path(td)
                     existing_base_files = {}
-                    for fn, (_orig_name, uf) in base_pick_for_target.items():
-                        p = td_path / fn
+                    for tgt_fn, (_upload_display_name, uf) in base_pick_for_target.items():
+                        # 必须以用户上传文件名为准落盘：审核「目标文件名」常为 *.doc，
+                        # 而实际上传可能是 *.docx；若用 tgt_fn 写入会误判后缀，
+                        # 导出会走错分支并产生 *.doc.txt 等怪异扩展名。
+                        _disk_bn = str(_upload_display_name or "").strip() or str(tgt_fn).strip()
+                        p = td_path / _disk_bn
                         p.write_bytes(uf.getvalue())
-                        existing_base_files[fn] = str(p)
+                        existing_base_files[tgt_fn] = str(p)
                     input_files = []
                     for uf in (ref_uploads or []):
                         n = str(getattr(uf, "name", "") or "").strip() or f"ref_{uuid.uuid4().hex[:8]}.txt"
@@ -9308,7 +9373,8 @@ def render_draft_page():
                         base_path = existing_base_files.get(fn)
                         patch_json = (getattr(res, "generated_patches", {}) or {}).get(fn) if inplace_mode else None
                         if base_path and inplace_mode and (patch_json or "").strip():
-                            base_suffix = Path(base_path).suffix.lower()
+                            # 审核点目标常为 *.doc，上传实为 OOXML（*.docx 内容）时按 docx 分支导出，避免误走 txt 降级
+                            base_suffix = sniff_word_processing_suffix(base_path).lower()
                             out_name = Path(fn).stem + (base_suffix or Path(fn).suffix or ".docx")
                             drafts_dir = settings.uploads_path / "draft_outputs"
                             drafts_dir.mkdir(parents=True, exist_ok=True)
@@ -9354,7 +9420,13 @@ def render_draft_page():
                                     meta=meta_pa,
                                 )
                             else:
-                                saved = export_like_base(base_path=base_path, out_path=str(out_path), generated_text=txt)
+                                saved = export_like_base(
+                                    base_file_path=base_path,
+                                    out_path=str(out_path),
+                                    title=str(fn),
+                                    content_text=str(txt or ""),
+                                    meta=meta_pa,
+                                )
                             patch_report_obj = report_obj_patch
                             if saved and inplace_mode and base_suffix == ".docx" and (patch_json or "").strip():
                                 patch_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.json")
@@ -9485,7 +9557,8 @@ def render_draft_page():
                             try:
                                 drafts_dir = settings.uploads_path / "draft_outputs"
                                 drafts_dir.mkdir(parents=True, exist_ok=True)
-                                _stem = Path(str(fn or "output")).name or "output"
+                                # 用 stem 避免「目标名含 .doc」时落盘成 *.doc.postaudit_preview.txt，下载易被误认为 Word
+                                _stem = Path(str(fn or "output")).stem or "output"
                                 _stem = re.sub(r'[<>:"/\\\\|?*]', "_", _stem).strip() or "output"
                                 _txt_name = f"{out_prefix}_{_stem}.postaudit_preview.txt"
                                 _txt_path = drafts_dir / _txt_name
@@ -10097,9 +10170,15 @@ def render_draft_page():
         if not projects:
             st.warning("当前知识库下暂无项目，请先在「② 项目与专属资料」创建项目，或切换为「新建项目」。")
         else:
-            proj_names = [p["name"] for p in projects]
-            sel_name = st.selectbox("选择已有项目", proj_names, key="draft_existing_proj_name")
-            selected_project = next((p for p in projects if p.get("name") == sel_name), None)
+            _draft_proj_lab = [_project_option_label(p) for p in projects]
+            _dj_i = st.selectbox(
+                "选择已有项目",
+                options=list(range(len(projects))),
+                format_func=lambda i: _draft_proj_lab[int(i)],
+                key="draft_existing_proj_idx",
+                help="下拉中「同名多行」＝库里有多条同名项目，请按 ID 区分；非本页重复新建。",
+            )
+            selected_project = projects[int(_dj_i)] if projects else None
             if selected_project:
                 selected_project_id = int(selected_project["id"])
     st.caption("项目字段与「② 项目与专属资料」一致；本处可临时修改用于本次生成。")
@@ -10499,7 +10578,7 @@ def render_draft_page():
 
                 base_path = existing_base_files_regen.get(fn) if isinstance(existing_base_files_regen, dict) else None
                 if base_path:
-                    base_suffix = Path(base_path).suffix.lower()
+                    base_suffix = sniff_word_processing_suffix(base_path).lower()
                     # 输出文件后缀必须与基础文件一致（Excel Base 就导出 Excel；避免 .xlsx.docx 这类错误）
                     out_name = fn
                     if base_suffix:
@@ -10645,7 +10724,7 @@ def render_draft_page():
                 else:
                     drafts_dir = settings.uploads_path / "draft_outputs"
                     drafts_dir.mkdir(parents=True, exist_ok=True)
-                    txt_path = drafts_dir / f"{out_prefix}_{fn}.draft.txt"
+                    txt_path = drafts_dir / f"{out_prefix}_{Path(str(fn)).stem}.draft.txt"
                     txt_path.write_text(txt or "", encoding="utf-8")
                     out_files_for_log.append(str(txt_path))
                     out_files_by_target[fn] = str(txt_path)
@@ -10948,7 +11027,7 @@ def render_draft_page():
                     if not base_path and isinstance(existing_base_files, dict):
                         base_path = existing_base_files.get(fn)
                     if base_path:
-                        base_suffix = Path(base_path).suffix.lower()
+                        base_suffix = sniff_word_processing_suffix(base_path).lower()
                         # 输出文件后缀必须与基础文件一致（Excel Base 就导出 Excel；避免 .xlsx.docx 这类错误）
                         out_name = fn
                         if base_suffix:
@@ -11130,7 +11209,7 @@ def render_draft_page():
                         # 非 Base：也落盘 txt，便于历史记录可见/可下载
                         drafts_dir = settings.uploads_path / "draft_outputs"
                         drafts_dir.mkdir(parents=True, exist_ok=True)
-                        txt_path = drafts_dir / f"{res.project_case_id}_{fn}.draft.txt"
+                        txt_path = drafts_dir / f"{res.project_case_id}_{Path(str(fn)).stem}.draft.txt"
                         txt_path.write_text(txt or "", encoding="utf-8")
                         out_files_for_log.append(str(txt_path))
                         out_files_by_target[fn] = str(txt_path)
@@ -11645,14 +11724,15 @@ def render_translation_page():
             dims = _cached_dimension_options()
             countries = dims.get("registration_countries", ["中国", "美国", "欧盟"]) or ["中国", "美国", "欧盟"]
             forms = dims.get("project_forms", ["Web", "APP", "PC"]) or ["Web", "APP", "PC"]
-            proj_names = [p["name"] for p in projects]
-            selected_name = st.selectbox(
+            _tr_proj_lab = [_project_option_label(p) for p in projects]
+            _tr_i = st.selectbox(
                 "选择翻译所属项目",
-                proj_names,
-                key="translation_proj_name",
-                help="与第三步「按项目审核」使用同一项目列表；检索词条/法规/案例时会带上项目与产品信息。",
+                options=list(range(len(projects))),
+                format_func=lambda i: _tr_proj_lab[int(i)],
+                key="translation_proj_idx",
+                help="与第三步「按项目审核」使用同一项目列表；同名请按 ID 区分。检索时会带上所选项目的产品与注册维度。",
             )
-            proj = next((p for p in projects if p["name"] == selected_name), None)
+            proj = projects[int(_tr_i)] if projects else None
             if proj:
                 trans_project_id = proj.get("id")
                 _country = proj.get("registration_country")

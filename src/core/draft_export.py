@@ -18,6 +18,7 @@ import random
 import re
 import shutil
 import tempfile
+import uuid
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
@@ -1980,6 +1981,46 @@ def _docx_append_revision_row(doc, meta: Dict, *, track_changes: bool = True) ->
         return False
 
 
+def sniff_word_processing_suffix(path: str | Path) -> str:
+    """用于分支判断的 Word 后缀：.doc/.dot 若实为 OOXML（zip），按 .docx 处理；.docm 等走 OOXML 分支。"""
+    p = Path(path)
+    suf = p.suffix.lower()
+    if suf in (".docx", ".docm", ".dotx", ".dotm"):
+        return ".docx"
+    if suf in (".doc", ".dot"):
+        try:
+            with open(p, "rb") as _bf:
+                if _bf.read(4) == b"PK\x03\x04":
+                    return ".docx"
+        except Exception:
+            pass
+    return suf
+
+
+def normalize_flat_txt_output_path(out: Path) -> Path:
+    """
+    将「纯文本降级输出」落盘路径规范为单一「.txt」扩展名。
+
+    若误将 out_path 拼成「xxx.doc.txt」，pathlib 的 with_suffix('.txt') 不会改变路径
+    （因为最后一个 suffix 已是 .txt），会写出畸形的 *.doc.txt 文件。
+    此处反复剥掉 stem 末尾的 Office 类扩展名，直到得到稳定主名后再加 .txt。
+    """
+    parent = out.parent
+    stem = out.stem
+    while True:
+        s = (stem or "").lower()
+        hit = False
+        for ext in (".docm", ".dotm", ".docx", ".dotx", ".doc", ".dot", ".rtf", ".wps"):
+            if s.endswith(ext):
+                stem = Path(stem).stem
+                hit = True
+                break
+        if not hit:
+            break
+    safe = (stem or "output").strip() or "output"
+    return parent / f"{safe}.txt"
+
+
 def export_like_base(
     *,
     base_file_path: str,
@@ -1994,8 +2035,10 @@ def export_like_base(
     """
     meta = meta or {}
     base = Path(base_file_path)
-    suffix = base.suffix.lower()
+    suffix = sniff_word_processing_suffix(base)
     out = Path(out_path)
+    if suffix == ".docx" and out.suffix.lower() not in (".docx", ".docm", ".dotx", ".dotm"):
+        out = out.with_suffix(".docx")
     out.parent.mkdir(parents=True, exist_ok=True)
     rows, version_tag = _rev_table_rows(meta)
 
@@ -2062,8 +2105,9 @@ def export_like_base(
         sidecar.write_text((content_text or ""), encoding="utf-8")
         return str(out)
 
-    # 其他格式：降级为 txt（仍保证可下载）
-    out_txt = out.with_suffix(out.suffix + ".txt") if out.suffix else out.with_suffix(".txt")
+    # 其他格式：降级为 txt（仍保证可下载）。
+    # 注意：不可用 out.suffix+".txt"；且当 out 误为「xxx.doc.txt」时 with_suffix('.txt') 无效，须 normalize。
+    out_txt = normalize_flat_txt_output_path(out)
     out_txt.write_text((content_text or ""), encoding="utf-8")
     return str(out_txt)
 
@@ -2087,11 +2131,50 @@ def export_docx_inplace_patch(
     meta = meta or {}
     base = Path(base_file_path)
     out = Path(out_path)
+    if sniff_word_processing_suffix(base) == ".docx" and out.suffix.lower() not in (
+        ".docx",
+        ".docm",
+        ".dotx",
+        ".dotm",
+    ):
+        out = out.with_suffix(".docx")
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    eff_base = base
+    conv_tmp: Optional[Path] = None
+    _sk_base = sniff_word_processing_suffix(base)
+    if _sk_base != ".docx" and base.suffix.lower() in (".doc", ".dot"):
+        conv_tmp = out.parent / f"_aicw_legacy_{uuid.uuid4().hex}.docx"
+        from src.core.word_legacy_convert import convert_binary_word_to_docx
+
+        _ok, _msg = convert_binary_word_to_docx(
+            src_path=str(base.resolve()),
+            dst_path=str(conv_tmp.resolve()),
+        )
+        if not (_ok and conv_tmp.is_file()):
+            report: Dict[str, Any] = {"applied": [], "skipped": [], "errors": [], "changes": []}
+            report["errors"].append(
+                {"error": (_msg or "二进制 Word 需先转为 docx 才能就地修改：转换失败").strip()}
+            )
+            if conv_tmp.is_file():
+                try:
+                    conv_tmp.unlink()
+                except OSError:
+                    pass
+            return str(out), report
+        eff_base = conv_tmp
 
     from docx import Document
 
-    shutil.copyfile(str(base), str(out))
+    try:
+        shutil.copyfile(str(eff_base), str(out))
+    finally:
+        if conv_tmp is not None and conv_tmp.is_file() and conv_tmp.resolve() == eff_base.resolve():
+            try:
+                conv_tmp.unlink()
+            except OSError:
+                pass
+
     doc = Document(str(out))
     if track_changes:
         _enable_track_revisions(doc)

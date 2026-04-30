@@ -44,5 +44,9 @@ streamlit run src/app.py
 |------|------|
 | `start.bat` | 启动 Web UI（本机访问，推荐用 localhost:8501） |
 | `start-lan.bat` | 启动 Web UI（局域网可访问；本机仍用 localhost:8501 打开） |
+| `restart_api.bat` | 重启 API 服务（会杀占用端口的进程；默认端口 8000） |
+| `start_all.bat` | 同时启动 Web + API（分别在窗口中运行） |
+| `restart_all.bat` | 同时重启 Web + API |
 | `stop.bat` | 停止运行中的服务（端口 8501/8000） |
+| `stop_api.bat` | 仅停止 API 服务（默认端口 8000；不影响 Web UI） |
 | `restart.bat` | 先停止再在新窗口启动 |

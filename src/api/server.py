@@ -1,11 +1,20 @@
 """FastAPI 服务：将 Agent 能力暴露为 REST API，供其他项目调用"""
 
 import sys
+import os
+import logging
 from pathlib import Path
 
 _root = Path(__file__).resolve().parent.parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
+
+# Disable Chroma/PostHog telemetry early (avoid noisy errors on some envs)
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+os.environ["CHROMA_TELEMETRY"] = "False"
+os.environ["POSTHOG_DISABLED"] = "true"
+logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
+logging.getLogger("chromadb").setLevel(logging.WARNING)
 
 import tempfile
 from typing import Any, Dict, List, Optional
@@ -20,7 +29,7 @@ from fastapi.openapi.docs import (
     swagger_ui_default_parameters,
 )
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from config import settings
 from src.core.agent import ReviewAgent
@@ -28,7 +37,13 @@ from src.core.db import (
     get_dimension_options,
     REGISTRATION_TYPES,
     REGISTRATION_COMPONENTS,
+    list_projects,
+    list_project_cases,
 )
+from config.runtime_settings import apply_runtime_config_dict, sync_cursor_overrides_from_settings
+from src.core.db import load_app_settings
+from src.core.quiz import service as quiz_service
+from src.core.quiz.models import EXAM_TRACKS
 
 app = FastAPI(
     title="注册文档审核 Agent API",
@@ -47,6 +62,78 @@ app.add_middleware(
 )
 
 _agents: Dict[str, ReviewAgent] = {}
+
+
+def _configure_api_service_console_timestamps() -> None:
+    """为 uvicorn 控制台日志增加本地时间（兼容 `python -m uvicorn ...` 等未传 log_config 的启动方式）。"""
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    try:
+        from uvicorn.logging import AccessFormatter, DefaultFormatter
+
+        default_fmt = DefaultFormatter(
+            fmt="%(asctime)s | %(levelprefix)s %(message)s",
+            datefmt=datefmt,
+            use_colors=None,
+        )
+        access_fmt = AccessFormatter(
+            fmt='%(asctime)s | %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+            datefmt=datefmt,
+            use_colors=None,
+        )
+    except Exception:
+        default_fmt = access_fmt = logging.Formatter(
+            "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt=datefmt,
+        )
+    for h in logging.getLogger("uvicorn.access").handlers:
+        h.setFormatter(access_fmt)
+    for name in ("uvicorn.error", "uvicorn"):
+        for h in logging.getLogger(name).handlers:
+            h.setFormatter(default_fmt)
+
+
+def _build_uvicorn_log_config_with_time() -> dict:
+    """供 `start_server()` 传入 uvicorn：在默认格式前增加 asctime。"""
+    import copy
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    cfg = copy.deepcopy(LOGGING_CONFIG)
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    for key in ("default", "access"):
+        spec = cfg.get("formatters", {}).get(key)
+        if isinstance(spec, dict):
+            prev = str(spec.get("fmt") or "")
+            if "%(asctime)s" not in prev:
+                spec["fmt"] = "%(asctime)s | " + prev
+            spec["datefmt"] = datefmt
+    return cfg
+
+
+@app.on_event("startup")
+def _load_runtime_settings_from_db_on_startup() -> None:
+    """
+    API 服务启动时从数据库恢复 runtime_settings_json（与 Streamlit Web UI 一致）。
+    否则系统配置页保存的 quiz_provider/quiz_llm_model 等不会影响 /quiz/* 调用。
+    """
+    _configure_api_service_console_timestamps()
+    try:
+        db_conf = load_app_settings()
+        if not db_conf:
+            return
+        raw_json = db_conf.get("runtime_settings_json")
+        if not raw_json:
+            return
+        try:
+            parsed = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+        except Exception:
+            return
+        if isinstance(parsed, dict) and parsed:
+            apply_runtime_config_dict(parsed)
+            sync_cursor_overrides_from_settings()
+    except Exception:
+        # 启动阶段不阻断 API；保持 .env 默认配置继续运行
+        return
 
 # Swagger UI 静态资源：多 CDN 回退（unpkg/jsdelivr 在部分网络下不可达会导致 /docs 空白）
 _SWAGGER_UI_CSS_URLS = [
@@ -96,6 +183,13 @@ def _swagger_ui_html_with_cdn_fallback(
     <div id="swagger-ui"></div>
     <script>
     (function () {{
+        // Polyfill for older browser engines (e.g., old Chromium/WebView)
+        // Swagger UI 5.x may call Object.hasOwn which doesn't exist everywhere.
+        if (typeof Object.hasOwn !== "function") {{
+            Object.hasOwn = function (obj, prop) {{
+                return Object.prototype.hasOwnProperty.call(obj, prop);
+            }};
+        }}
         function loadCss(urls, idx) {{
             if (idx >= urls.length) return;
             var l = document.createElement("link");
@@ -189,12 +283,114 @@ class KnowledgeQueryRequest(BaseModel):
     model: Optional[str] = None
     model_en: Optional[str] = None
     registration_country_en: Optional[str] = None
+    # 项目案例维度（可选；用于前端下拉）
+    case_name: Optional[str] = None
+    case_country: Optional[str] = None
+    case_type: Optional[str] = None
     # 仍保留 collection 供多租户场景，不对外强调
     collection: str = "regulations"
 
 
 class CollectionRequest(BaseModel):
     collection: str = "regulations"
+
+
+class QuizGenerateSetRequest(BaseModel):
+    collection: str = "regulations"
+    exam_track: str = "cn"
+    title: str = ""
+    category: str = ""
+    difficulty: str = "medium"
+    question_type: str = "single_choice"
+    question_count: int = 20
+    created_by: str = "system"
+
+
+class QuizPracticeSetRequest(BaseModel):
+    collection: str = "regulations"
+    exam_track: str = "cn"
+    category: str = ""
+    difficulty: str = "medium"
+    question_type: str = "single_choice"
+    question_count: int = 20
+    user_id: str = ""
+
+
+class QuizIngestByAIRequest(BaseModel):
+    collection: str = "regulations"
+    exam_track: str = "cn"
+    target_count: int = 50
+    review_mode: str = "auto_apply"
+    category: str = ""
+    difficulty: str = "medium"
+    question_type: str = "single_choice"
+    created_by: str = "system"
+    set_title: str = ""
+
+
+class QuizIngestJobSetIdRequest(BaseModel):
+    set_id: int
+
+
+class QuizBankQuestionPatchRequest(BaseModel):
+    # quiz_questions 可编辑字段
+    stem: Optional[str] = None
+    options: Optional[List[str]] = None
+    # Pydantic 无法区分 answer=None 与未传，因此用 answer_present 显式声明是否更新
+    answer_present: bool = False
+    answer: Any = None
+    explanation: Optional[str] = None
+    evidence: Optional[List[Dict[str, Any]]] = None
+    status: Optional[str] = None  # active / inactive
+    # quiz_question_bank 可编辑字段（对该 question_id 在本 collection 下的所有 bank 行生效）
+    exam_track: Optional[str] = None
+    category: Optional[str] = None
+    question_type: Optional[str] = None
+    difficulty: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class QuizAttemptStartRequest(BaseModel):
+    collection: str = "regulations"
+    user_id: str = ""
+    mode: str = "practice"
+
+
+class QuizSubmitAnswersRequest(BaseModel):
+    """考试交卷 submit；collection 可由调用方传入，省略则从 attempt 行读取。"""
+    model_config = ConfigDict(extra="ignore")
+    answers: List[Dict[str, Any]] = Field(default_factory=list)
+    collection: Optional[str] = None
+
+
+class QuizPracticeSubmitRequest(BaseModel):
+    """练习提交：attempt_id 放在 JSON body（与 aiword 一致）；也兼容 camelCase attemptId。"""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    collection: str = "regulations"
+    user_id: str = Field(default="", alias="userId")
+    set_id: Optional[int] = Field(default=None, ge=1, alias="setId")
+    attempt_id: Optional[int] = Field(default=None, ge=1, alias="attemptId")
+    answers: List[Dict[str, Any]] = Field(default_factory=list)
+
+    @field_validator("set_id", "attempt_id", mode="before")
+    @classmethod
+    def _blank_str_to_none(cls, v: Any) -> Any:
+        # 兼容上游/前端传空串："" 不应触发 int_parsing，应按未传处理
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+
+class QuizUpsertGradingRuleRequest(BaseModel):
+    collection: str = "regulations"
+    paper_id: Optional[int] = None
+    question_id: int
+    answer_key: Any
+    rubric: Optional[Dict[str, Any]] = None
+    updated_by: str = "system"
 
 
 def _merge_review_context(
@@ -214,6 +410,12 @@ def _merge_review_context(
 @app.get("/")
 def root():
     return {"service": "注册文档审核 Agent", "version": "1.0.0", "status": "running"}
+
+
+@app.get("/health")
+def health():
+    """兼容上游健康检查：aiword 默认探测 /health。"""
+    return {"status": "ok", "service": "aicheckword"}
 
 
 @app.get("/docs", include_in_schema=False)
@@ -422,6 +624,9 @@ def search_knowledge(request: KnowledgeQueryRequest):
         request.registration_component,
         request.project_form,
         request.document_language,
+        request.case_name,
+        request.case_country,
+        request.case_type,
     ):
         if isinstance(x, str) and x.strip():
             extra_terms.append(x.strip())
@@ -479,6 +684,12 @@ def search_knowledge(request: KnowledgeQueryRequest):
             checks.append(_eq(meta.get("model"), request.model))
         if meta.get("model_en") is not None and request.model_en:
             checks.append(_eq(meta.get("model_en"), request.model_en))
+        if meta.get("case_name") is not None and request.case_name:
+            checks.append(_eq(meta.get("case_name"), request.case_name))
+        if meta.get("case_country") is not None and request.case_country:
+            checks.append(_eq(meta.get("case_country"), request.case_country))
+        if meta.get("case_type") is not None and request.case_type:
+            checks.append(_eq(meta.get("case_type"), request.case_type))
         if all(checks) if checks else True:
             filtered.append(r)
 
@@ -496,6 +707,9 @@ def search_knowledge(request: KnowledgeQueryRequest):
             "product_name_en": request.product_name_en,
             "model": request.model,
             "model_en": request.model_en,
+            "case_name": request.case_name,
+            "case_country": request.case_country,
+            "case_type": request.case_type,
         },
         "results": filtered,
         "total": len(filtered),
@@ -503,11 +717,103 @@ def search_knowledge(request: KnowledgeQueryRequest):
 
 
 @app.get("/knowledge/search/options")
-def knowledge_search_options():
+def knowledge_search_options(collection: str = Query("regulations", description="知识库名称")):
     """返回查询参数可选值（与页面一致）"""
+    def _uniq(values: List[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for v in values or []:
+            s = str(v or "").strip()
+            if not s:
+                continue
+            k = s.casefold()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(s)
+        return out
+
     dims = get_dimension_options()
-    reg_country = dims.get("registration_countries") or ["中国", "美国", "欧盟"]
-    project_forms = dims.get("project_forms") or ["Web", "APP", "PC"]
+    reg_country = _uniq(dims.get("registration_countries") or ["中国", "美国", "欧盟"])
+    project_forms = _uniq(dims.get("project_forms") or ["Web", "APP", "PC"])
+    project_name_opts: List[str] = []
+    project_name_en_opts: List[str] = []
+    product_name_opts: List[str] = []
+    product_name_en_opts: List[str] = []
+    model_opts: List[str] = []
+    model_en_opts: List[str] = []
+    project_list: List[Dict[str, str]] = []
+    try:
+        _proj_seen = set()
+        for p in list_projects(collection) or []:
+            if not isinstance(p, dict):
+                continue
+            name = str(p.get("name") or "").strip()
+            name_en = str(p.get("name_en") or "").strip()
+            product = str(p.get("product_name") or "").strip()
+            product_en = str(p.get("product_name_en") or "").strip()
+            model = str(p.get("model") or "").strip()
+            model_en = str(p.get("model_en") or "").strip()
+            p_country = str(p.get("registration_country") or "").strip()
+            p_type = str(p.get("registration_type") or "").strip()
+            p_component = str(p.get("registration_component") or "").strip()
+            p_form = str(p.get("project_form") or "").strip()
+
+            project_name_opts.append(name)
+            project_name_en_opts.append(name_en)
+            product_name_opts.append(product)
+            product_name_en_opts.append(product_en)
+            model_opts.append(model)
+            model_en_opts.append(model_en)
+
+            sk = (
+                name.casefold(),
+                p_country.casefold(),
+                p_type.casefold(),
+                p_component.casefold(),
+                p_form.casefold(),
+            )
+            if any(sk) and sk not in _proj_seen:
+                _proj_seen.add(sk)
+                project_list.append(
+                    {
+                        "project_name": name,
+                        "project_name_en": name_en,
+                        "product_name": product,
+                        "product_name_en": product_en,
+                        "model": model,
+                        "model_en": model_en,
+                        "registration_country": p_country,
+                        "registration_type": p_type,
+                        "registration_component": p_component,
+                        "project_form": p_form,
+                    }
+                )
+    except Exception:
+        pass
+    project_name_opts = _uniq(project_name_opts)
+    project_name_en_opts = _uniq(project_name_en_opts)
+    product_name_opts = _uniq(product_name_opts)
+    product_name_en_opts = _uniq(product_name_en_opts)
+    model_opts = _uniq(model_opts)
+    model_en_opts = _uniq(model_en_opts)
+
+    case_name_opts: List[str] = []
+    case_country_opts: List[str] = []
+    case_type_opts: List[str] = []
+    try:
+        for c in list_project_cases(collection) or []:
+            if not isinstance(c, dict):
+                continue
+            case_name_opts.append(str(c.get("case_name") or ""))
+            case_country_opts.append(str(c.get("registration_country") or ""))
+            case_type_opts.append(str(c.get("registration_type") or ""))
+    except Exception:
+        # 选项接口应尽量可用：案例读取失败时只返回基础维度
+        pass
+    case_name_opts = _uniq(case_name_opts)
+    case_country_opts = _uniq(case_country_opts)
+    case_type_opts = _uniq(case_type_opts)
     return {
         # 兼容旧调用：仍保留顶层键
         "registration_country": reg_country,
@@ -515,12 +821,22 @@ def knowledge_search_options():
         "registration_component": REGISTRATION_COMPONENTS,
         "project_form": project_forms,
         "document_language": ["zh", "en", "both"],
+        "project_list": project_list,
+        "project_name_options": project_name_opts,
+        "project_name_en_options": project_name_en_opts,
+        "product_name_options": product_name_opts,
+        "product_name_en_options": product_name_en_opts,
+        "model_options": model_opts,
+        "model_en_options": model_en_opts,
         "project_name": {"type": "string", "required": False, "description": "可选，自由文本"},
         "project_name_en": {"type": "string", "required": False, "description": "可选，自由文本"},
         "product_name": {"type": "string", "required": False, "description": "可选，自由文本"},
         "product_name_en": {"type": "string", "required": False, "description": "可选，自由文本"},
         "model": {"type": "string", "required": False, "description": "可选，自由文本"},
         "model_en": {"type": "string", "required": False, "description": "可选，自由文本"},
+        "case_name": case_name_opts,
+        "case_country": case_country_opts,
+        "case_type": case_type_opts,
         # 推荐新调用：统一字段定义，一次取全参数规则
         "fields": {
             "query": {"type": "string", "required": True, "description": "自由文本检索词"},
@@ -529,12 +845,15 @@ def knowledge_search_options():
             "registration_component": {"type": "enum", "required": True, "options": REGISTRATION_COMPONENTS},
             "project_form": {"type": "enum", "required": True, "options": project_forms},
             "document_language": {"type": "enum", "required": True, "options": ["zh", "en", "both"]},
-            "project_name": {"type": "string", "required": False},
-            "project_name_en": {"type": "string", "required": False},
-            "product_name": {"type": "string", "required": False},
-            "product_name_en": {"type": "string", "required": False},
-            "model": {"type": "string", "required": False},
-            "model_en": {"type": "string", "required": False},
+            "project_name": {"type": "enum", "required": False, "options": project_name_opts},
+            "project_name_en": {"type": "enum", "required": False, "options": project_name_en_opts},
+            "product_name": {"type": "enum", "required": False, "options": product_name_opts},
+            "product_name_en": {"type": "enum", "required": False, "options": product_name_en_opts},
+            "model": {"type": "enum", "required": False, "options": model_opts},
+            "model_en": {"type": "enum", "required": False, "options": model_en_opts},
+            "case_name": {"type": "enum", "required": False, "options": case_name_opts},
+            "case_country": {"type": "enum", "required": False, "options": case_country_opts},
+            "case_type": {"type": "enum", "required": False, "options": case_type_opts},
         },
     }
 
@@ -543,6 +862,457 @@ def knowledge_search_options():
 def clear_knowledge(request: CollectionRequest):
     agent = get_agent(request.collection)
     return agent.clear_knowledge()
+
+
+@app.post("/quiz/sets/generate")
+def quiz_generate_set(request: QuizGenerateSetRequest):
+    if request.exam_track not in EXAM_TRACKS:
+        raise HTTPException(status_code=400, detail=f"exam_track 不支持: {request.exam_track}")
+    try:
+        data = quiz_service.generate_set(
+            collection=request.collection,
+            exam_track=request.exam_track,
+            set_type="exam",
+            created_by=request.created_by or "teacher",
+            title=request.title,
+            category=request.category,
+            difficulty=request.difficulty,
+            question_type=request.question_type,
+            question_count=request.question_count,
+            status="draft",
+        )
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/practice/generate-set")
+def quiz_generate_practice_set(request: QuizPracticeSetRequest):
+    if request.exam_track not in EXAM_TRACKS:
+        raise HTTPException(status_code=400, detail=f"exam_track 不支持: {request.exam_track}")
+    try:
+        data = quiz_service.generate_set(
+            collection=request.collection,
+            exam_track=request.exam_track,
+            set_type="practice",
+            created_by=request.user_id or "student",
+            title=f"{EXAM_TRACKS.get(request.exam_track)}练习套题",
+            category=request.category,
+            difficulty=request.difficulty,
+            question_type=request.question_type,
+            question_count=request.question_count,
+            status="published",
+        )
+        sid = int(data.get("id") or data.get("set_id") or 0) if isinstance(data, dict) else 0
+        if sid > 0 and isinstance(data, dict):
+            att = quiz_service.start_attempt(
+                collection=request.collection,
+                set_id=sid,
+                user_id=request.user_id or "",
+                mode="practice",
+            )
+            aid = int(att.get("attempt_id") or 0) if isinstance(att, dict) else 0
+            if aid > 0:
+                data["attempt_id"] = aid
+                data["practice_session_id"] = str(aid)
+                data["session_id"] = str(aid)
+                data["practiceSessionId"] = str(aid)
+                data["sessionId"] = str(aid)
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/bank/ingest-by-ai")
+def quiz_ingest_bank_by_ai(request: QuizIngestByAIRequest):
+    if request.exam_track not in EXAM_TRACKS:
+        raise HTTPException(status_code=400, detail=f"exam_track 不支持: {request.exam_track}")
+    try:
+        data = quiz_service.ingest_bank_by_ai(
+            collection=request.collection,
+            exam_track=request.exam_track,
+            target_count=request.target_count,
+            created_by=request.created_by,
+            review_mode=request.review_mode,
+            category=request.category,
+            difficulty=request.difficulty,
+            question_type=request.question_type,
+            set_title=request.set_title,
+        )
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/bank/ingest-jobs/{job_id}")
+def quiz_get_ingest_job(job_id: int):
+    try:
+        return {"ok": True, "data": quiz_service.get_ingest_job(job_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/bank/ingest-jobs/{job_id}/set-id")
+def quiz_set_ingest_job_set_id(job_id: int, request: QuizIngestJobSetIdRequest):
+    try:
+        return {"ok": True, "data": quiz_service.set_ingest_job_set_id(job_id, request.set_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/sets/{set_id}/publish")
+def quiz_publish_set(set_id: int):
+    try:
+        return {"ok": True, "data": quiz_service.publish_set(set_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/sets/{set_id}/review-by-ai")
+def quiz_review_set_by_ai(
+    set_id: int,
+    collection: str = Query("regulations"),
+    created_by: str = Query("system"),
+):
+    try:
+        return {"ok": True, "data": quiz_service.start_review_set_by_ai_job(collection=collection, set_id=set_id, created_by=created_by)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/sets/review-jobs/{job_id}")
+def quiz_review_job_get(job_id: int):
+    try:
+        return {"ok": True, "data": quiz_service.fetch_review_job(job_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/sets")
+def quiz_sets_list(
+    collection: str = Query("regulations"),
+    set_type: str = Query(""),
+    exam_track: str = Query(""),
+    status: str = Query(""),
+    q: str = Query(""),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        return {
+            "ok": True,
+            "data": quiz_service.list_sets(
+                collection=collection,
+                set_type=set_type,
+                exam_track=exam_track,
+                status=status,
+                q=q,
+                limit=limit,
+                offset=offset,
+            ),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/sets/{set_id}")
+def quiz_sets_get(set_id: int):
+    try:
+        return {"ok": True, "data": quiz_service.get_set(set_id=set_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/quiz/sets/{set_id}")
+def quiz_sets_delete(set_id: int):
+    try:
+        return {"ok": True, "data": quiz_service.delete_set(set_id=set_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/exams/{set_id}/start")
+def quiz_start_exam(set_id: int, request: QuizAttemptStartRequest):
+    try:
+        data = quiz_service.start_attempt(
+            collection=request.collection,
+            set_id=set_id,
+            user_id=request.user_id or "",
+            mode=request.mode or "exam",
+        )
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/practice/submit")
+def quiz_submit_practice(
+    body: QuizPracticeSubmitRequest,
+    attempt_id: Optional[int] = Query(default=None, ge=1, description="兼容旧调用：也可仅 query 传 attempt_id"),
+):
+    aid = attempt_id or body.attempt_id
+    # 兼容 aiword 仅传 set_id 的场景：自动创建一次 practice attempt，再提交答案
+    if not aid and body.set_id:
+        created = quiz_service.start_attempt(
+            collection=body.collection,
+            set_id=int(body.set_id),
+            user_id=(body.user_id or ""),
+            mode="practice",
+        )
+        aid = int((created or {}).get("attempt_id") or 0) or None
+    if not aid:
+        raise HTTPException(
+            status_code=422,
+            detail="attempt_id 必填：请放在 JSON body（attempt_id 或 attemptId）或 query 参数 attempt_id；或传 set_id 让后端自动创建练习会话",
+        )
+    try:
+        data = quiz_service.submit_answers_and_grade(
+            attempt_id=int(aid),
+            answers=body.answers or [],
+            collection=(body.collection or "").strip() or None,
+        )
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/exams/{attempt_id}/submit")
+def quiz_submit_exam(attempt_id: int, request: QuizSubmitAnswersRequest):
+    try:
+        coll = None
+        if getattr(request, "collection", None) not in (None, ""):
+            coll = str(request.collection).strip() or None
+        data = quiz_service.submit_answers_and_grade(
+            attempt_id=attempt_id,
+            answers=request.answers or [],
+            collection=coll,
+        )
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/attempts/{attempt_id}/grade-by-cache")
+def quiz_grade_by_cache(attempt_id: int, collection: str = Query("regulations"), paper_id: Optional[int] = Query(None)):
+    try:
+        data = quiz_service.grade_attempt_by_cache(collection=collection, attempt_id=attempt_id, paper_id=paper_id)
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/attempts/{attempt_id}/auto-grade")
+def quiz_auto_grade(attempt_id: int, collection: str = Query("regulations"), paper_id: Optional[int] = Query(None)):
+    try:
+        data = quiz_service.auto_grade_attempt(collection=collection, attempt_id=attempt_id, paper_id=paper_id)
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/attempts/{attempt_id}/grading-status")
+def quiz_attempt_grading_status(attempt_id: int):
+    """异步主观题阅卷进度：阅卷中 grading / 完成后 state=graded 且含总分。"""
+    try:
+        return {"ok": True, "data": quiz_service.get_attempt_grading_status(attempt_id=attempt_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/quiz/attempts/{attempt_id}/answers")
+def quiz_attempt_answers(attempt_id: int, collection: str = Query("regulations")):
+    """
+    返回 attempt 的作答明细（题干/选项/标准答案/学生答案等），用于 aiword 的考试/练习详情展示。
+
+    说明：
+    - is_correct 可能为空/不准确（若未触发自动判分）；前端可优先展示“标准答案 vs 学生答案”。
+    - collection 参数仅用于兼容未来按 collection 分库的扩展；当前实现从题库表聚合即可。
+    """
+    try:
+        _ = collection  # 预留参数，避免上层固定传参导致 422
+        return {"ok": True, "data": quiz_service.get_attempt_answers_with_questions(attempt_id=attempt_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/grading-rules/upsert")
+def quiz_upsert_grading_rules(request: QuizUpsertGradingRuleRequest):
+    try:
+        data = quiz_service.upsert_grading_rule(
+            collection=request.collection,
+            paper_id=request.paper_id,
+            question_id=request.question_id,
+            answer_key=request.answer_key,
+            rubric=request.rubric or {},
+            updated_by=request.updated_by,
+        )
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/bank/tracks")
+def quiz_bank_tracks(collection: str = "regulations"):
+    try:
+        return {"ok": True, "data": quiz_service.get_tracks_inventory(collection)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/wrongbook")
+def quiz_wrongbook_get(
+    collection: str = Query("regulations"),
+    user_id: str = Query("", description="学生 user_id，由网关注入"),
+    limit: int = Query(80, ge=1, le=200),
+):
+    try:
+        return {"ok": True, "data": quiz_service.student_wrongbook(collection=collection, user_id=user_id, limit=limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/student/unpracticed-bank")
+def quiz_student_unpracticed_bank(
+    collection: str = Query("regulations"),
+    user_id: str = Query("", description="学生 user_id，由网关注入"),
+    exam_track: str = Query(""),
+    limit: int = Query(100, ge=0, le=300),
+):
+    try:
+        return {
+            "ok": True,
+            "data": quiz_service.student_unpracticed_bank(
+                collection=collection, user_id=user_id, exam_track=exam_track, limit=limit
+            ),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/bank/questions")
+def quiz_bank_questions_list(
+    collection: str = Query("regulations"),
+    exam_track: str = Query(""),
+    q: str = Query(""),
+    category: str = Query(""),
+    question_type: str = Query(""),
+    difficulty: str = Query(""),
+    is_active: Optional[bool] = Query(True),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        data = quiz_service.admin_list_bank_questions(
+            collection=collection,
+            exam_track=exam_track,
+            q=q,
+            category=category,
+            question_type=question_type,
+            difficulty=difficulty,
+            is_active=is_active,
+            limit=limit,
+            offset=offset,
+        )
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/quiz/bank/questions/{question_id}")
+def quiz_bank_question_patch(
+    question_id: int,
+    request: QuizBankQuestionPatchRequest,
+    collection: str = Query("regulations"),
+):
+    try:
+        data = quiz_service.admin_patch_bank_question(
+            collection=collection,
+            question_id=int(question_id),
+            stem=request.stem,
+            options=request.options,
+            answer_present=bool(request.answer_present),
+            answer=request.answer,
+            explanation=request.explanation,
+            evidence=request.evidence,
+            status=request.status,
+            exam_track=request.exam_track,
+            category=request.category,
+            question_type=request.question_type,
+            difficulty=request.difficulty,
+            is_active=request.is_active,
+        )
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/quiz/bank/questions/{question_id}")
+def quiz_bank_question_delete(question_id: int, collection: str = Query("regulations")):
+    try:
+        data = quiz_service.admin_delete_bank_question(collection=collection, question_id=int(question_id))
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/stats/overview")
+def quiz_stats_overview(collection: str = "regulations"):
+    try:
+        return {"ok": True, "data": quiz_service.get_overview_stats(collection)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/stats/options")
+def quiz_stats_options(collection: str = "regulations"):
+    """统计端下拉：学生列表、考试任务（assignment_id）列表，来源为 quiz_attempts 聚合。"""
+    try:
+        return {"ok": True, "data": quiz_service.get_stats_options(collection)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/stats/student/{student_id}")
+def quiz_stats_student(student_id: str, collection: str = "regulations"):
+    # v1 先返回 overview + student_id 占位；后续可拓展为个人趋势统计
+    try:
+        data = quiz_service.get_overview_stats(collection)
+        data["student_id"] = student_id
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/stats/exam/{assignment_id}")
+def quiz_stats_exam(assignment_id: int, collection: str = "regulations"):
+    # v1 先返回 overview + assignment_id 占位；后续可拓展为单考试维度指标
+    try:
+        data = quiz_service.get_overview_stats(collection)
+        data["assignment_id"] = assignment_id
+        return {"ok": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/config/effective")
+def quiz_effective_config():
+    """调试接口：返回当前 API 进程内生效的刷题 AI 配置（便于确认 DB 配置是否已加载）。"""
+    try:
+        return {
+            "ok": True,
+            "data": {
+                "quiz_provider": getattr(settings, "quiz_provider", "") or "",
+                "quiz_llm_model": getattr(settings, "quiz_llm_model", "") or "",
+                "quiz_temperature": float(getattr(settings, "quiz_temperature", 0.2) or 0.2),
+                "fallback_provider": (settings.provider or ""),
+                "fallback_llm_model": (settings.llm_model or ""),
+                "embedding_model": (settings.embedding_model or ""),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/checklist/generate")
@@ -990,7 +1760,7 @@ def _expose_only_public_schema_routes() -> None:
     public_paths = {"/knowledge/search", "/knowledge/search/options"}
     for route in app.routes:
         path = getattr(route, "path", "")
-        if path in public_paths:
+        if path in public_paths or path.startswith("/quiz/"):
             route.include_in_schema = True
         else:
             route.include_in_schema = False
@@ -1001,7 +1771,15 @@ _expose_only_public_schema_routes()
 
 def start_server():
     import uvicorn
-    uvicorn.run(app, host=settings.api_host, port=settings.api_port)
+
+    try:
+        log_cfg = _build_uvicorn_log_config_with_time()
+    except Exception:
+        log_cfg = None
+    kwargs = {"app": app, "host": settings.api_host, "port": settings.api_port}
+    if log_cfg is not None:
+        kwargs["log_config"] = log_cfg
+    uvicorn.run(**kwargs)
 
 
 if __name__ == "__main__":

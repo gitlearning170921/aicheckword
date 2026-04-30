@@ -19,6 +19,7 @@ from config.runtime_settings import (
     sync_cursor_overrides_from_settings,
 )
 from src.core.db import persist_settings_dual_write
+from src.core.db import load_app_settings
 
 # ── 静态分组（非 AI Tab）的字段 ─────────────────────────────────────────
 
@@ -173,7 +174,15 @@ def _ai_keys_for_provider(provider: str) -> List[str]:
 
 
 def _all_ai_tab_keys_union() -> Set[str]:
-    s: Set[str] = {"provider", "llm_model", "embedding_model", "provider_sidebar_presets"}
+    s: Set[str] = {
+        "provider",
+        "llm_model",
+        "embedding_model",
+        "provider_sidebar_presets",
+        "quiz_provider",
+        "quiz_llm_model",
+        "quiz_temperature",
+    }
     if "pdf_ocr_llm_model" in settings.model_fields:
         s.add("pdf_ocr_llm_model")
     for pv in _PROVIDER_OPTION_VALUES:
@@ -235,6 +244,9 @@ FIELD_LABELS: Dict[str, str] = {
     "llm_model": "对话模型名（须与当前提供方一致，如 qwen2.5 / gpt-4o / deepseek-chat）",
     "provider_sidebar_presets": "侧栏按提供方预设（JSON；侧栏切换保存时自动维护，一般勿手改）",
     "embedding_model": "嵌入模型名（各客户端需一致）",
+    "quiz_provider": "刷题/题库：AI 提供方（空=跟随全局）",
+    "quiz_llm_model": "刷题/题库：对话模型名（空=跟随全局 llm_model）",
+    "quiz_temperature": "刷题/题库：temperature（越大越发散，建议 0.1~0.3）",
     "chroma_server_host": "Chroma 服务地址（留空=本机目录）",
     "chroma_server_port": "Chroma HTTP 端口",
     "chroma_server_ssl": "HTTPS 连接 Chroma",
@@ -330,7 +342,6 @@ def _collect_from_widgets() -> Dict[str, Any]:
         wk = _widget_key(key)
         out[key] = st.session_state.get(wk, getattr(settings, key))
     out["provider"] = _coerce_provider_to_valid(out.get("provider"))
-    st.session_state[_widget_key("provider")] = out["provider"]
     # Cursor 等：不在此编辑模型，避免误用其它服务的模型名；入库仍以当前 settings 为准
     if not _show_llm_embedding_fields(out["provider"]):
         out["llm_model"] = getattr(settings, "llm_model")
@@ -340,8 +351,6 @@ def _collect_from_widgets() -> Dict[str, Any]:
     # 兼容库列与旧逻辑：与侧栏一致，cursor_* 跟随 llm_*
     out["cursor_verify_ssl"] = bool(out.get("llm_verify_ssl", True))
     out["cursor_trust_env"] = bool(out.get("llm_trust_env", True))
-    st.session_state[_widget_key("cursor_verify_ssl")] = out["cursor_verify_ssl"]
-    st.session_state[_widget_key("cursor_trust_env")] = out["cursor_trust_env"]
     return out
 
 
@@ -359,6 +368,33 @@ def _render_field(key: str) -> None:
         if wk not in st.session_state or st.session_state.get(wk) not in vals:
             st.session_state[wk] = vals[idx_default]
         # 勿与 key 同时强传 index：部分旧版 Streamlit 会每轮把选中项打回 index，导致切换无效/控件错位
+        try:
+            st.selectbox(
+                label,
+                vals,
+                format_func=lambda x, m=labels_map: m.get(x, x),
+                key=wk,
+            )
+        except TypeError:
+            idx = vals.index(st.session_state[wk])
+            st.selectbox(
+                label,
+                vals,
+                index=min(idx, len(vals) - 1),
+                format_func=lambda x, m=labels_map: m.get(x, x),
+                key=wk,
+            )
+        return
+
+    if key == "quiz_provider":
+        vals = [""] + [v for _, v in _PROVIDER_OPTIONS]
+        labels_map = {v: lab for lab, v in _PROVIDER_OPTIONS}
+        labels_map[""] = "（跟随全局 provider）"
+        cur_val = str(_widget_effective_value(key, wk) or "")
+        if cur_val not in vals:
+            cur_val = ""
+        if wk not in st.session_state or st.session_state.get(wk) not in vals:
+            st.session_state[wk] = cur_val
         try:
             st.selectbox(
                 label,
@@ -471,6 +507,12 @@ def _render_ai_tab() -> None:
             "当前提供方与侧栏一致，**无需在此配置**对话/嵌入模型；保存时保留内存中已有模型字段，不会被本页清空。"
         )
 
+    st.markdown("**刷题/题库专用 AI（可选）**")
+    st.caption("用于 /quiz/* 生成套题与自动批卷；留空则跟随全局 provider/llm_model。")
+    _render_field("quiz_provider")
+    _render_field("quiz_llm_model")
+    _render_field("quiz_temperature")
+
 
 def render_system_config_body() -> None:
     """渲染配置表单主体。"""
@@ -485,7 +527,23 @@ def render_system_config_body() -> None:
         "🔐 **API Key / 数据库密码** 等在本页以**明文**回显，便于确认已从配置或库中加载；请勿在不受信任环境中截图或投屏。"
     )
 
-    c1, c2 = st.columns(2)
+    st.markdown("**当前生效（内存）— 刷题/题库 AI**")
+    st.code(
+        json.dumps(
+            {
+                "quiz_provider": getattr(settings, "quiz_provider", "") or "",
+                "quiz_llm_model": getattr(settings, "quiz_llm_model", "") or "",
+                "quiz_temperature": float(getattr(settings, "quiz_temperature", 0.2) or 0.2),
+                "fallback_provider": (settings.provider or ""),
+                "fallback_llm_model": (settings.llm_model or ""),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        language="json",
+    )
+
+    c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("从当前内存载入表单", key="sys_cfg_mem"):
             _push_settings_to_widgets()
@@ -500,6 +558,27 @@ def render_system_config_body() -> None:
             _push_settings_to_widgets()
             st.session_state.pop("_sys_cfg_provider_form_snap", None)
             streamlit_rerun()
+    with c3:
+        if st.button("从数据库载入表单", key="sys_cfg_db_load"):
+            row = load_app_settings()
+            raw_json = (row or {}).get("runtime_settings_json")
+            if not raw_json:
+                st.warning("数据库中 runtime_settings_json 为空或未配置。")
+                return
+            try:
+                parsed = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+                if not isinstance(parsed, dict):
+                    st.error("runtime_settings_json 不是 JSON 对象。")
+                    return
+                n = apply_runtime_config_dict(parsed)
+                sync_cursor_overrides_from_settings()
+                _push_settings_to_widgets()
+                st.session_state.pop("_sys_cfg_provider_form_snap", None)
+                st.session_state["current_provider"] = (settings.provider or "ollama").strip().lower()
+                st.success(f"已从数据库载入并应用 {n} 项配置。")
+                streamlit_rerun()
+            except Exception as e:
+                st.error(f"从数据库载入失败：{e}")
 
     # 不用 st.tabs：优先横向 radio；无 horizontal / label_visibility 时不用纵向长列表，改横向按钮（与旧版 Streamlit 1.9 等兼容）
     _sec_key = "sys_cfg_section_radio"
@@ -605,7 +684,25 @@ def render_system_config_body() -> None:
             persist_settings_dual_write()
             st.session_state.pop("_sys_cfg_provider_form_snap", None)
             st.session_state["current_provider"] = (settings.provider or "ollama").strip().lower()
-            st.success(f"已保存（应用 {n} 项配置）。")
+            # 保存后立即从库回读关键字段，便于确认是否真的写入 runtime_settings_json
+            try:
+                row = load_app_settings() or {}
+                raw = row.get("runtime_settings_json") or ""
+                parsed = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
+                if isinstance(parsed, dict):
+                    st.success(
+                        "已保存（应用 %s 项配置）。DB 回读：quiz_provider=%s quiz_llm_model=%s quiz_temperature=%s"
+                        % (
+                            n,
+                            repr(parsed.get("quiz_provider")),
+                            repr(parsed.get("quiz_llm_model")),
+                            repr(parsed.get("quiz_temperature")),
+                        )
+                    )
+                else:
+                    st.success(f"已保存（应用 {n} 项配置）。")
+            except Exception:
+                st.success(f"已保存（应用 {n} 项配置）。")
             streamlit_rerun()
     with b2:
         blob = json.dumps(serialize_settings_to_flat_dict(), ensure_ascii=False, indent=2)
