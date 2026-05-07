@@ -321,14 +321,61 @@ class KnowledgeBase:
     def search(self, query: str, top_k: int = 10) -> List[Document]:
         return self.vectorstore.similarity_search(query, k=top_k)
 
-    def search_by_category(self, query: str, category: str, top_k: int = 10) -> List[Document]:
-        """按分类检索（如 category='glossary' 检索词条）。仅对主知识库生效；项目库/审核点库无 category 过滤时退回普通检索。"""
+    def search_by_category(
+        self, query: str, category: str, top_k: int = 10, case_id: Optional[int] = None
+    ) -> List[Document]:
+        """按分类检索（如 category='glossary' 检索词条）。仅对主知识库生效；项目库/审核点库无 category 过滤时退回普通检索。
+
+        case_id 非空时（常用于 category=project_case）：尽量按 metadata.case_id 过滤；底层不支持时回退为扩大检索后内存过滤。
+        """
         if self.project_id or self.is_checkpoint:
             return self.vectorstore.similarity_search(query, k=top_k)
+        if case_id is None:
+            try:
+                return self.vectorstore.similarity_search(query, k=top_k, filter={"category": category})
+            except TypeError:
+                return self.vectorstore.similarity_search(query, k=top_k)
+
+        def _match_case(doc: Document) -> bool:
+            md = getattr(doc, "metadata", None) or {}
+            if str(md.get("category") or "") != str(category):
+                return False
+            try:
+                return int(md.get("case_id") or -1) == int(case_id)
+            except (TypeError, ValueError):
+                return False
+
+        over_k = min(max(int(top_k) * 8, 24), 120)
+        # 1) 复合 where（部分 Chroma 版本支持）
+        for flt in (
+            {"$and": [{"category": category}, {"case_id": int(case_id)}]},
+            {"category": category, "case_id": int(case_id)},
+        ):
+            try:
+                docs = self.vectorstore.similarity_search(query, k=top_k, filter=flt)
+                if docs:
+                    return docs[:top_k]
+            except Exception:
+                continue
+        # 2) 仅 category 过滤后内存筛 case_id
         try:
-            return self.vectorstore.similarity_search(query, k=top_k, filter={"category": category})
+            pool = self.vectorstore.similarity_search(query, k=over_k, filter={"category": category})
         except TypeError:
-            return self.vectorstore.similarity_search(query, k=top_k)
+            pool = self.vectorstore.similarity_search(query, k=over_k)
+        out = [d for d in pool if _match_case(d)][:top_k]
+        if len(out) >= top_k:
+            return out
+        # 3) 无 category 过滤的兜底（老数据 metadata 不全时）
+        try:
+            pool2 = self.vectorstore.similarity_search(query, k=over_k)
+        except Exception:
+            pool2 = []
+        for d in pool2:
+            if _match_case(d) and d not in out:
+                out.append(d)
+            if len(out) >= top_k:
+                break
+        return out[:top_k]
 
     def search_with_scores(self, query: str, top_k: int = 10):
         return self.vectorstore.similarity_search_with_relevance_scores(query, k=top_k)

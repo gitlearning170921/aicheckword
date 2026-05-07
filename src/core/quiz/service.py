@@ -1,27 +1,95 @@
 import hashlib
 import json
+import logging
+import uuid
 import math
 import random
 import re
 import threading
 from difflib import SequenceMatcher
 from collections import deque
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from config import settings
 from src.core.agent import ReviewAgent
 from src.core.llm_factory import invoke_chat_direct
 
-from .models import EXAM_TRACKS, QUESTION_TYPES
+from .models import EXAM_CATEGORIES, EXAM_TRACKS, QUESTION_TYPES
 from . import repository as repo
 
+logger = logging.getLogger(__name__)
 
 TRACK_HINTS = {
     "cn": "中国医疗器械法规、注册与质量体系要求",
     "iso13485": "ISO 13485 质量管理体系要求与实施",
     "mdsap": "MDSAP 审核程序与多国监管要求",
 }
+
+
+class QuizRequestError(Exception):
+    """组卷/录题等入口参数不合法（应由 API 层映射为 HTTP 400）。"""
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.args[0] if self.args else "QuizRequestError"
+
+
+def require_project_case_quiz(*, collection: str, exam_category: str, project_case_id: Any) -> Optional[int]:
+    """考试类型为 project_case 时校验并返回案例 id；其它类型返回 None。"""
+    ec = _normalize_exam_category(exam_category)
+    if ec != "project_case":
+        return None
+    if project_case_id is None or str(project_case_id).strip() == "":
+        raise QuizRequestError("项目案例考试必须提供 project_case_id（请选择已训练入库的项目案例）")
+    try:
+        pid = int(project_case_id)
+    except (TypeError, ValueError):
+        raise QuizRequestError("project_case_id 无效") from None
+    if pid <= 0:
+        raise QuizRequestError("project_case_id 无效")
+    from src.core.db import get_project_case, get_project_case_file_names
+
+    row = get_project_case(pid)
+    if not row:
+        raise QuizRequestError("项目案例不存在")
+    coll = str(row.get("collection") or "").strip()
+    if coll != str(collection or "").strip():
+        raise QuizRequestError("项目案例不属于当前知识库 collection")
+    names = get_project_case_file_names(collection, pid) or []
+    if not names:
+        raise QuizRequestError("该案例尚未训练入库项目案例知识库，无法组卷/录题")
+    return pid
+
+
+def list_ready_project_cases_for_quiz(*, collection: str) -> List[Dict[str, Any]]:
+    """与已训练 project_case 知识库一致的案例列表（供考试中心下拉）。"""
+    from src.core.db import get_project_case_file_names, list_project_cases
+
+    out: List[Dict[str, Any]] = []
+    for row in list_project_cases(collection) or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            cid = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        if cid <= 0:
+            continue
+        names = get_project_case_file_names(collection, cid) or []
+        if not names:
+            continue
+        out.append(
+            {
+                "id": cid,
+                "case_name": str(row.get("case_name") or ""),
+                "product_name": str(row.get("product_name") or ""),
+                "registration_country": str(row.get("registration_country") or ""),
+                "registration_type": str(row.get("registration_type") or ""),
+                "registration_component": str(row.get("registration_component") or ""),
+                "project_form": str(row.get("project_form") or ""),
+            }
+        )
+    return out
 
 
 _OBJECTIVE_QUESTION_TYPES = frozenset(("single_choice", "multiple_choice", "true_false"))
@@ -132,8 +200,36 @@ def _hash_text(*parts: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _make_scope_hash(exam_track: str, category: str, difficulty: str, question_type: str) -> str:
-    return _hash_text(exam_track, category, difficulty, question_type)[:32]
+def _normalize_exam_category(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    if s in ("new_standard", "new_standard_release", "newstd", "新标", "新标发布"):
+        return "new_standard"
+    if s in (
+        "project_case",
+        "projectcase",
+        "case_audit",
+        "caseaudit",
+        "项目案例",
+        "案例考试",
+        "项目案例考试",
+    ):
+        return "project_case"
+    return "daily"
+
+
+def _make_scope_hash(
+    exam_track: str,
+    category: str,
+    difficulty: str,
+    question_type: str,
+    exam_category: str = "daily",
+    project_case_id: Optional[int] = None,
+) -> str:
+    ec = _normalize_exam_category(exam_category)
+    pc = ""
+    if ec == "project_case" and project_case_id is not None:
+        pc = f"|pcid={int(project_case_id)}"
+    return _hash_text(exam_track, category, difficulty, question_type, ec, pc)[:32]
 
 
 def _safe_question_type(v: str) -> str:
@@ -180,23 +276,43 @@ def _difficulty_question_type_plan(difficulty: str, question_count: int) -> List
     return [(types[i], counts[i]) for i in range(len(types)) if counts[i] > 0]
 
 
-def _ingest_knowledge_scope_plan(target_count: int) -> List[tuple[str, str, int]]:
-    """AI 录题：知识来源占比 — 项目案例 30%、审核点 30%、法规标准 20%、程序文件 20%。"""
+def _ingest_knowledge_scope_plan(
+    target_count: int,
+    weights: Optional[List[float]] = None,
+) -> List[tuple[str, str, int]]:
+    """AI 录题：知识来源占比（默认 项目案例 30%、审核点 30%、法规标准 20%、程序文件 20%）。"""
     n = max(1, int(target_count))
     keys = ["project_case", "audit_checkpoint", "regulation", "program"]
     labels = ["项目案例", "审核点", "法规标准", "程序文件"]
-    weights = [0.3, 0.3, 0.2, 0.2]
-    counts = _split_int_by_weights(n, weights)
+    wdef = [0.3, 0.3, 0.2, 0.2]
+    w = list(weights) if weights is not None and len(weights) == 4 else list(wdef)
+    w = [max(0.0, float(x)) for x in w]
+    s = sum(w)
+    if s <= 0:
+        w = list(wdef)
+        s = sum(w)
+    w = [x / s for x in w]
+    counts = _split_int_by_weights(n, w)
     return [(keys[i], labels[i], counts[i]) for i in range(len(keys)) if counts[i] > 0]
 
 
-def _ingest_question_type_plan(segment_count: int) -> List[tuple[str, int]]:
-    """单段录题内题型占比：单选 30%、多选 10%、判断 10%、主观案例分析 50%。"""
+def _ingest_question_type_plan(
+    segment_count: int,
+    weights: Optional[List[float]] = None,
+) -> List[tuple[str, int]]:
+    """单段录题内题型占比（默认 单选 30%、多选 10%、判断 10%、主观案例分析 50%）。"""
     c = max(0, int(segment_count))
     if c <= 0:
         return []
     types = ["single_choice", "multiple_choice", "true_false", "case_analysis"]
-    w = [0.3, 0.1, 0.1, 0.5]
+    wdef = [0.3, 0.1, 0.1, 0.5]
+    w = list(weights) if weights is not None and len(weights) == 4 else list(wdef)
+    w = [max(0.0, float(x)) for x in w]
+    s = sum(w)
+    if s <= 0:
+        w = list(wdef)
+        s = sum(w)
+    w = [x / s for x in w]
     counts = _split_int_by_weights(c, w)
     return [(types[i], counts[i]) for i in range(len(types)) if counts[i] > 0]
 
@@ -221,15 +337,24 @@ def _rows_to_evidence(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 _OPEN_REGULATION_EVIDENCE_SOURCE = "通用法规知识（大模型摘要·非用户向量库）"
 
 
-def _regulation_open_evidence_via_llm(exam_track: str, need: int) -> List[Dict[str, Any]]:
+def _regulation_open_evidence_via_llm(exam_track: str, need: int, exam_category: str = "daily") -> List[Dict[str, Any]]:
     """本地 regulation 类向量不足时，用模型生成通用监管要点摘录；不冒充具体上传文件或条款号。"""
     need = max(1, min(int(need), 20))
     track_name = EXAM_TRACKS.get(exam_track, exam_track)
     track_hint = TRACK_HINTS.get(exam_track, "")
+    ec = _normalize_exam_category(exam_category)
+    scene = EXAM_CATEGORIES.get(ec, ec)
+    focus_extra = ""
+    if ec == "new_standard":
+        focus_extra = (
+            "\n本次为「新标发布」导向：请围绕**可能的新版/修订/替代关系、实施过渡期、对软件生命周期与注册变更的影响方向**组织素材，"
+            "强调「需以主管部门/标准化组织正式发布为准」；仍**禁止**编造具体文号、条款号、实施日期。"
+        )
     prompt = f"""
 你是医疗器械法规教研助手。用户本地向量库可能**未导入法规原文**，需要为考试命题准备若干条**一般性、可公开核对方向的表述**作为素材摘录（不等同于引用具体成文法条）。
 
 体考类型：{track_name}（{track_hint}）
+考试类型：{scene}{focus_extra}
 
 硬性要求：
 1) 只输出 JSON，不要其它文字。
@@ -274,19 +399,28 @@ JSON:""".strip()
         return [{"content_snippet": fb[:500], "source_file": _OPEN_REGULATION_EVIDENCE_SOURCE} for _ in range(need)]
 
 
-def _extract_evidence_scoped(agent: ReviewAgent, exam_track: str, scope_key: str, top_k: int) -> List[Dict[str, Any]]:
+def _extract_evidence_scoped(
+    agent: ReviewAgent,
+    exam_track: str,
+    scope_key: str,
+    top_k: int,
+    exam_category: str = "daily",
+    project_case_id: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """按知识来源维度检索命题素材（项目案例 / 审核点 / 法规标准 / 程序文件）。
 
     法规标准：优先主库 category=regulation；若不足或未训练，则用大模型生成「通用法规要点」摘录补足（source_file
     固定为「通用法规知识（大模型摘要·非用户向量库）」，与真实上传文件区分）。
     """
-    base_q = f"{EXAM_TRACKS.get(exam_track, exam_track)} {TRACK_HINTS.get(exam_track, '')} 典型考点 命题依据"
+    ec = _normalize_exam_category(exam_category)
+    rev_q = " 修订 新版本 替代 废止 过渡期 实施日期 专标 指南 变化点" if ec == "new_standard" else ""
+    base_q = f"{EXAM_TRACKS.get(exam_track, exam_track)} {TRACK_HINTS.get(exam_track, '')} 典型考点 命题依据{rev_q}"
     tk = max(1, int(top_k))
 
     if scope_key == "regulation":
         docs: List[Any] = []
         try:
-            docs = agent.kb.search_by_category(base_q + " 法规 标准 技术要求", "regulation", top_k=tk)
+            docs = agent.kb.search_by_category(base_q + " 法规 标准 技术要求 指南", "regulation", top_k=tk)
         except Exception:
             docs = []
         rows: List[Dict[str, Any]] = []
@@ -301,19 +435,26 @@ def _extract_evidence_scoped(agent: ReviewAgent, exam_track: str, scope_key: str
             )
         evidence = _rows_to_evidence(rows)
         if len(evidence) < tk:
-            evidence.extend(_regulation_open_evidence_via_llm(exam_track, tk - len(evidence)))
+            evidence.extend(_regulation_open_evidence_via_llm(exam_track, tk - len(evidence), exam_category))
         return evidence[:tk]
 
     docs: List[Any] = []
     try:
+        tail = " 对照表" if ec == "new_standard" else ""
         if scope_key == "audit_checkpoint":
-            docs = agent.checkpoint_kb.search(base_q + " 审核点 检查表 符合性", top_k=tk)
+            docs = agent.checkpoint_kb.search(base_q + tail + " 审核点 检查表 符合性", top_k=tk)
         elif scope_key == "project_case":
-            docs = agent.kb.search_by_category(base_q + " 项目案例 注册资料", "project_case", top_k=tk)
+            # 与组卷/练习补题共用同一取证实现，避免两处检索词或过滤逻辑漂移
+            cid = int(project_case_id) if project_case_id is not None else None
+            if cid is not None:
+                return _extract_evidence_project_case(
+                    agent, exam_track, top_k=tk, exam_category=ec, project_case_id=cid
+                )
+            docs = []
         elif scope_key == "program":
-            docs = agent.kb.search_by_category(base_q + " 程序文件 SOP 规程", "program", top_k=tk)
+            docs = agent.kb.search_by_category(base_q + tail + " 程序文件 SOP 规程", "program", top_k=tk)
         else:
-            docs = agent.kb.search(base_q, top_k=tk)
+            docs = agent.kb.search(base_q + tail, top_k=tk)
     except Exception:
         docs = []
     rows2: List[Dict[str, Any]] = []
@@ -327,6 +468,45 @@ def _extract_evidence_scoped(agent: ReviewAgent, exam_track: str, scope_key: str
             }
         )
     return _rows_to_evidence(rows2)
+
+
+def _trim_embedded_evidence_from_stem(stem: str, evidence: List[Any]) -> str:
+    """若题干中粘入了与 evidence[].content_snippet 相同的大段原文（任意题型），截断到材料出现之前。
+
+    材料应放在 `evidence_json` 的摘录字段中，**不是**选项或判断句本身；此处防止模型/历史数据把摘录糊进 `stem`。
+    """
+    s = str(stem or "").strip()
+    if not s or not isinstance(evidence, list):
+        return s
+    cut_at: Optional[int] = None
+    for ev in evidence:
+        if not isinstance(ev, dict):
+            continue
+        sn = str(ev.get("content_snippet") or "").strip()
+        if len(sn) < 80:
+            continue
+        needles: List[str] = [sn]
+        if len(sn) > 200:
+            needles.append(sn[:360])
+        if len(sn) > 130:
+            needles.append(sn[:220])
+        if len(sn) > 95:
+            needles.append(sn[:120])
+        for needle in needles:
+            if len(needle) < 72:
+                continue
+            pos = s.find(needle)
+            # pos=0 表示整段 stem 即材料，不截断；否则去掉从首次命中起的重复粘贴
+            if pos > 0:
+                if cut_at is None or pos < cut_at:
+                    cut_at = pos
+                break
+    if cut_at is not None:
+        out = s[:cut_at].rstrip()
+        tail = s[cut_at:].strip()
+        if len(tail) >= 80 and len(out) >= 6:
+            return out
+    return s
 
 
 def _ensure_question_shape(question: Dict[str, Any], fallback_category: str = "") -> Dict[str, Any]:
@@ -388,20 +568,25 @@ def _ensure_question_shape(question: Dict[str, Any], fallback_category: str = ""
                 if len(uniq) >= 2:
                     break
         answer = uniq
+    ev_out = question.get("evidence") if isinstance(question.get("evidence"), list) else []
+    stem_out = str(question.get("stem") or "").strip()
+    stem_out = _trim_embedded_evidence_from_stem(stem_out, ev_out)
     return {
         "question_type": q_type,
-        "stem": str(question.get("stem") or "").strip(),
+        "stem": stem_out,
         "options": opts,
         "answer": answer,
         "explanation": str(question.get("explanation") or "").strip(),
         "category": str(question.get("category") or fallback_category or "").strip(),
         "difficulty": _safe_difficulty(str(question.get("difficulty") or "medium")),
-        "evidence": question.get("evidence") if isinstance(question.get("evidence"), list) else [],
+        "evidence": ev_out,
     }
 
 
-def _extract_evidence(agent: ReviewAgent, exam_track: str, top_k: int = 8) -> List[Dict[str, Any]]:
-    query = f"{EXAM_TRACKS.get(exam_track, exam_track)} {TRACK_HINTS.get(exam_track, '')} 典型考题要点"
+def _extract_evidence(agent: ReviewAgent, exam_track: str, top_k: int = 8, exam_category: str = "daily") -> List[Dict[str, Any]]:
+    ec = _normalize_exam_category(exam_category)
+    tail = " 修订 新版本 替代 废止 过渡期 专标 指南 变化点" if ec == "new_standard" else ""
+    query = f"{EXAM_TRACKS.get(exam_track, exam_track)} {TRACK_HINTS.get(exam_track, '')} 典型考题要点{tail}"
     try:
         rows = agent.search_knowledge(query, top_k=top_k, use_checkpoints=True)
     except Exception:
@@ -427,6 +612,42 @@ def _extract_evidence(agent: ReviewAgent, exam_track: str, top_k: int = 8) -> Li
     return evidence
 
 
+def _extract_evidence_project_case(
+    agent: ReviewAgent,
+    exam_track: str,
+    top_k: int,
+    exam_category: str,
+    project_case_id: int,
+) -> List[Dict[str, Any]]:
+    """项目案例考试：仅从所选案例的 project_case 向量取证（不混入法规 open LLM 摘要）。"""
+    ec = _normalize_exam_category(exam_category)
+    rev_q = " 修订 新版本 替代 废止 过渡期 实施日期 专标 指南 变化点" if ec == "new_standard" else ""
+    base_q = f"{EXAM_TRACKS.get(exam_track, exam_track)} {TRACK_HINTS.get(exam_track, '')} 典型考点 命题依据{rev_q}"
+    tail = " 对照表" if ec == "new_standard" else ""
+    q = (
+        base_q
+        + tail
+        + " 项目案例 注册资料 设计开发 生产 记录 偏差 变更 风险管理 现场核查 GMP 软件生命周期"
+    )
+    tk = max(1, int(top_k))
+    docs: List[Any] = []
+    try:
+        docs = agent.kb.search_by_category(q, "project_case", top_k=tk, case_id=int(project_case_id))
+    except Exception:
+        docs = []
+    rows: List[Dict[str, Any]] = []
+    for doc in docs:
+        md = getattr(doc, "metadata", None) or {}
+        rows.append(
+            {
+                "content": getattr(doc, "page_content", "") or "",
+                "source": md.get("source_file") or "",
+                "metadata": md if isinstance(md, dict) else {},
+            }
+        )
+    return _rows_to_evidence(rows)
+
+
 def _fallback_questions(
     exam_track: str,
     category: str,
@@ -435,9 +656,11 @@ def _fallback_questions(
     *,
     question_type: str = "true_false",
     difficulty: str = "medium",
+    exam_category: str = "daily",
 ) -> List[Dict[str, Any]]:
     qt = _safe_question_type(question_type)
     diff = _safe_difficulty(difficulty)
+    ec_fb = _normalize_exam_category(exam_category)
     out: List[Dict[str, Any]] = []
     for i in range(count):
         ev = evidence[i % len(evidence)] if evidence else {"content_snippet": "知识库命中不足", "source_file": ""}
@@ -446,7 +669,8 @@ def _fallback_questions(
         snip = str(ev.get("content_snippet", "") or "")[:160]
         if qt == "single_choice":
             stem = (
-                f"[{EXAM_TRACKS.get(exam_track, exam_track)}] 依据 {src_text}，下列哪项最恰当？\n{snip}"
+                f"[{EXAM_TRACKS.get(exam_track, exam_track)}] 依据 {src_text} 的入库摘录，下列哪项最恰当？"
+                f"（具体摘录在本题 evidence 中，勿在题干中整段复述。）"
             )
             opt_sets = (
                 (
@@ -483,7 +707,8 @@ def _fallback_questions(
             )
         elif qt == "multiple_choice":
             stem = (
-                f"[{EXAM_TRACKS.get(exam_track, exam_track)}] 依据 {src_text}，下列哪些说法成立（多选）？\n{snip}"
+                f"[{EXAM_TRACKS.get(exam_track, exam_track)}] 依据 {src_text} 的入库摘录，下列哪些说法成立（多选）？"
+                f"（摘录见本题 evidence。）"
             )
             opt_texts = [
                 "摘录可作为题干结论的前提依据之一",
@@ -504,8 +729,11 @@ def _fallback_questions(
                 }
             )
         elif qt == "case_analysis":
+            prefix = "【本案项目案例资料】 " if ec_fb == "project_case" else ""
             stem = (
-                f"[{EXAM_TRACKS.get(exam_track, exam_track)}] 案例分析：结合 {src_text} 的摘录，说明应关注的合规要点与理由。\n{snip}"
+                f"{prefix}[{EXAM_TRACKS.get(exam_track, exam_track)}] 案例分析：请仅结合 {src_text} 中与本案相关的入库摘录作答，"
+                f"说明核查员可能追问的焦点及你方应如何举证、补证。"
+                f"（背景摘录在本题 evidence 中；勿把整段原文当作题干复述抄写。）"
             )
             out.append(
                 {
@@ -520,9 +748,11 @@ def _fallback_questions(
                 }
             )
         else:
+            raw_snip = str(ev.get("content_snippet", "") or "").strip()
+            short_claim = (raw_snip[:150] + ("…" if len(raw_snip) > 150 else "")).strip() or "（完整上下文见本题 evidence）"
             stem = (
-                f"[{EXAM_TRACKS.get(exam_track, exam_track)}] "
-                f"根据 {src_text} 的内容判断下述说法是否正确：{snip[:120]}"
+                f"[{EXAM_TRACKS.get(exam_track, exam_track)}] 依据 {src_text}，判断下列陈述是否正确：{short_claim}"
+                f"（更长原文见本题 evidence。）"
             )
             out.append(
                 {
@@ -547,27 +777,72 @@ def _generate_questions_by_ai(
     question_type: str,
     count: int,
     evidence: List[Dict[str, Any]],
+    exam_category: str = "daily",
+    project_case_id: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     min_plausible = 0 if count <= 1 else max(1, (count * 4 + 9) // 10)
+    ec = _normalize_exam_category(exam_category)
+    scene_line = f"考试类型：{EXAM_CATEGORIES.get(ec, ec)}。"
+    new_std_rules = ""
+    if ec == "new_standard":
+        new_std_rules = (
+            "\n14) 本批为「新标发布」：题干与选项应引导考生识别**修订/替代/适用范围变化/对软件文档与验证的影响**等；"
+            "仍不得编造具体文号与实施日期；explanation 中须提示「以官方发布文本为准」。"
+        )
+    project_case_anchor = ""
+    if ec == "project_case" and project_case_id:
+        from src.core.db import get_project_case
+
+        prow = get_project_case(int(project_case_id)) or {}
+        cn = str(prow.get("case_name") or "").strip()
+        pn = str(prow.get("product_name") or "").strip()
+        rc = str(prow.get("registration_country") or "").strip()
+        rt = str(prow.get("registration_type") or "").strip()
+        rcomp = str(prow.get("registration_component") or "").strip()
+        pform = str(prow.get("project_form") or "").strip()
+        project_case_anchor = (
+            f"\n【本套题锁定的项目案例】case_id={int(project_case_id)}；"
+            f"案例名：{cn or '—'}；产品：{pn or '—'}；注册国家/地区：{rc or '—'}；注册类别：{rt or '—'}；"
+            f"结构组成：{rcomp or '—'}；项目形态：{pform or '—'}。"
+            "命题时仅可将上述字段用于**与 evidence 摘录一致**的表述；不得编造上述字段未给出的注册号、版本、日期、批号等。"
+        )
+    project_case_rules = ""
+    if ec == "project_case":
+        project_case_rules = (
+            "\n14) 本批为「项目案例」：**全部题型**（单选/多选/判断/案例分析）均须**严格依据 evidence 中本项目案例已入库资料摘录**命题，"
+            "题干与选项/判断陈述中的事实、功能描述、记录名称、流程节点等应能在摘录中找到依据或合理概括，**禁止**写成与本案资料无关的泛化法规背诵题。"
+            "\n15) 模拟核查口吻：你扮演**现场核查/体考考官**（面向研发、生产、质量体系人员），可结合 GMP、现场核查指南等**通用核查关注点**发问，"
+            "但必须**落脚到 evidence 中的具体文档与摘录内容**；不得编造具体条款号、公告号、标准号、页码或 evidence 未出现的文件名。"
+            "\n16) **案例分析题（case_analysis）硬性要求**："
+            "题干必须呈现**基于摘录的具体情境或矛盾点**（例如记录缺失、版本不一致、验证范围与声称功能不符等），不得出「泛泛谈质量管理体系」且与摘录脱钩的题；"
+            "`answer` 参考要点须按「摘录事实 → 核查风险/追问点 → 建议补充的证据或记录（对应 source_file）」组织，**至少 2 条**且每条能指回 evidence；"
+            "禁止「教材式」或与本案无关的标准答案套话。"
+            f"{project_case_anchor}"
+        )
     prompt = f"""
 你是医疗器械法规考试命题助手。请只输出 JSON，不要额外说明。
 
 要求：
-1) 生成 {count} 道题，体考类型：{EXAM_TRACKS.get(exam_track, exam_track)}（{TRACK_HINTS.get(exam_track, '')}）
+1) 生成 {count} 道题，体考类型：{EXAM_TRACKS.get(exam_track, exam_track)}（{TRACK_HINTS.get(exam_track, '')}）；{scene_line}
 2) 题型：{question_type}
 3) 难度：{difficulty}
 4) 分类：{category or exam_track}
 5) 必须依据 evidence，不得编造法规条款编号/章节号/文件名。
+5a) **全部题型（单选/多选/判断/案例分析）**：`stem` **禁止**整段粘贴下方 evidence 中的原文摘录、表格转写或 OCR 残留标记；题干只用简短设问+必要概括；完整摘录**仅**写入该题 `evidence[].content_snippet`（与其它题型一致）。
 6) 每题 explanation 必须明确写出“依据的来源文件名”，格式示例：依据：《文件名》；……。禁止出现“根据审核点XXX”这类不可定位表述。
 7) evidence[].source_file 必须填写为具体可读的文件名（程序文件/法规文件/项目案例文件名）；如果无法确定，填空字符串，并在 explanation 中写“来源文件未标注”。不得使用 tmp 临时文件名。
 8) JSON 格式：{{"questions":[{{"question_type":"single_choice|multiple_choice|true_false|case_analysis","stem":"...","options":[...],"answer":...,"explanation":"...","category":"...","difficulty":"easy|medium|hard","evidence":[{{"content_snippet":"...","source_file":"..."}}]}}]}}
 9) 单选/多选：`options` 为**纯陈述文本数组**（2～6 项），**不要**在每项前加 `A./B.` 等字母前缀（系统会统一编号）。单选 `answer` 为单个大写字母（如 `C`）；多选 `answer` 为字母数组（如 `["A","D"]`）。
 9.1) 多选题（multiple_choice）必须至少有 **2 个**正确选项（`answer` 数组长度 ≥ 2），不得只给一个正确项。
 9.2) 案例分析题（case_analysis）必须满足：`options` 为空数组；`answer` 为**参考作答要点文本**（不是 A/B/C/D），学生端会用文本框输入。
+9.2.1) 若当前为「项目案例」考试类型：案例分析题还须满足第 16) 条对情境与答案结构的全部要求。
+9.2.2) **案例分析**在遵守第 5a) 条前提下：`stem` 只写**设问与简短情境**（建议 ≤ 500 汉字或等效），用 1～3 句概括矛盾点；**禁止**在 `stem` 中整段粘贴 `evidence[].content_snippet`。
+9.2.3) 需要考生引用的具体事实，在题干中**概括**并指向文件名；**背景原文只放在**各题 `evidence[].content_snippet`；`answer` 为参考要点，**禁止**将 `answer` 全文写入 `stem`。
 10) 干扰项质量（本批共 {count} 题）：其中至少 **{min_plausible}** 题须标为 `medium` 或 `hard`，且这些题的**错误选项**须与正确选项在句式长度、术语层级上**尽量平行**，呈现**易混淆结论**；**禁止**整批题都靠「仅…」「只需要…」「不需要…」「绝不是…」「与审核无关」等一眼可排除的标语式否定句凑满四个选项。
 11) 约 **60%** 题目可为 `easy`：允许轻度否定或排除语气，但**不要**让四个错误项共用同一种开头模板；**不得**出现「明显三项都错、只剩一项像真命题」的凑数结构。
 12) 正确答案在命制时不要刻意总落在同一字母位；落库前系统会打乱选项顺序并重写 `answer`，你仍须保证**每个错误选项本身像合理结论**而非「反着说就对了」的口号。
 13) 同批各题题干须围绕不同角度设问，避免只改一两处用词、结构高度雷同的「换皮题」；系统还会与历史题库做相似度过滤，雷同过多会被丢弃。
+{new_std_rules}{project_case_rules}
 
 evidence:
 {json.dumps(evidence, ensure_ascii=False)}
@@ -610,9 +885,9 @@ def _dedupe_questions_for_ingest(
     questions: List[Dict[str, Any]],
     *,
     prior_stems: List[str],
-    max_similar_frac: float = 0.2,
+    max_similar_frac: float = 0.1,
 ) -> List[Dict[str, Any]]:
-    """AI 录题：与历史题干近似重复的题控制在约 max_similar_frac（默认 20%）以内。"""
+    """AI 录题：与历史题干近似重复的题控制在约 max_similar_frac（默认 10%）以内。"""
     if not questions:
         return []
     pool = list(questions)
@@ -872,10 +1147,14 @@ def generate_set(
     question_type: str = "single_choice",
     question_count: int = 20,
     status: str = "draft",
+    exam_category: str = "daily",
+    project_case_id: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """组卷：题型占比仅由 difficulty 决定；question_type 参数保留兼容，不参与组卷。"""
     if exam_track not in EXAM_TRACKS:
         raise ValueError(f"不支持的 exam_track: {exam_track}")
+    ec = _normalize_exam_category(exam_category)
+    pc_id = require_project_case_quiz(collection=collection, exam_category=exam_category, project_case_id=project_case_id)
     question_count = max(1, int(question_count))
     difficulty = _safe_difficulty(difficulty)
     bank_cat = (category or "").strip() or None
@@ -883,14 +1162,27 @@ def generate_set(
     plan = _difficulty_question_type_plan(difficulty, question_count)
     mix_map = {qt: n for qt, n in plan}
     set_cfg = {
-        "set_config_hash": _hash_text(exam_track, hash_cat or "", difficulty, json.dumps(mix_map, sort_keys=True), str(question_count))[:32],
+        "set_config_hash": _hash_text(
+            exam_track,
+            hash_cat or "",
+            difficulty,
+            json.dumps(mix_map, sort_keys=True),
+            str(question_count),
+            ec,
+            str(pc_id or ""),
+        )[:32],
         "question_type_mix": mix_map,
         "question_type": "mixed",
         "difficulty": difficulty,
         "question_count": question_count,
         "category": category or exam_track,
         "bank_category_filter": bank_cat,
+        "exam_category": ec,
+        "examCategory": ec,
     }
+    if pc_id is not None:
+        set_cfg["project_case_id"] = int(pc_id)
+        set_cfg["projectCaseId"] = int(pc_id)
     selected_all: List[Dict[str, Any]] = []
     seen_ids: set[int] = set()
     sig_counts: Dict[str, int] = {}
@@ -931,7 +1223,7 @@ def generate_set(
         if cnt <= 0:
             continue
         qtype = _safe_question_type(qtype)
-        scope_hash = _make_scope_hash(exam_track, hash_cat, difficulty, qtype)
+        scope_hash = _make_scope_hash(exam_track, hash_cat, difficulty, qtype, ec, project_case_id=pc_id)
         selected: List[Dict[str, Any]] = []
         if uid_pr:
             prioritized_ids: List[int] = []
@@ -985,7 +1277,12 @@ def generate_set(
                 seen_ids.add(int(x["id"]))
         short = cnt - len(selected)
         if short > 0:
-            evidence = _extract_evidence(agent, exam_track, top_k=max(8, short))
+            if ec == "project_case" and pc_id is not None:
+                evidence = _extract_evidence_project_case(
+                    agent, exam_track, top_k=max(8, short), exam_category=ec, project_case_id=int(pc_id)
+                )
+            else:
+                evidence = _extract_evidence(agent, exam_track, top_k=max(8, short), exam_category=ec)
             stem_cat = (category or "").strip() or exam_track
             try:
                 generated = _generate_questions_by_ai(
@@ -995,6 +1292,8 @@ def generate_set(
                     question_type=qtype,
                     count=short,
                     evidence=evidence,
+                    exam_category=ec,
+                    project_case_id=int(pc_id) if ec == "project_case" and pc_id is not None else None,
                 )
             except Exception:
                 generated = _fallback_questions(
@@ -1004,6 +1303,7 @@ def generate_set(
                     evidence,
                     question_type=qtype,
                     difficulty=difficulty,
+                    exam_category=ec,
                 )
             saved = _save_questions_to_bank(
                 collection=collection,
@@ -1056,8 +1356,22 @@ def ingest_bank_by_ai(
     difficulty: str = "medium",
     question_type: str = "single_choice",
     set_title: str = "",
+    exam_category: str = "daily",
+    ingest_knowledge_weights: Optional[List[float]] = None,
+    ingest_question_type_weights: Optional[List[float]] = None,
+    max_similar_frac: Optional[float] = None,
+    project_case_id: Optional[Any] = None,
 ) -> Dict[str, Any]:
     target_count = max(1, int(target_count))
+    ec = _normalize_exam_category(exam_category)
+    pc_id = require_project_case_quiz(collection=collection, exam_category=exam_category, project_case_id=project_case_id)
+    kw = ingest_knowledge_weights if ingest_knowledge_weights is not None else None
+    qw = ingest_question_type_weights if ingest_question_type_weights is not None else None
+    msf = float(max_similar_frac) if max_similar_frac is not None else 0.1
+    if msf < 0.0:
+        msf = 0.0
+    if msf > 0.5:
+        msf = 0.5
     job_id = repo.create_ingest_job(
         collection=collection,
         exam_track=exam_track,
@@ -1069,19 +1383,29 @@ def ingest_bank_by_ai(
         f"{EXAM_TRACKS.get(exam_track, exam_track)}-AI录题-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     )
     difficulty = _safe_difficulty(difficulty)
+    mix_label = "project_case100" if ec == "project_case" else "project_case30_audit30_regulation20_program20"
+    draft_cfg: Dict[str, Any] = {
+        "source": "bank_ingest_by_ai",
+        "ingest_job_id": job_id,
+        "ingest_knowledge_weights": kw,
+        "ingest_question_type_weights": qw,
+        "ingest_max_similar_frac": msf,
+        "ingest_knowledge_mix": mix_label,
+        "ingest_type_mix": "single30_multi10_tf10_case50",
+        "difficulty": difficulty,
+        "exam_category": ec,
+        "examCategory": ec,
+    }
+    if pc_id is not None:
+        draft_cfg["project_case_id"] = int(pc_id)
+        draft_cfg["projectCaseId"] = int(pc_id)
     try:
         draft_set_id = repo.create_set(
             collection=collection,
             set_type="bank_ingest",
             exam_track=exam_track,
             title=title,
-            set_config={
-                "source": "bank_ingest_by_ai",
-                "ingest_job_id": job_id,
-                "ingest_knowledge_mix": "project_case30_audit30_regulation20_program20",
-                "ingest_type_mix": "single30_multi10_tf10_case50",
-                "difficulty": difficulty,
-            },
+            set_config=draft_cfg,
             status="draft",
             created_by=created_by,
             items=[],
@@ -1105,16 +1429,39 @@ def ingest_bank_by_ai(
             bank_stems_for_dedupe = repo.list_recent_question_stems(
                 collection=collection, exam_track=exam_track, limit=260
             )
-            for scope_key, cat_label, seg_n in _ingest_knowledge_scope_plan(target_count):
+            if ec == "project_case":
+                scope_plan: List[tuple[str, str, int]] = [("project_case", "项目案例", target_count)]
+            else:
+                scope_plan = _ingest_knowledge_scope_plan(target_count, weights=kw)
+            for scope_key, cat_label, seg_n in scope_plan:
                 if seg_n <= 0:
                     continue
-                for qt, qc in _ingest_question_type_plan(seg_n):
+                for qt, qc in _ingest_question_type_plan(seg_n, weights=qw):
                     if qc <= 0:
                         continue
                     qt = _safe_question_type(qt)
-                    scope_hash = _make_scope_hash(exam_track, hash_cat, difficulty, qt)
-                    evidence = _extract_evidence_scoped(agent, exam_track, scope_key, top_k=max(8, qc))
+                    scope_hash = _make_scope_hash(exam_track, hash_cat, difficulty, qt, ec, project_case_id=pc_id)
                     gen_n = qc + max(2, (qc + 3) // 4)
+                    # 项目案例录题：与「来一套」补题同源取证，并加大 top_k（录题无缓存、全靠当次素材，过少易泛化）
+                    if ec == "project_case" and pc_id is not None:
+                        tk_pc = max(16, qc, gen_n, qc * 2 + 4)
+                        tk_pc = min(tk_pc, 120)
+                        evidence = _extract_evidence_project_case(
+                            agent,
+                            exam_track,
+                            top_k=tk_pc,
+                            exam_category=ec,
+                            project_case_id=int(pc_id),
+                        )
+                    else:
+                        evidence = _extract_evidence_scoped(
+                            agent,
+                            exam_track,
+                            scope_key,
+                            top_k=max(8, qc),
+                            exam_category=ec,
+                            project_case_id=pc_id,
+                        )
                     try:
                         generated = _generate_questions_by_ai(
                             exam_track=exam_track,
@@ -1123,6 +1470,8 @@ def ingest_bank_by_ai(
                             question_type=qt,
                             count=gen_n,
                             evidence=evidence,
+                            exam_category=ec,
+                            project_case_id=int(pc_id) if ec == "project_case" and pc_id is not None else None,
                         )
                     except Exception:
                         generated = _fallback_questions(
@@ -1132,11 +1481,12 @@ def ingest_bank_by_ai(
                             evidence,
                             question_type=qt,
                             difficulty=difficulty,
+                            exam_category=ec,
                         )
                     prior_stems = [str(x.get("stem") or "") for x in all_saved]
                     prior_stems.extend(bank_stems_for_dedupe)
                     generated = _dedupe_questions_for_ingest(
-                        generated, prior_stems=prior_stems, max_similar_frac=0.2
+                        generated, prior_stems=prior_stems, max_similar_frac=msf
                     )
                     generated = generated[:qc]
                     if len(generated) < qc:
@@ -1148,9 +1498,10 @@ def ingest_bank_by_ai(
                             evidence,
                             question_type=qt,
                             difficulty=difficulty,
+                            exam_category=ec,
                         )
                         more_prior = prior_stems + [str(x.get("stem") or "") for x in generated]
-                        fb = _dedupe_questions_for_ingest(fb, prior_stems=more_prior, max_similar_frac=0.2)
+                        fb = _dedupe_questions_for_ingest(fb, prior_stems=more_prior, max_similar_frac=msf)
                         generated.extend(fb[:need])
                         generated = generated[:qc]
                     saved = _save_questions_to_bank(
@@ -2032,4 +2383,108 @@ def admin_patch_bank_question(
 def admin_delete_bank_question(*, collection: str, question_id: int) -> Dict[str, Any]:
     repo.admin_deactivate_question(collection=collection, question_id=int(question_id))
     return {"question_id": int(question_id), "deleted": True}
+
+
+def regulatory_updates_hint(*, exam_track: str, as_of: Optional[str] = None, since: Optional[str] = None) -> Dict[str, Any]:
+    """面向「新标发布」备考：由模型归纳**可能需关注的监管/标准动态方向**（不等同于官方发布清单）。
+
+    输出仅供内部培训选题线索；实施与注册决策必须以主管部门与标准发布机构正式文本为准。
+    """
+    tr = str(exam_track or "").strip().lower()
+    if tr not in EXAM_TRACKS:
+        raise ValueError(f"不支持的 exam_track: {exam_track}")
+    as_of_d = date.today().isoformat()
+    if as_of:
+        try:
+            as_of_d = str(date.fromisoformat(str(as_of).strip()[:10]))
+        except Exception:
+            pass
+    since_d = (date.fromisoformat(as_of_d) - timedelta(days=365)).isoformat()
+    if since:
+        try:
+            since_d = str(date.fromisoformat(str(since).strip()[:10]))
+        except Exception:
+            pass
+    track_name = EXAM_TRACKS.get(tr, tr)
+    track_hint = TRACK_HINTS.get(tr, "")
+    prompt = f"""
+你是医疗器械软件（SaMD/独立软件）合规信息助理。
+时间窗（必须遵守）：**自 {since_d} 起至 {as_of_d}（含）止，约近 12 个月**；请优先围绕该时间窗内**可能已公开讨论/征求意见/换版预告/过渡期安排**等方向组织要点（仍不得编造具体文号、公告号与实施日期）。
+体考类型：{track_name}（{track_hint}）
+
+任务：列出培训/考试命题时**值得优先核对**的「通用法规、标准、指南、专标」**更新与修订方向**（不写死具体文号与实施日期，避免幻觉）。
+
+硬性要求：
+1) 只输出 JSON，不要其它文字。
+2) 格式：{{
+  "since": "{since_d}",
+  "as_of": "{as_of_d}",
+  "exam_track": "{tr}",
+  "disclaimer": "本结果由模型归纳，可能不完整或滞后；**不得以本 JSON 替代官方发布**。命题请围绕“变化影响与组织应对”而非虚构条款。",
+  "checklist": [
+    {{"domain":"监管/标准/指南/专标之一","what_to_watch":"要关注什么变化","why_for_software":"与医疗器械软件相关的典型影响方向","how_to_verify":"建议的官方核对渠道类型（如主管部门法规库、标准委公开文本）"}}
+  ],
+  "suggested_question_angles": ["用于录题/出题的角度1","角度2","角度3"]
+}}
+3) checklist 4～8 条；每条应能回答「与上一稳定版本相比，组织要核对什么」；表述克制，避免断言「已发布」「已实施」除非属于常识性周期描述且不绑定具体文号。
+
+JSON:""".strip()
+    try:
+        prov = (settings.quiz_provider or settings.provider or "").strip().lower()
+        model = (settings.quiz_llm_model or settings.llm_model or "").strip()
+        temp = float(getattr(settings, "quiz_temperature", 0.2) or 0.2)
+        logger.info(
+            "regulatory_updates_hint: calling LLM (invoke_chat_direct) exam_track=%s since=%s as_of=%s provider=%r model=%r",
+            tr,
+            since_d,
+            as_of_d,
+            prov or "",
+            model or "",
+        )
+        txt = invoke_chat_direct(prompt, temperature=temp, provider=prov, model=model)
+        data = json.loads(_norm_json_text(txt))
+        if not isinstance(data, dict):
+            data = {}
+        data.setdefault("since", since_d)
+        data.setdefault("as_of", as_of_d)
+        data.setdefault("exam_track", tr)
+        data.setdefault(
+            "disclaimer",
+            "本结果由模型归纳，可能不完整或滞后；不得以本输出替代官方发布。",
+        )
+        n_chk = len(data.get("checklist") or []) if isinstance(data.get("checklist"), list) else 0
+        logger.info(
+            "regulatory_updates_hint: LLM returned JSON ok exam_track=%s checklist_items=%s",
+            tr,
+            n_chk,
+        )
+        return data
+    except Exception as exc:
+        logger.warning(
+            "regulatory_updates_hint: LLM or parse failed, using static fallback exam_track=%s err=%s",
+            tr,
+            str(exc)[:500],
+        )
+        return {
+            "since": since_d,
+            "as_of": as_of_d,
+            "exam_track": tr,
+            "disclaimer": "模型不可用或解析失败；请直接查阅主管部门法规库与标准发布机构公开文本。",
+            "error": str(exc),
+            "checklist": [
+                {
+                    "domain": "软件生命周期与配置管理",
+                    "what_to_watch": "设计开发/变更控制/发布与可追溯性要求是否有更新导向",
+                    "why_for_software": "独立软件版本迭代频繁，需对齐变更证据与风险管理更新",
+                    "how_to_verify": "对照最新质量管理体系与软件相关指导原则公开文本",
+                },
+                {
+                    "domain": "网络安全与数据保护",
+                    "what_to_watch": "数据出境、日志留存、脆弱性管理等要求是否有强化趋势",
+                    "why_for_software": "联网与远程功能影响安全证据组织方式",
+                    "how_to_verify": "查阅网络安全相关法规与配套指南的公开版本说明",
+                },
+            ],
+            "suggested_question_angles": ["修订前后差异对验证范围的影响", "适用范围变化对说明书与标签的影响", "过渡期内的证据组织策略（不绑定具体日期）"],
+        }
 

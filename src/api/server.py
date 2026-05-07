@@ -29,7 +29,7 @@ from fastapi.openapi.docs import (
     swagger_ui_default_parameters,
 )
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from config import settings
 from src.core.agent import ReviewAgent
@@ -44,6 +44,7 @@ from config.runtime_settings import apply_runtime_config_dict, sync_cursor_overr
 from src.core.db import load_app_settings
 from src.core.quiz import service as quiz_service
 from src.core.quiz.models import EXAM_TRACKS
+from src.core.quiz.service import QuizRequestError
 
 app = FastAPI(
     title="注册文档审核 Agent API",
@@ -296,29 +297,51 @@ class CollectionRequest(BaseModel):
 
 
 class QuizGenerateSetRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     collection: str = "regulations"
     exam_track: str = "cn"
+    # daily=日常考试；new_standard=新标发布（与体考类型正交）
+    exam_category: str = Field(
+        default="daily",
+        validation_alias=AliasChoices("exam_category", "examCategory"),
+    )
     title: str = ""
     category: str = ""
     difficulty: str = "medium"
     question_type: str = "single_choice"
     question_count: int = 20
     created_by: str = "system"
+    # exam_category=project_case 时必填：project_cases.id
+    project_case_id: Optional[int] = Field(default=None, alias="projectCaseId")
 
 
 class QuizPracticeSetRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     collection: str = "regulations"
     exam_track: str = "cn"
+    exam_category: str = Field(
+        default="daily",
+        validation_alias=AliasChoices("exam_category", "examCategory"),
+    )
     category: str = ""
     difficulty: str = "medium"
     question_type: str = "single_choice"
     question_count: int = 20
     user_id: str = ""
+    project_case_id: Optional[int] = Field(default=None, alias="projectCaseId")
 
 
 class QuizIngestByAIRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
     collection: str = "regulations"
     exam_track: str = "cn"
+    exam_category: str = Field(
+        default="daily",
+        validation_alias=AliasChoices("exam_category", "examCategory"),
+    )
     target_count: int = 50
     review_mode: str = "auto_apply"
     category: str = ""
@@ -326,6 +349,18 @@ class QuizIngestByAIRequest(BaseModel):
     question_type: str = "single_choice"
     created_by: str = "system"
     set_title: str = ""
+    project_case_id: Optional[int] = Field(default=None, alias="projectCaseId")
+    # 由 aiword 从 app_configs 注入；缺省则 aicheckword 内用产品默认占比
+    ingest_knowledge_weights: Optional[List[float]] = None
+    ingest_question_type_weights: Optional[List[float]] = None
+    max_similar_frac: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
+class QuizRegulatoryHintRequest(BaseModel):
+    exam_track: str = "cn"
+    as_of: str = ""
+    # 时间窗起点（YYYY-MM-DD）；缺省由服务端按 as_of 回推约 365 天
+    since: str = ""
 
 
 class QuizIngestJobSetIdRequest(BaseModel):
@@ -880,8 +915,12 @@ def quiz_generate_set(request: QuizGenerateSetRequest):
             question_type=request.question_type,
             question_count=request.question_count,
             status="draft",
+            exam_category=request.exam_category,
+            project_case_id=request.project_case_id,
         )
         return {"ok": True, "data": data}
+    except QuizRequestError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -902,6 +941,8 @@ def quiz_generate_practice_set(request: QuizPracticeSetRequest):
             question_type=request.question_type,
             question_count=request.question_count,
             status="published",
+            exam_category=request.exam_category,
+            project_case_id=request.project_case_id,
         )
         sid = int(data.get("id") or data.get("set_id") or 0) if isinstance(data, dict) else 0
         if sid > 0 and isinstance(data, dict):
@@ -919,6 +960,8 @@ def quiz_generate_practice_set(request: QuizPracticeSetRequest):
                 data["practiceSessionId"] = str(aid)
                 data["sessionId"] = str(aid)
         return {"ok": True, "data": data}
+    except QuizRequestError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -938,10 +981,45 @@ def quiz_ingest_bank_by_ai(request: QuizIngestByAIRequest):
             difficulty=request.difficulty,
             question_type=request.question_type,
             set_title=request.set_title,
+            exam_category=request.exam_category,
+            ingest_knowledge_weights=request.ingest_knowledge_weights,
+            ingest_question_type_weights=request.ingest_question_type_weights,
+            max_similar_frac=request.max_similar_frac,
+            project_case_id=request.project_case_id,
         )
         return {"ok": True, "data": data}
+    except QuizRequestError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/tools/project-cases")
+def quiz_tools_project_cases(collection: str = Query("regulations", description="知识库 collection")):
+    """已训练入库（knowledge_docs 有 project_case 块）的项目案例列表，供考试中心下拉。"""
+    try:
+        rows = quiz_service.list_ready_project_cases_for_quiz(collection=collection)
+        return {"ok": True, "data": {"cases": rows, "collection": collection}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/quiz/tools/regulatory-updates-hint")
+def quiz_regulatory_updates_hint(request: QuizRegulatoryHintRequest):
+    """「新标发布」备考：按体考类型给出需关注的法规/标准/指南更新方向（模型归纳，非官方清单）。"""
+    if request.exam_track not in EXAM_TRACKS:
+        raise HTTPException(status_code=400, detail=f"exam_track 不支持: {request.exam_track}")
+    try:
+        data = quiz_service.regulatory_updates_hint(
+            exam_track=request.exam_track,
+            as_of=request.as_of or None,
+            since=request.since or None,
+        )
+        return {"ok": True, "data": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/quiz/bank/ingest-jobs/{job_id}")
@@ -1206,6 +1284,24 @@ def quiz_wrongbook_get(
         return {"ok": True, "data": quiz_service.student_wrongbook(collection=collection, user_id=user_id, limit=limit)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/student/assignments", include_in_schema=False)
+def quiz_student_assignments_compat():
+    """兼容 aiword 多路径探测：考试任务由 aiword 管理；返回空列表（HTTP 200），避免日志误报 404。"""
+    return {"ok": True, "data": {"assignments": []}}
+
+
+@app.get("/quiz/me/assignments", include_in_schema=False)
+def quiz_me_assignments_compat():
+    """同上：/me 别名。"""
+    return {"ok": True, "data": {"assignments": []}}
+
+
+@app.get("/quiz/student/exams", include_in_schema=False)
+def quiz_student_exams_compat():
+    """兼容 aiword 探测的旧路径；考试列表由 aiword 本地提供。"""
+    return {"ok": True, "data": {"assignments": []}}
 
 
 @app.get("/quiz/student/unpracticed-bank")

@@ -33,6 +33,18 @@ def _parse_answer_question_id(raw: Any) -> int:
         return 0
 
 
+def _normalize_question_stem_in_memory(item: Dict[str, Any]) -> None:
+    """各题型：若题干内嵌了与 evidence 相同的大段摘录，在返回给前端前截断（不改数据库）。"""
+    try:
+        from src.core.quiz.service import _trim_embedded_evidence_from_stem as _trim_stem
+    except Exception:
+        return
+    ev = item.get("evidence")
+    if not isinstance(ev, list):
+        return
+    item["stem"] = _trim_stem(str(item.get("stem") or ""), ev)
+
+
 def _pick_user_answer_blob(x: Dict[str, Any]) -> Any:
     """兼容 aiword/前端：`answer`、`value` 与 `user_answer` 等价。"""
     if not isinstance(x, dict):
@@ -299,6 +311,7 @@ def list_questions_by_ids(*, collection: str, question_ids: Sequence[int]) -> Li
         r["options"] = _load(r.pop("options_json", "[]"), [])
         r["answer"] = _load(r.pop("answer_json", "null"), None)
         r["evidence"] = _load(r.pop("evidence_json", "[]"), [])
+        _normalize_question_stem_in_memory(r)
         out.append(r)
     return out
 
@@ -506,6 +519,7 @@ def load_set(set_id: int) -> Optional[Dict[str, Any]]:
         r["options"] = _load(r.pop("options_json", "[]"), [])
         r["answer"] = _load(r.pop("answer_json", "null"), None)
         r["evidence"] = _load(r.pop("evidence_json", "[]"), [])
+        _normalize_question_stem_in_memory(r)
         out_items.append(r)
     d = dict(root)
     d["set_config"] = _load(d.get("set_config_json"), {})
