@@ -1,0 +1,3 @@
+# 开发/文档用可选依赖（不进入生产镜像默认安装）
+# 生成考试中心介绍 PPT：pip install -r requirements-dev.txt && python scripts/generate_exam_center_pptx.py
+python-pptx>=0.6.21,<2.0.0
