@@ -1,37 +1,40 @@
 """
 调用 Cursor Cloud Agents API：发起任务、轮询完成、取回助手回复文本。
+支持请求级凭据（``ClientLlmConfig`` / aiword Header）与 ``settings`` 合并。
 """
+
+from __future__ import annotations
 
 import base64
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
 from config import settings
 
 
-def _auth_header() -> str:
-    raw = f"{settings.cursor_api_key}:"
+def _auth_header(api_key: str) -> str:
+    raw = f"{api_key}:"
     return "Basic " + base64.b64encode(raw.encode()).decode()
 
 
-def _get_headers() -> dict:
+def _get_headers(api_key: str) -> dict:
     return {
-        "Authorization": _auth_header(),
+        "Authorization": _auth_header(api_key),
         "Content-Type": "application/json",
     }
 
 
-def _base_url() -> str:
-    base = (settings.cursor_api_base or "https://api.cursor.com").rstrip("/")
-    return base
+def _base_url(base: str) -> str:
+    return (base or "https://api.cursor.com").rstrip("/")
 
 
 def _http_client(timeout: float = 60) -> httpx.Client:
     """统一创建 httpx 客户端。支持：关闭 SSL 校验、绕过系统代理（代理导致 SSL EOF 时）"""
     try:
         from config.cursor_overrides import get_cursor_verify_ssl, get_cursor_trust_env
+
         verify = get_cursor_verify_ssl()
         trust_env = get_cursor_trust_env()
     except Exception:
@@ -60,20 +63,27 @@ def _raise_for_status_with_body(r: httpx.Response, context: str = "") -> None:
     raise RuntimeError(f"Error code: {r.status_code} - {msg}{hint}".strip())
 
 
-def launch_agent(prompt_text: str) -> str:
-    if not settings.cursor_api_key or not settings.cursor_repository:
-        raise RuntimeError("Cursor 模式下请配置 API Key 和 GitHub 仓库地址（Cursor Dashboard → Integrations）")
-    url = f"{_base_url()}/v0/agents"
+def launch_agent(prompt_text: str, *, client_llm: Optional[Any] = None) -> str:
+    from src.core.llm_factory import ClientLlmConfig, merged_cursor_launch_params
+
+    cl = client_llm if isinstance(client_llm, ClientLlmConfig) else None
+    p = merged_cursor_launch_params(cl)
+    if not p["api_key"] or not p["repository"]:
+        raise RuntimeError(
+            "Cursor 模式下请配置 API Key 与 GitHub 仓库地址（请求头 X-Client-Llm-Api-Key / "
+            "X-Client-Cursor-Repository，或 aicheckword 系统设置中的 cursor_*）"
+        )
+    url = f"{_base_url(p['base_url'])}/v0/agents"
     payload = {
         "prompt": {"text": prompt_text},
         "source": {
-            "repository": settings.cursor_repository.strip(),
-            "ref": (settings.cursor_ref or "main").strip(),
+            "repository": p["repository"].strip(),
+            "ref": (p["ref"] or "main").strip(),
         },
         "target": {"autoCreatePr": False},
     }
     with _http_client(timeout=90) as client:
-        r = client.post(url, json=payload, headers=_get_headers())
+        r = client.post(url, json=payload, headers=_get_headers(p["api_key"]))
         _raise_for_status_with_body(r, "launch_agent")
         data = r.json()
     return data["id"]
@@ -83,18 +93,30 @@ def launch_agent(prompt_text: str) -> str:
 _POLL_REQUEST_TIMEOUT = 120
 
 
-def get_agent_status(agent_id: str) -> dict:
-    url = f"{_base_url()}/v0/agents/{agent_id}"
+def get_agent_status(agent_id: str, *, client_llm: Optional[Any] = None) -> dict:
+    from src.core.llm_factory import ClientLlmConfig, merged_cursor_launch_params
+
+    cl = client_llm if isinstance(client_llm, ClientLlmConfig) else None
+    p = merged_cursor_launch_params(cl)
+    if not p["api_key"]:
+        raise RuntimeError("Cursor 模式下缺少 API Key")
+    url = f"{_base_url(p['base_url'])}/v0/agents/{agent_id}"
     with _http_client(timeout=_POLL_REQUEST_TIMEOUT) as client:
-        r = client.get(url, headers=_get_headers())
+        r = client.get(url, headers=_get_headers(p["api_key"]))
         _raise_for_status_with_body(r, "get_agent_status")
         return r.json()
 
 
-def get_agent_conversation(agent_id: str) -> list:
-    url = f"{_base_url()}/v0/agents/{agent_id}/conversation"
+def get_agent_conversation(agent_id: str, *, client_llm: Optional[Any] = None) -> list:
+    from src.core.llm_factory import ClientLlmConfig, merged_cursor_launch_params
+
+    cl = client_llm if isinstance(client_llm, ClientLlmConfig) else None
+    p = merged_cursor_launch_params(cl)
+    if not p["api_key"]:
+        raise RuntimeError("Cursor 模式下缺少 API Key")
+    url = f"{_base_url(p['base_url'])}/v0/agents/{agent_id}/conversation"
     with _http_client(timeout=_POLL_REQUEST_TIMEOUT) as client:
-        r = client.get(url, headers=_get_headers())
+        r = client.get(url, headers=_get_headers(p["api_key"]))
         _raise_for_status_with_body(r, "get_agent_conversation")
         data = r.json()
     return data.get("messages") or []
@@ -104,10 +126,12 @@ def poll_until_finished(
     agent_id: str,
     poll_interval: float = 2.0,
     timeout: float = 300,
+    *,
+    client_llm: Optional[Any] = None,
 ) -> str:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        status_data = get_agent_status(agent_id)
+        status_data = get_agent_status(agent_id, client_llm=client_llm)
         status = (status_data.get("status") or "").upper()
         if status in ("FINISHED", "FAILED", "STOPPED"):
             return status
@@ -115,8 +139,8 @@ def poll_until_finished(
     return "TIMEOUT"
 
 
-def get_last_assistant_reply(agent_id: str) -> Optional[str]:
-    messages = get_agent_conversation(agent_id)
+def get_last_assistant_reply(agent_id: str, *, client_llm: Optional[Any] = None) -> Optional[str]:
+    messages = get_agent_conversation(agent_id, client_llm=client_llm)
     texts = []
     for m in messages:
         if (m.get("type") or "") == "assistant_message" and m.get("text"):
@@ -126,12 +150,18 @@ def get_last_assistant_reply(agent_id: str) -> Optional[str]:
     return "\n\n".join(texts)
 
 
-def complete_task(prompt_text: str, poll_interval: float = 2.0, timeout: float = 600) -> str:
-    agent_id = launch_agent(prompt_text)
-    status = poll_until_finished(agent_id, poll_interval=poll_interval, timeout=timeout)
+def complete_task(
+    prompt_text: str,
+    poll_interval: float = 2.0,
+    timeout: float = 600,
+    *,
+    client_llm: Optional[Any] = None,
+) -> str:
+    agent_id = launch_agent(prompt_text, client_llm=client_llm)
+    status = poll_until_finished(agent_id, poll_interval=poll_interval, timeout=timeout, client_llm=client_llm)
     if status != "FINISHED":
         raise RuntimeError(f"Cursor Agent 未完成: status={status}, agent_id={agent_id}")
-    reply = get_last_assistant_reply(agent_id)
+    reply = get_last_assistant_reply(agent_id, client_llm=client_llm)
     if not reply:
         raise RuntimeError(f"Cursor Agent 未返回对话内容, agent_id={agent_id}")
     return reply

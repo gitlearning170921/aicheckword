@@ -185,15 +185,32 @@ class ReviewAgent:
         return pkb.add_documents(chunks, file_name=name)
 
     def extract_and_save_project_basic_info(
-        self, project_id: int, provider: Optional[str] = None
+        self,
+        project_id: int,
+        provider: Optional[str] = None,
+        client_llm=None,
+        *,
+        inline_source_text: Optional[str] = None,
     ) -> str:
-        """从项目知识库中已入库的文本提取「项目基本信息」，若知识库中无此条则训练后写入 projects.basic_info_text，供审核时与待审文档一致性核对。返回提取出的文本。"""
+        """从项目知识库中已入库的文本提取「项目基本信息」，写入 projects.basic_info_text。
+
+        若传入 ``inline_source_text``（例如初稿流程已本地加载的输入摘录且跳过向量化），
+        则优先使用该文本，避免依赖先 ``train_project_docs`` 再读库。
+        """
         from config import settings
-        text = get_project_knowledge_text(project_id, max_chars=15000)
+        text = (inline_source_text or "").strip()
+        if len(text) < 50:
+            text = get_project_knowledge_text(project_id, max_chars=15000)
         if not text or len(text.strip()) < 50:
             update_project_basic_info(project_id, "")
             return ""
-        use_cursor = (provider or getattr(settings, "provider", None) or "").lower() == "cursor"
+        prov = (provider or getattr(settings, "provider", None) or "").strip().lower()
+        _cl_active = False
+        if client_llm is not None:
+            try:
+                _cl_active = bool(client_llm.has_any())
+            except Exception:
+                _cl_active = False
         from .db import get_prompt_by_key
         _default_basic = """从以下项目资料（如技术要求、说明书等）中，提取用于审核时与待审文档做一致性核对的基本信息。
 
@@ -215,9 +232,14 @@ class ReviewAgent:
         prompt = tpl.format(text=text[:12000])
 
         try:
-            if use_cursor:
+            if prov == "cursor":
                 from .cursor_agent import complete_task
-                out = complete_task(prompt)
+
+                out = complete_task(prompt, client_llm=client_llm)
+            elif _cl_active:
+                from .llm_factory import invoke_chat_direct
+
+                out = invoke_chat_direct(prompt, temperature=0.1, provider=provider, client_llm=client_llm)
             else:
                 msg = self.reviewer.llm.invoke(prompt)
                 out = getattr(msg, "content", str(msg))

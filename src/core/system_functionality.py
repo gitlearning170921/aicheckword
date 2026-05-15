@@ -156,6 +156,7 @@ def identify_system_functionality_with_llm(
     raw_content: str,
     source_hint: str,
     provider: Optional[str] = None,
+    client_llm=None,
 ) -> str:
     """用 LLM 根据原始内容生成系统功能描述。"""
     from config import settings as s
@@ -164,12 +165,32 @@ def identify_system_functionality_with_llm(
         source_hint=source_hint,
         raw_content=raw_content[:12000],
     )
-    use_cursor = (provider or getattr(s, "provider", "") or "").strip().lower() == "cursor"
-    if use_cursor:
+    prov = (provider or getattr(s, "provider", "") or "").strip().lower()
+    if prov == "cursor":
         from .cursor_agent import complete_task
-        return (complete_task(prompt_text) or "").strip()
-    # Ollama / OpenAI
+
+        return (complete_task(prompt_text, client_llm=client_llm) or "").strip()
+    _cl_active = False
+    if client_llm is not None:
+        try:
+            _cl_active = bool(client_llm.has_any())
+        except Exception:
+            _cl_active = False
+    if _cl_active:
+        from .llm_factory import invoke_chat_direct
+
+        return (
+            invoke_chat_direct(
+                prompt_text,
+                temperature=0.1,
+                provider=provider,
+                client_llm=client_llm,
+            )
+            or ""
+        ).strip()
+    # Ollama / OpenAI（全局 settings）
     from .reviewer import DocumentReviewer
+
     rev = DocumentReviewer()
     msg = rev.llm.invoke(prompt_text)
     return (getattr(msg, "content", str(msg)) or "").strip()

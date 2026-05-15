@@ -40,11 +40,13 @@ from src.core.db import (
     list_projects,
     list_project_cases,
 )
+from src.core.project_option_label import format_project_option_label
 from config.runtime_settings import apply_runtime_config_dict, sync_cursor_overrides_from_settings
 from src.core.db import load_app_settings
 from src.core.quiz import service as quiz_service
 from src.core.quiz.models import EXAM_TRACKS
 from src.core.quiz.service import QuizRequestError
+from src.api.draft_integration import router as draft_integration_router
 
 app = FastAPI(
     title="注册文档审核 Agent API",
@@ -61,6 +63,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(draft_integration_router)
 
 _agents: Dict[str, ReviewAgent] = {}
 
@@ -1844,6 +1848,7 @@ def integration_list_projects(collection: str = "regulations"):
                 "registrationComponent": p.get("registration_component", ""),
                 "projectForm": p.get("project_form", ""),
                 "productName": p.get("product_name", ""),
+                "label": format_project_option_label(p),
             }
             for p in projects
         ]

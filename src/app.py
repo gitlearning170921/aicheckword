@@ -241,6 +241,7 @@ from src.core.db import (
     OP_TYPE_TRANSLATION,
     OP_TYPE_TRANSLATION_ERROR,
 )
+from src.core.project_option_label import format_project_option_label as _project_option_label
 from src.core.audit_handoff import (
     build_immediate_audit_point_records,
     build_immediate_audit_remediation_by_target,
@@ -422,34 +423,14 @@ def _cached_operation_logs(op_type, collection_filter, limit: int):
 
 def _invalidate_operation_logs_cache() -> None:
     """写入 operation_logs 后调用，避免「操作记录」页 TTL 缓存看不到刚写入的行。"""
-    try:
-        _cached_operation_logs.clear()
-    except Exception:
-        pass
+    from src.core.operation_logs_invalidation import invalidate_operation_logs_cache
+
+    invalidate_operation_logs_cache()
 
 
 @_make_ttl_cache(ttl_sec=12)
 def _cached_list_projects(collection: str):
     return list_projects(collection)
-
-
-def _project_option_label(p: dict) -> str:
-    """项目下拉展示：名称 + 主键 ID（+ 项目编号），便于区分库中多条同名项目。"""
-    try:
-        nm = str((p or {}).get("name") or "").strip() or "未命名"
-    except Exception:
-        nm = "未命名"
-    try:
-        pid = int((p or {}).get("id") or 0)
-    except Exception:
-        pid = 0
-    pc = ""
-    try:
-        pc = str((p or {}).get("project_code") or "").strip()
-    except Exception:
-        pc = ""
-    suf = f" · {pc}" if pc else ""
-    return f"{nm} (ID:{pid}){suf}"
 
 
 @_make_ttl_cache(ttl_sec=12)
@@ -3337,7 +3318,7 @@ def _render_projects_tab(agent, collection: str):
     forms = dims.get("project_forms", ["Web", "APP", "PC"])
 
     projects = _cached_list_projects(collection)
-    project_options = ["➕ 新建项目"] + [f"{p['name']} (ID:{p['id']})" for p in projects]
+    project_options = ["➕ 新建项目"] + [_project_option_label(p) for p in projects]
 
     sel = st.selectbox("选择项目", project_options, key="proj_sel")
     if sel == "➕ 新建项目":
@@ -10135,7 +10116,6 @@ def render_draft_page():
         if case_file_names and _base_name_candidates and not selected_template_files:
             _matched = [n for n in _base_name_candidates if n in case_file_names]
             if _matched:
-                # 仅当用户未选择且未确认“生成全部”时自动填充
                 try:
                     if not st.session_state.get(f"draft_select_all_{base_case_id}"):
                         st.session_state["draft_template_files"] = list(dict.fromkeys(_matched))

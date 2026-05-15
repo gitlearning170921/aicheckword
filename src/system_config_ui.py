@@ -74,6 +74,13 @@ API_DIR_KEYS = [
 
 KDOCS_KEYS = ["kdocs_app_id", "kdocs_app_key"]
 
+# 初稿集成 Tab；须与 config.settings.Settings 中字段同名（仅当 model 含该键时参与 FLAT 对账）
+_DRAFT_INTEGRATION_SETTING_KEYS: Tuple[str, ...] = (
+    "draft_interop_allowed_providers",
+    "draft_interop_personal_keys_only",
+    "draft_interop_notes",
+)
+
 # 与侧栏 provider 值一致；返回当前提供方需要编辑的字段（不含 provider / 模型）
 _PROVIDER_OPTION_VALUES = [
     "deepseek",
@@ -195,8 +202,13 @@ FLAT_KEYS: List[str] = list_persistable_setting_keys()
 
 STATIC_FORM_KEYS: Set[str] = set(MYSQL_KEYS + NETWORK_KEYS + CHROMA_CHUNK_KEYS + REVIEW_STABILITY_KEYS + API_DIR_KEYS + KDOCS_KEYS)
 _AI_TAB_KEYS: Set[str] = _all_ai_tab_keys_union()
-_GROUPED = STATIC_FORM_KEYS | _AI_TAB_KEYS | {"cursor_verify_ssl", "cursor_trust_env"}
 _all = set(FLAT_KEYS)
+_GROUPED = (
+    STATIC_FORM_KEYS
+    | _AI_TAB_KEYS
+    | {"cursor_verify_ssl", "cursor_trust_env"}
+    | (set(_DRAFT_INTEGRATION_SETTING_KEYS) & _all)
+)
 if _GROUPED != _all:
     missing = sorted(_all - _GROUPED)
     extra = sorted(_GROUPED - _all)
@@ -205,6 +217,7 @@ if _GROUPED != _all:
 SYSTEM_CONFIG_TAB_LABELS: List[str] = [
     "MySQL",
     "AI 与模型",
+    "初稿集成",
     "网络/SSL",
     "向量分块",
     "审核稳定",
@@ -268,6 +281,9 @@ FIELD_LABELS: Dict[str, str] = {
     "review_deepseek_inter_doc_sleep_sec": "批量审核文件间间隔·DeepSeek 额外（秒）",
     "audit_perf_log": "审核报告性能分段日志（或环境变量 AUDIT_PERF_LOG=1）",
     "async_correction_kb_feed": "纠正写入知识库：后台线程异步嵌入（关闭则同步阻塞保存）",
+    "draft_interop_allowed_providers": "初稿联调：允许的 provider（逗号分隔小写；留空=服务端不限制）",
+    "draft_interop_personal_keys_only": "初稿联调：须个人 Key 且禁止回落系统各厂商 Key（与 Header 语义一致）",
+    "draft_interop_notes": "初稿联调：给 aiword 等客户端展示的备注（纯文本）",
     "api_host": "FastAPI 监听地址",
     "api_port": "FastAPI 端口",
     "training_docs_dir": "训练文档目录",
@@ -355,6 +371,12 @@ def _collect_from_widgets() -> Dict[str, Any]:
 
 
 def _render_field(key: str) -> None:
+    if key not in settings.model_fields:
+        st.warning(
+            f"配置项 **{key}** 在当前运行的 Settings 模型中不存在（多为未同步 `config/settings.py` 或需重启进程）。"
+            "请拉齐代码后重启 Streamlit。"
+        )
+        return
     label = FIELD_LABELS.get(key, key)
     field = settings.model_fields[key]
     ann = field.annotation
@@ -482,8 +504,37 @@ def _render_static_keys(title: str, keys: List[str]) -> None:
         _render_field(key)
 
 
+def _render_draft_integration_tab() -> None:
+    """初稿 HTTP 集成（aiword）与联调状态：独立分区，避免埋没在「AI 与模型」折叠里。"""
+    st.markdown("**初稿集成 API（aiword）与模型联调状态**")
+    st.info(
+        "**HTTP 前缀**：`/api/integration/draft`（jobs / meta / download / **interop-config**）。\n\n"
+        "**联调白名单与 Header 语义**（含 `X-Client-Llm-Personal-Keys-Only`、个人 Key 与系统 Key 分工）："
+        "见仓库文档 **`docs/integration-draft-provider-status.md`**（与源码同目录 `docs/`）。\n\n"
+        "**管理员须在本系统配好的项**（供 Cursor 等回落）：`cursor_repository`、`cursor_api_base`、`cursor_ref`；"
+        "以及各提供方在侧栏/本页中的 **Base URL / 默认模型**（aiword 用户未填个人 Base/模型时由上游按该逻辑回落）。\n\n"
+        "**aiword 侧**：页面2个人 Key 与系统 Key 独立；本分区下方三项保存入库后，由 **`GET .../interop-config`** 下发供 aiword 同步展示与校验。"
+    )
+    st.caption(
+        "初稿路由注册在 FastAPI `draft_integration` 中；下方字段与其它系统配置一样写入 "
+        "`runtime_settings_json`，保存后即对集成 API 生效。"
+    )
+    _present = [k for k in _DRAFT_INTEGRATION_SETTING_KEYS if k in settings.model_fields]
+    _missing = [k for k in _DRAFT_INTEGRATION_SETTING_KEYS if k not in settings.model_fields]
+    if _missing:
+        st.warning(
+            "当前进程加载的 **Settings** 缺少初稿联调字段 "
+            f"（{', '.join(_missing)}）。请确认已更新 **`config/settings.py`** 并**重启** Streamlit / 应用后再打开本页。"
+        )
+    if _present:
+        _render_static_keys("联调策略（入库后 aiword 可拉取 interop-config）", list(_present))
+
+
 def _render_ai_tab() -> None:
     st.markdown("**AI 服务与模型**")
+    st.caption(
+        "初稿 HTTP 集成、aiword 个人 Key 模式与 **provider 联调白名单**：请切换到上方配置分区 **「初稿集成」** 查看完整说明。"
+    )
     st.caption(
         "此处**仅编辑要入库的配置**，下拉切换提供方**不会**改变左侧边栏当前使用的服务；"
         "侧栏用于切换实际运行中的 AI。保存系统配置后，侧栏会与入库的提供方对齐。"
@@ -635,6 +686,8 @@ def render_system_config_body() -> None:
         _render_static_keys("MySQL（新机器请至少在 .env 中配置此项以首次连库）", MYSQL_KEYS)
     elif section == "AI 与模型":
         _render_ai_tab()
+    elif section == "初稿集成":
+        _render_draft_integration_tab()
     elif section == "网络/SSL":
         _render_static_keys(
             "网络 / SSL / 代理（与侧栏「不校验 SSL」「不使用系统代理」一致；默认即当前运行配置）",

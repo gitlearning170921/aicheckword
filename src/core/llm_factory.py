@@ -4,12 +4,59 @@
 """
 
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 
 from config import settings
 from config.cursor_overrides import get_llm_verify_ssl, get_llm_trust_env
+
+
+@dataclass
+class ClientLlmConfig:
+    """单次请求级 LLM 凭据（如 aiword 用户自带 Key）。禁止写入日志或 DB。
+
+    Cursor Cloud Agents：``api_key`` 为 Cursor Dashboard API Key；``base_url`` 为 Cursor API Base；
+    ``cursor_repository`` / ``cursor_ref`` 对应 GitHub 仓库与分支（与系统设置字段语义一致）。
+
+    ``personal_keys_only``：为 True 时 **API Key 仅用请求内字段**，不回退到 ``settings``（如 aiword 页面2个人配置）。
+    """
+
+    api_key: str = ""
+    base_url: str = ""
+    model: str = ""
+    cursor_repository: str = ""
+    cursor_ref: str = ""
+    personal_keys_only: bool = False
+
+    def has_any(self) -> bool:
+        return bool(
+            (self.api_key or "").strip()
+            or (self.base_url or "").strip()
+            or (self.model or "").strip()
+            or (self.cursor_repository or "").strip()
+            or (self.cursor_ref or "").strip()
+        )
+
+
+def merged_cursor_launch_params(client_llm: Optional[ClientLlmConfig] = None) -> dict[str, str]:
+    """合并请求级 ClientLlmConfig 与 ``settings``，得到 Cursor Agents 所需的 Key / Base / 仓库 / ref。"""
+    cl = client_llm
+    strict = bool(cl and cl.personal_keys_only)
+    if strict:
+        ak = ((cl.api_key if cl else "") or "").strip()
+    else:
+        ak = ((cl.api_key if cl else "") or "").strip() or (settings.cursor_api_key or "").strip()
+    base = ((cl.base_url if cl else "") or "").strip() or (settings.cursor_api_base or "https://api.cursor.com").strip()
+    repo = ((cl.cursor_repository if cl else "") or "").strip() or (settings.cursor_repository or "").strip()
+    ref = ((cl.cursor_ref if cl else "") or "").strip() or (settings.cursor_ref or "main").strip()
+    return {
+        "api_key": ak,
+        "base_url": base.rstrip("/"),
+        "repository": repo,
+        "ref": ref or "main",
+    }
 
 
 def _ensure_tiktoken_no_proxy():
@@ -198,21 +245,27 @@ def invoke_chat_direct(
     temperature: float = 0.1,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    client_llm: Optional[ClientLlmConfig] = None,
 ) -> str:
     """
     直接调用当前配置的聊天接口，返回助手回复内容。
     用于多文档一致性等场景，避免 LangChain 将 content 当模板解析导致 {\"category\"} 报错。
     支持：openai / deepseek / lingyi（OpenAI 兼容）、ollama、tongyi（DashScope Generation）。
     provider: 若传入（如从 Streamlit current_provider），则优先使用，否则用 settings.provider。
+    client_llm: 若传入且含 api_key/base_url/model 等，则对应字段覆盖 settings（用于集成 API / 用户自带 Key）。
     """
     p = (provider or settings.provider or "").strip().lower()
-    m = (model or settings.llm_model or "").strip()
+    cl = client_llm
+    m = ((cl.model if cl else "") or model or settings.llm_model or "").strip()
 
     if p == "tongyi":
         # 通义走 DashScope 官方域名，与 OpenAI 兼容服务的 Base URL 无关；侧栏也无「通义 Base URL」项。
-        api_key = (settings.dashscope_api_key or "").strip()
+        if cl and getattr(cl, "personal_keys_only", False):
+            api_key = ((cl.api_key if cl else "") or "").strip()
+        else:
+            api_key = ((cl.api_key if cl else "") or (settings.dashscope_api_key or "")).strip()
         if not api_key:
-            raise RuntimeError("通义模式下请先配置 DASHSCOPE_API_KEY")
+            raise RuntimeError("通义模式下请先配置 DASHSCOPE_API_KEY或在请求中传入 X-Client-Llm-Api-Key")
         try:
             from dashscope import Generation
         except ImportError as e:
@@ -243,10 +296,13 @@ def invoke_chat_direct(
 
     with _openai_http_client() as client:
         if p in ("openai", "deepseek", "lingyi"):
-            api_key = _openai_compatible_api_key(p)
-            base_url = _openai_compatible_base_url(p).rstrip("/")
+            if cl and getattr(cl, "personal_keys_only", False):
+                api_key = ((cl.api_key if cl else "") or "").strip()
+            else:
+                api_key = ((cl.api_key if cl else "") or _openai_compatible_api_key(p)).strip()
+            base_url = ((cl.base_url if cl else "") or _openai_compatible_base_url(p)).strip().rstrip("/")
             if not api_key:
-                raise RuntimeError(f"{p} 模式下请先配置 API Key")
+                raise RuntimeError(f"{p} 模式下请先配置 API Key或在请求中传入 X-Client-Llm-Api-Key")
             url = f"{base_url}/chat/completions"
             payload = {
                 "model": m or ("deepseek-chat" if p == "deepseek" else "gpt-4o-mini"),
@@ -267,7 +323,9 @@ def invoke_chat_direct(
             return (choice.get("message") or {}).get("content") or ""
 
         if p == "ollama":
-            base_url = (settings.ollama_base_url or "http://localhost:11434").rstrip("/")
+            base_url = (
+                ((cl.base_url if cl else "") or (settings.ollama_base_url or "http://localhost:11434")).strip().rstrip("/")
+            )
             url = f"{base_url}/api/chat"
             payload = {
                 "model": m or "qwen2.5",

@@ -32,7 +32,7 @@ from .document_loader import (
     extract_section_outline_from_texts,
 )
 from .knowledge_base import KnowledgeBase
-from .llm_factory import invoke_chat_direct
+from .llm_factory import ClientLlmConfig, invoke_chat_direct
 from .system_functionality import identify_system_functionality_with_llm
 from .cursor_agent import complete_task
 from .agent import ReviewAgent
@@ -605,6 +605,7 @@ def _plan_multi_base_route_llm(
     base_manifest: List[Tuple[str, str]],
     ref_manifest: List[Tuple[str, str]],
     provider: Optional[str],
+    client_llm: Optional[ClientLlmConfig] = None,
 ) -> Dict[str, Any]:
     ref_all_names = [rn for _, rn in ref_manifest]
     if not chosen:
@@ -634,7 +635,11 @@ def _plan_multi_base_route_llm(
     )
 
     try:
-        raw = invoke_chat_direct(prompt, temperature=0.15, provider=provider)
+        _p_route = (provider or "").strip().lower()
+        if _p_route == "cursor":
+            raw = complete_task(prompt, client_llm=client_llm)
+        else:
+            raw = invoke_chat_direct(prompt, temperature=0.15, provider=provider, client_llm=client_llm)
         parsed = _parse_json_object_from_llm(raw or "")
         if not parsed or not isinstance(parsed.get("assignments"), list):
             raise ValueError("invalid routing json")
@@ -1000,6 +1005,7 @@ class DocumentDraftGenerator:
         *,
         template_file_name: str,
         provider: Optional[str] = None,
+        client_llm: Optional[ClientLlmConfig] = None,
     ) -> List[Dict[str, Any]]:
         """从知识库中提取适用于当前目标文件的测试用例编号规则（tc_id_rules）。
 
@@ -1197,8 +1203,13 @@ class DocumentDraftGenerator:
         ).format(file_name=key, kb_ctx=kb_ctx)
 
         try:
-            use_cursor = settings.is_cursor or (provider or "").strip().lower() == "cursor"
-            raw = (complete_task(prompt) if use_cursor else invoke_chat_direct(prompt, temperature=0.1, provider=provider)) or ""
+            _p_tc = (provider or "").strip().lower()
+            if _p_tc == "cursor":
+                raw = (complete_task(prompt, client_llm=client_llm) or "").strip()
+            else:
+                raw = (
+                    invoke_chat_direct(prompt, temperature=0.1, provider=provider, client_llm=client_llm) or ""
+                ).strip()
             obj = json.loads((raw or "").strip())
             rules = obj.get("tc_id_rules") if isinstance(obj, dict) else None
             if not isinstance(rules, list):
@@ -1249,6 +1260,7 @@ class DocumentDraftGenerator:
         workspace_root: Optional[Path] = None,
         provider: Optional[str] = None,
         audit_remediation_text: str = "",
+        client_llm: Optional[ClientLlmConfig] = None,
     ) -> Tuple[str, bool]:
         try:
             _row_pf = get_draft_file_skills_rules(self.collection, int(base_case_id), template_file_name)
@@ -1346,11 +1358,20 @@ class DocumentDraftGenerator:
                     "元素必须来自上述清单中的 [R*_P*] 引用；若确实无法对应则填空数组 []。\n"
                 )
 
-        if settings.is_cursor or (provider or "").strip().lower() == "cursor":
+        _p_one = (provider or "").strip().lower()
+        if _p_one == "cursor":
             # Cursor 模式下 skills/rules 也会参与；但此处仍把其内容注入 prompt，确保非 Cursor/或截断时依旧遵循硬约束。
-            return ((complete_task(prompt) or "").strip(), had_per_file)
+            return ((complete_task(prompt, client_llm=client_llm) or "").strip(), had_per_file)
 
-        return (invoke_chat_direct(prompt, temperature=DOC_DRAFT_GEN_TEMPERATURE, provider=provider).strip(), had_per_file)
+        return (
+            invoke_chat_direct(
+                prompt,
+                temperature=DOC_DRAFT_GEN_TEMPERATURE,
+                provider=provider,
+                client_llm=client_llm,
+            ).strip(),
+            had_per_file,
+        )
 
     def generate(
         self,
@@ -1402,7 +1423,12 @@ class DocumentDraftGenerator:
         author_role_map: Optional[Dict[str, str]] = None,
         audit_remediation_by_target: Optional[Dict[str, str]] = None,
         # True：不读取案例库中的模板文档文本（仍可用 base_case_id 取项目维度占位；与 save_as_case=False 的审核后修改配合）
-        skip_case_template_text: bool = False,
+            skip_case_template_text: bool = False,
+            # False：与 Streamlit 初稿页一致，先 train_project_docs 再读库提取基本信息（慢，但输入会进项目向量库）。
+            # True：仅用本地摘录提取基本信息，跳过向量化（集成 API 默认 True，显著缩短 Ollama embed 阶段）。
+            skip_input_vector_training: bool = False,
+            # 集成 API：用户自带 LLM 凭据（禁止持久化）
+            client_llm: Optional[ClientLlmConfig] = None,
     ) -> GeneratedCaseDocs:
         def _progress(msg: str, frac: float) -> None:
             try:
@@ -1446,10 +1472,18 @@ class DocumentDraftGenerator:
                 p = Path(src_path)
                 if not p.exists():
                     raise FileNotFoundError(f"输入文件不存在：{src_path}")
-                # 复制一份到临时目录，避免后续路径/权限影响训练或转换
-                dst = temp_dir / (src_name or p.name)
+                # 复制一份到临时目录，避免后续路径/权限影响训练或转换。
+                # 压缩包解压场景下 src_name 可能含子目录（如 folder/doc.docx）；须先 mkdir 父级，
+                # 否则 Windows 上 Path.write_bytes 会因父目录不存在报 Errno 2。
+                raw_nm = (src_name or "").strip() or p.name
+                rel = Path(raw_nm)
+                if rel.is_absolute() or ".." in rel.parts:
+                    rel = Path(p.name)
+                dst = temp_dir / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_bytes(p.read_bytes())
-                saved_inputs.append((str(dst), dst.name))
+                disp = rel.as_posix() if str(rel) != p.name else dst.name
+                saved_inputs.append((str(dst), disp))
 
             # 3) 选择已有项目或新建项目
             proj_existing = None
@@ -1501,15 +1535,72 @@ class DocumentDraftGenerator:
             # 拉取项目最新信息（用于“空输入重跑”场景复用已保存的 basic_info/system_functionality）
             proj_latest = get_project(int(project_id)) or {}
 
-            # 4) 训练输入文件到项目专属向量库，用于提取基本信息
+            # 3b) 从磁盘加载输入/参考文件摘录（后续系统功能、生成路由与「跳过向量化」时的基本信息提取共用）
+            combined_input_text = ""
             if saved_inputs:
-                _progress(f"训练输入文件（{len(saved_inputs)} 个）…", 0.12)
-            for fp, fn in saved_inputs:
-                self.agent.train_project_docs(int(project_id), fp, file_name=fn)
+                _progress("加载输入/参考文件摘录…", 0.08)
+
+                def _build_combined_input_excerpt() -> str:
+                    parts: List[str] = []
+                    for fp, _fn in saved_inputs:
+                        try:
+                            docs = load_single_file(fp)
+                            per_file_cap = 18000
+                            _txt = _smart_excerpt_from_docs(
+                                docs, file_name=Path(fp).name, max_chars=per_file_cap
+                            )
+                            parts.append(f"【输入/参考文件：{Path(fp).name}】\n{_txt}")
+                        except Exception:
+                            parts.append(f"【输入文档加载失败/仅文件名占位：{Path(fp).name}】")
+                    return "\n\n".join(t for t in parts if t.strip())
+
+                combined_input_text = _build_combined_input_excerpt()
+
+            # 4) 训练输入文件到项目专属向量库（可跳过：与 Streamlit 默认不同，集成侧默认跳过以节省 embed 时间）
+            if saved_inputs and not skip_input_vector_training:
+                _progress(f"训练输入文件（向量化，共 {len(saved_inputs)} 个）…", 0.10)
+                n_in = len(saved_inputs)
+                for i_in, (fp, fn) in enumerate(saved_inputs, start=1):
+                    frac_lo, frac_hi = 0.10, 0.22
+                    base_frac = frac_lo + (frac_hi - frac_lo) * ((i_in - 1) / max(1, n_in))
+                    span = (frac_hi - frac_lo) / max(1, n_in)
+
+                    def _on_loading(msg: str, *, _i=i_in, _fn=fn) -> None:
+                        _progress(
+                            f"训练输入文件 ({_i}/{n_in})：{_fn} · {msg}",
+                            base_frac + span * 0.08,
+                        )
+
+                    def _embed_cb(done: int, total: int, *, _i=i_in, _fn=fn) -> None:
+                        t = max(1, int(total))
+                        d = min(int(done), t)
+                        sub = base_frac + span * (0.15 + 0.80 * (d / t))
+                        _progress(
+                            f"训练输入文件 ({_i}/{n_in})：{_fn} · 向量化 {d}/{t} 块",
+                            min(sub, base_frac + span * 0.99),
+                        )
+
+                    self.agent.train_project_docs(
+                        int(project_id),
+                        fp,
+                        file_name=fn,
+                        on_loading=_on_loading,
+                        callback=_embed_cb,
+                    )
+            elif saved_inputs and skip_input_vector_training:
+                _progress(
+                    f"已跳过输入向量化（{len(saved_inputs)} 个文件；本次输入不入项目向量库，基本信息从摘录提取）…",
+                    0.12,
+                )
 
             if saved_inputs:
                 _progress("提取项目基本信息…", 0.22)
-                extracted_basic_info_text = self.agent.extract_and_save_project_basic_info(int(project_id), provider=provider)
+                extracted_basic_info_text = self.agent.extract_and_save_project_basic_info(
+                    int(project_id),
+                    provider=provider,
+                    client_llm=client_llm,
+                    inline_source_text=combined_input_text if skip_input_vector_training else None,
+                )
             else:
                 # 允许“历史记录重新生成”不上传输入文件：复用项目中已保存的 basic_info_text
                 extracted_basic_info_text = (proj_latest.get("basic_info_text") or "").strip()
@@ -1544,27 +1635,13 @@ class DocumentDraftGenerator:
 
             # 5) 提取/更新系统功能描述（供项目审核一致性核对）
             #    这里直接从输入文档“可读文本”提炼，不依赖 project_knowledge_text（避免训练/提取耦合）
-            input_docs_texts: List[str] = []
-            for fp, _fn in saved_inputs:
-                try:
-                    docs = load_single_file(fp)
-                    # 防止长 PDF/长 Word 仅取开头导致关键信息遗漏：构建“头尾+关键词命中”的稳健摘录
-                    per_file_cap = 18000
-                    _txt = _smart_excerpt_from_docs(docs, file_name=Path(fp).name, max_chars=per_file_cap)
-                    input_docs_texts.append(
-                        f"【输入/参考文件：{Path(fp).name}】\n{_txt}"
-                    )
-                except Exception:
-                    # 训练阶段通常可通过；此处失败就降级：把文件名占位
-                    input_docs_texts.append(f"【输入文档加载失败/仅文件名占位：{Path(fp).name}】")
-            combined_input_text = "\n\n".join(t for t in input_docs_texts if t.strip())
-
             if saved_inputs and combined_input_text.strip():
                 _progress("提取系统功能描述…", 0.30)
                 sys_fun_text = identify_system_functionality_with_llm(
                     raw_content=combined_input_text,
                     source_hint="输入的 Word/Excel/PDF 文档",
                     provider=provider,
+                    client_llm=client_llm,
                 )
             else:
                 # 空输入重跑：复用项目中已保存的 system_functionality_text
@@ -1703,6 +1780,7 @@ class DocumentDraftGenerator:
                     base_manifest=list(base_files_manifest or []),
                     ref_manifest=list(saved_inputs),
                     provider=provider,
+                    client_llm=client_llm,
                 )
                 for a in routing_plan.get("assignments") or []:
                     if not isinstance(a, dict):
@@ -1883,6 +1961,7 @@ class DocumentDraftGenerator:
                         if isinstance(audit_remediation_by_target, dict)
                         else ""
                     ),
+                    client_llm=client_llm,
                 )
                 if not (raw_out or "").strip():
                     raise RuntimeError(f"生成失败：{template_file_name} 返回空文本")
@@ -1919,6 +1998,7 @@ class DocumentDraftGenerator:
                                 inplace_patch=True,
                                 workspace_root=Path(__file__).resolve().parents[2],
                                 provider=provider,
+                                client_llm=client_llm,
                             )
                             pj2, nt2 = _parse_patch_and_updated_text(raw_out2)
                             if pj2.strip():
@@ -1931,7 +2011,9 @@ class DocumentDraftGenerator:
                             p_obj = json.loads(patch_json)
                             if isinstance(p_obj, dict) and "tc_id_rules" not in p_obj:
                                 tc_rules = self._extract_tc_id_rules_from_kb(
-                                    template_file_name=template_file_name, provider=provider
+                                    template_file_name=template_file_name,
+                                    provider=provider,
+                                    client_llm=client_llm,
                                 )
                                 if tc_rules:
                                     p_obj["tc_id_rules"] = tc_rules

@@ -103,6 +103,14 @@ class Settings(BaseSettings):
     # 纠正入库写入反馈向量库时是否在后台线程执行（True=先返回 UI，向量异步写入）
     async_correction_kb_feed: bool = True
 
+    # ─── 初稿集成 API（aiword）联调：由系统配置页「初稿集成」分区维护；GET /api/integration/draft/interop-config 下发 ───
+    # 允许的 provider 列表（逗号分隔、小写），空表示不限制（兼容旧部署）
+    draft_interop_allowed_providers: str = "deepseek,cursor,tongyi"
+    # True：集成请求须个人 Key、禁止与系统各厂商 Key 回落合并（与 X-Client-Llm-Personal-Keys-Only 一致）
+    draft_interop_personal_keys_only: bool = True
+    # 给 aiword 等客户端展示的运维备注（纯文本）
+    draft_interop_notes: str = ""
+
     # API 服务
     api_host: str = "0.0.0.0"
     api_port: int = 8000
