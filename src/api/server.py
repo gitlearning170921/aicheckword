@@ -16,6 +16,27 @@ os.environ["POSTHOG_DISABLED"] = "true"
 logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
 logging.getLogger("chromadb").setLevel(logging.WARNING)
 
+
+class _QuietDraftJobStatusPollAccessFilter(logging.Filter):
+    """屏蔽 aiword 等对初稿任务状态的轮询行，避免 uvicorn access 刷屏（保留 POST 创建与 download）。"""
+
+    _needle = "/api/integration/draft/jobs/"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if self._needle not in msg:
+            return True
+        u = msg.upper()
+        if "GET " not in u and '"GET ' not in msg:
+            return True
+        if "/DOWNLOAD" in u:
+            return True
+        return False
+
+
 import tempfile
 from typing import Any, Dict, List, Optional
 
@@ -46,7 +67,10 @@ from src.core.db import load_app_settings
 from src.core.quiz import service as quiz_service
 from src.core.quiz.models import EXAM_TRACKS
 from src.core.quiz.service import QuizRequestError
+from src.api.audit_integration import router as audit_integration_router
 from src.api.draft_integration import router as draft_integration_router
+from src.api.integration_common import router as integration_common_router
+from src.api.translation_integration import router as translation_integration_router
 
 app = FastAPI(
     title="注册文档审核 Agent API",
@@ -65,6 +89,9 @@ app.add_middleware(
 )
 
 app.include_router(draft_integration_router)
+app.include_router(audit_integration_router)
+app.include_router(translation_integration_router)
+app.include_router(integration_common_router)
 
 _agents: Dict[str, ReviewAgent] = {}
 
@@ -92,6 +119,11 @@ def _configure_api_service_console_timestamps() -> None:
         )
     for h in logging.getLogger("uvicorn.access").handlers:
         h.setFormatter(access_fmt)
+        if not any(
+            type(f).__name__ == "_QuietDraftJobStatusPollAccessFilter"
+            for f in getattr(h, "filters", ())
+        ):
+            h.addFilter(_QuietDraftJobStatusPollAccessFilter())
     for name in ("uvicorn.error", "uvicorn"):
         for h in logging.getLogger(name).handlers:
             h.setFormatter(default_fmt)
@@ -105,6 +137,21 @@ def _build_uvicorn_log_config_with_time() -> dict:
 
     cfg = copy.deepcopy(LOGGING_CONFIG)
     datefmt = "%Y-%m-%d %H:%M:%S"
+    cfg.setdefault("filters", {})
+    cfg["filters"]["quiet_draft_job_status_poll"] = {
+        "()": "src.api.server._QuietDraftJobStatusPollAccessFilter",
+    }
+    acc_handler = cfg.get("handlers", {}).get("access")
+    if isinstance(acc_handler, dict):
+        prev = acc_handler.get("filters")
+        if isinstance(prev, list):
+            names = [x for x in prev if x != "quiet_draft_job_status_poll"]
+            names.append("quiet_draft_job_status_poll")
+            acc_handler["filters"] = names
+        elif prev:
+            acc_handler["filters"] = [str(prev), "quiet_draft_job_status_poll"]
+        else:
+            acc_handler["filters"] = ["quiet_draft_job_status_poll"]
     for key in ("default", "access"):
         spec = cfg.get("formatters", {}).get(key)
         if isinstance(spec, dict):

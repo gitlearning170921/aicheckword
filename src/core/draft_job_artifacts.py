@@ -193,13 +193,25 @@ def export_draft_job_files(
                 except Exception:
                     pass
             else:
+                # 无 PATCH_JSON 时勿把 UPDATED_TEXT 整段追加进 docx（会破坏表格/版式）
                 saved = export_like_base(
                     base_file_path=base_path,
                     out_path=str(out_path),
                     title=fn,
                     content_text=txt or "",
                     meta=meta,
+                    append_generated_content=not bool(inplace_patch),
                 )
+                if inplace_patch and (txt or "").strip():
+                    sidecar = Path(saved).with_suffix(
+                        Path(saved).suffix + ".model-output.txt"
+                    )
+                    try:
+                        sidecar.write_text(txt or "", encoding="utf-8")
+                        downloads.append(str(sidecar))
+                        out_files_for_log.append(str(sidecar))
+                    except Exception:
+                        pass
                 downloads.append(saved)
 
             out_files_for_log.append(str(saved))

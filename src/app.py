@@ -153,6 +153,7 @@ from config.settings import (
 )
 from src.core.agent import ReviewAgent
 from src.core.document_draft_generator import DocumentDraftGenerator
+from src.core.draft_input_vectorization import find_duplicate_input_file_names
 from src.core.display_filename import sanitize_audit_report_dict
 from src.core.document_loader import (
     load_single_file,
@@ -464,125 +465,13 @@ def _infer_draft_author_role_idx(
     project_form: str = "",
 ) -> int:
     """根据待生成文件名与模板案例上的注册类别/项目形态，推断「编写人员身份」下拉索引。"""
-    scores = {k: 0 for k in _DRAFT_AUTHOR_ROLE_KEYS}
+    from src.core.draft_integration_ui_meta import infer_draft_author_role_idx as _impl
 
-    def _idx(k: str) -> int:
-        try:
-            return _DRAFT_AUTHOR_ROLE_KEYS.index(k)
-        except ValueError:
-            return 0
-
-    rt = (registration_type or "").strip()
-    pf = (project_form or "").strip()
-    high_risk_reg = any(x in rt for x in ("三类", "Ⅲ", "Ⅱb", "Ⅱa"))
-
-    for fn in file_names or []:
-        s = (fn or "").strip()
-        if not s:
-            continue
-        low = s.lower()
-
-        def _hit(*parts: str) -> bool:
-            for p in parts:
-                if not p:
-                    continue
-                if all(ord(c) < 128 for c in p):
-                    if p.lower() in low:
-                        return True
-                else:
-                    if p in s:
-                        return True
-            return False
-
-        # 测试/验证/确认 → 测试工程师（qa）
-        if _hit(
-            "测试用例", "test case", "test execution", "system test", "system testing",
-            "确认测试", "集成测试", "单元测试", "unit test", "integration test",
-            "verification plan", "verification report", "validation plan", "validation report",
-            "测试报告", "测试计划", "测试方案", "测试", "验证", "确认", "V&V", "IQ", "OQ", "PQ",
-        ):
-            scores["qa"] += 3
-        if _hit("traceability", "追溯", "rtm", "可追溯性", "traceability analysis", "追溯矩阵", "追溯分析"):
-            scores["qa"] += 2
-        # 风险 → 风险经理（rm）
-        if _hit(
-            "risk", "ras", "rmp", "rmr", "风险分析", "风险管理", "risk analysis",
-            "risk management", "风险评估", "风险控制", "风险报告", "风险",
-            "hazard", "fmea", "fta",
-        ):
-            scores["rm"] += 3
-            if high_risk_reg:
-                scores["rm"] += 1
-        # 用户需求/产品预期用途 → 产品经理（pm）
-        if _hit(
-            "urs", "用户需求", "product requirement", "产品需求", "市场需求",
-            "prd", "mrd", "需求", "user needs", "user requirement",
-        ):
-            scores["pm"] += 3
-        # 软件需求/设计/架构 → 研发经理（rdm）
-        if _hit(
-            "srs", "软件需求规范", "requirement specification", "软件需求说明书", "软件需求",
-            "software requirement", "software requirements",
-        ):
-            scores["rdm"] += 3
-        if _hit(
-            "architecture", "ads", "架构", "详细设计", "概要设计", "design specification", "sdd",
-            "网络安全", "cybersecurity", "cyber security", "设计说明", "设计规范", "软件设计",
-            "设计",
-        ):
-            scores["rdm"] += 2
-        if _hit("software description", "软件描述", "软件研究"):
-            scores["rdm"] += 2
-        if _hit("audit", "审计", "日志", "权限", "access control", "编码规范"):
-            scores["rdm"] += 1
-        # 说明书/标签 → 注册工程师（ra）
-        if _hit(
-            "instruction", "ifu", "说明书", "使用说明", "udn", "user manual", "用户手册",
-            "instructions for use", "产品技术要求", "注册申报", "注册申请", "注册自检",
-            "技术审评", "临床评价",
-        ):
-            scores["ra"] += 2
-        if _hit("label", "标签", "包装标识"):
-            scores["ra"] += 1
-        # 计划/进度 → 项目经理（pjm）
-        if _hit(
-            "milestone", "计划", "project plan", "schedule", "开发计划",
-            "项目计划", "进度计划", "立项", "里程碑",
-        ):
-            scores["pjm"] += 2
-        # 配置管理 → 配置管理员（cm）
-        if _hit(
-            "config", "配置管理", "release", "baseline", "configuration",
-            "version control", "版本控制", "变更管理", "变更控制", "配置项",
-            "配置", "scm", "cm plan",
-        ):
-            scores["cm"] += 3
-        # 界面/可用性 → UI 设计师（ui）
-        if _hit(
-            "interface", "界面", " ui", "usability", "可用性",
-            "交互", "user experience", "用户体验", "ux",
-        ):
-            scores["ui"] += 2
-        # 生产/制造 → 生产专员（prod）
-        if _hit(
-            "生产", "production", "manufacturing", "制造", "生产工艺",
-            "生产放行", "工艺规程", "bom",
-        ):
-            scores["prod"] += 2
-        if _hit("预期用途", "适应症", "intended use", "产品特性", "产品定义"):
-            scores["pm"] += 1
-
-    if max(scores.values()) == 0:
-        if pf and any(x in pf for x in ("软件", "APP", "Web", "PC", "独立")):
-            return _idx("rdm")
-        return 0
-
-    tie_break = ["qa", "rm", "rdm", "ra", "pm", "pjm", "ui", "cm", "prod", ""]
-    best = max(scores.values())
-    for k in tie_break:
-        if scores.get(k, 0) == best:
-            return _idx(k)
-    return 0
+    return _impl(
+        file_names,
+        registration_type=registration_type,
+        project_form=project_form,
+    )
 
 
 def _format_case_option(c: dict) -> str:
@@ -10809,8 +10698,51 @@ def render_draft_page():
             st.session_state["_draft_regen_notice"] = f"重新生成失败：{_re}"
         # 不要 return：继续渲染历史记录区域，便于立即查看/下载
 
+    # 参考文件向量化重名：与「② 项目专属资料」相同，按项目检测后询问覆盖或沿用已有向量
+    if st.session_state.get("draft_vec_pending_payload"):
+        _dvp = st.session_state.get("draft_vec_pending_payload") or {}
+        _dups = list(st.session_state.get("draft_vec_duplicates") or [])
+        st.warning(
+            "**与项目向量库对比**：以下参考/输入文件名在本项目中已存在，是否重新向量化？"
+        )
+        st.caption(
+            "重名文件："
+            + "、".join(_dups[:12])
+            + ("…" if len(_dups) > 12 else "")
+            + "。选择「不覆盖」将跳过向量化并优先使用库内已有数据。"
+        )
+        _dc1, _dc2 = st.columns(2)
+        with _dc1:
+            if st.button("✅ 覆盖：重新向量化并覆盖已有数据", key="draft_vec_overwrite"):
+                _pl = dict(_dvp)
+                _pl["input_vector_on_duplicate"] = "overwrite"
+                job["tmp_dir"] = st.session_state.get("draft_vec_pending_tmp_dir") or ""
+                for _k in (
+                    "draft_vec_pending_payload",
+                    "draft_vec_duplicates",
+                    "draft_vec_pending_tmp_dir",
+                    "draft_vec_expand_temp_dirs",
+                ):
+                    st.session_state.pop(_k, None)
+                _submit_draft_job(_pl)
+                _streamlit_rerun()
+        with _dc2:
+            if st.button("⏭️ 不覆盖：跳过重名文件，使用已有向量数据", key="draft_vec_skip"):
+                _pl = dict(_dvp)
+                _pl["input_vector_on_duplicate"] = "skip"
+                job["tmp_dir"] = st.session_state.get("draft_vec_pending_tmp_dir") or ""
+                for _k in (
+                    "draft_vec_pending_payload",
+                    "draft_vec_duplicates",
+                    "draft_vec_pending_tmp_dir",
+                    "draft_vec_expand_temp_dirs",
+                ):
+                    st.session_state.pop(_k, None)
+                _submit_draft_job(_pl)
+                _streamlit_rerun()
+
     # 生成进度、生成结果预览：放在“开始生成按钮”下方
-    if start and (not job.get("running")):
+    if start and (not job.get("running")) and not st.session_state.get("draft_vec_pending_payload"):
         _dir_inputs = st.session_state.get("draft_input_dir_items") or []
         if not input_files and not _dir_inputs:
             st.warning("请先上传输入/参考文件，或通过文件夹路径添加输入文件。")
@@ -10915,45 +10847,56 @@ def render_draft_page():
                 # 将临时目录记录到 job，便于失败时清理；实际清理在任务完成后进行
                 job["tmp_dir"] = str(tmp_dir)
 
-                _submit_draft_job(
-                    {
-                        "base_case_id": base_case_id,
-                        # 目标文件为空时：显式传空列表触发“base-only”模式；否则按选择生成
-                        "template_file_names": (effective_template_files if effective_template_files else []),
-                        "project_id": selected_project_id if proj_mode.startswith("使用已有") else None,
-                        "existing_base_files": existing_base_files or None,
-                        "base_files_manifest": base_files_manifest or None,
-                        "multi_base_auto_route": bool(base_files_manifest),
-                        "input_files": input_paths,
-                        "document_language": doc_lang_val,
-                        "registration_country": registration_country,
-                        "registration_type": registration_type,
-                        "registration_component": registration_component,
-                        "project_form": project_form,
-                        "project_name": p_name.strip() or "",
-                        "project_code": p_code.strip() or "",
-                        "project_name_en": p_name_en.strip() or "",
-                        "product_name": p_product.strip() or "",
-                        "product_name_en": p_product_en.strip() or "",
-                        "model": p_model.strip() or "",
-                        "model_en": p_model_en.strip() or "",
-                        "registration_country_en": p_country_en.strip() or "",
-                        "scope_of_application_override": p_scope.strip() if p_scope is not None else None,
-                        "persist_project_fields": bool(persist_project_fields),
-                        "new_case_name": new_case_name.strip() or "",
-                        "project_key": project_key.strip() or "",
-                        "skills_patch_text": skills_patch_text,
-                        "rules_patch_text": rules_patch_text,
-                        "provider": st.session_state.get("current_provider"),
-                        "inplace_patch": bool(inplace_mode),
-                        "save_as_case": bool(save_as_case),
-                        "draft_strategy": draft_strategy,
-                        "author_role": draft_author_role,
-                        "author_role_map": author_role_map or None,
-                    }
-                )
-
-                _streamlit_rerun()
+                _draft_payload = {
+                    "base_case_id": base_case_id,
+                    "template_file_names": (effective_template_files if effective_template_files else []),
+                    "project_id": selected_project_id if proj_mode.startswith("使用已有") else None,
+                    "existing_base_files": existing_base_files or None,
+                    "base_files_manifest": base_files_manifest or None,
+                    "multi_base_auto_route": bool(base_files_manifest),
+                    "input_files": input_paths,
+                    "document_language": doc_lang_val,
+                    "registration_country": registration_country,
+                    "registration_type": registration_type,
+                    "registration_component": registration_component,
+                    "project_form": project_form,
+                    "project_name": p_name.strip() or "",
+                    "project_code": p_code.strip() or "",
+                    "project_name_en": p_name_en.strip() or "",
+                    "product_name": p_product.strip() or "",
+                    "product_name_en": p_product_en.strip() or "",
+                    "model": p_model.strip() or "",
+                    "model_en": p_model_en.strip() or "",
+                    "registration_country_en": p_country_en.strip() or "",
+                    "scope_of_application_override": p_scope.strip() if p_scope is not None else None,
+                    "persist_project_fields": bool(persist_project_fields),
+                    "new_case_name": new_case_name.strip() or "",
+                    "project_key": project_key.strip() or "",
+                    "skills_patch_text": skills_patch_text,
+                    "rules_patch_text": rules_patch_text,
+                    "provider": st.session_state.get("current_provider"),
+                    "inplace_patch": bool(inplace_mode),
+                    "save_as_case": bool(save_as_case),
+                    "draft_strategy": draft_strategy,
+                    "author_role": draft_author_role,
+                    "author_role_map": author_role_map or None,
+                    "input_vector_on_duplicate": "skip",
+                }
+                _vec_dups: list = []
+                if selected_project_id and input_paths:
+                    _vec_dups = find_duplicate_input_file_names(
+                        int(selected_project_id),
+                        [str(dn) for _p, dn in input_paths],
+                    )
+                if _vec_dups:
+                    st.session_state["draft_vec_pending_payload"] = _draft_payload
+                    st.session_state["draft_vec_duplicates"] = _vec_dups
+                    st.session_state["draft_vec_pending_tmp_dir"] = str(tmp_dir)
+                    st.session_state["draft_vec_expand_temp_dirs"] = list(expand_temp_dirs)
+                    _streamlit_rerun()
+                else:
+                    _submit_draft_job(_draft_payload)
+                    _streamlit_rerun()
 
             except Exception as e:
                 st.error(f"提交生成任务失败：{e}")

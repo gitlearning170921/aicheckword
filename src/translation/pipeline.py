@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .models import TextBlock, SUPPORTED_EXTENSIONS
-from .parser import parse_document
+from .parser import _paragraphs_in_hf_container, parse_document
 from .segment import blocks_to_sentences, apply_translations_to_blocks
 from .translator import translate_sentences
 from .correction import correct_text, CorrectionStats, apply_manual_replacements
@@ -135,19 +135,80 @@ def _write_docx(source_path: Path, out_path: Path, blocks: List[TextBlock]) -> N
                 [b for b in blocks if b.block_type == "header" and len(b.path) >= 3 and b.path[0] == section_idx and b.path[1] == "h"],
                 key=lambda b: b.path[2],
             )
+            header_paras = _paragraphs_in_hf_container(section.header, doc)
             for i, b in enumerate(header_blocks):
-                if i < len(section.header.paragraphs):
-                    _replace_paragraph_text_keep_format(section.header.paragraphs[i], b.translated_text or b.original_text)
+                if i < len(header_paras):
+                    _replace_paragraph_text_keep_format(
+                        header_paras[i], b.translated_text or b.original_text
+                    )
             footer_blocks = sorted(
                 [b for b in blocks if b.block_type == "footer" and len(b.path) >= 3 and b.path[0] == section_idx and b.path[1] == "f"],
                 key=lambda b: b.path[2],
             )
+            footer_paras = _paragraphs_in_hf_container(section.footer, doc)
             for i, b in enumerate(footer_blocks):
-                if i < len(section.footer.paragraphs):
-                    _replace_paragraph_text_keep_format(section.footer.paragraphs[i], b.translated_text or b.original_text)
+                if i < len(footer_paras):
+                    _replace_paragraph_text_keep_format(
+                        footer_paras[i], b.translated_text or b.original_text
+                    )
         except Exception:
             pass
     doc.save(out_path)
+    _write_docx_comments(out_path, blocks)
+
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _write_docx_comments(out_path: Path, blocks: List[TextBlock]) -> None:
+    """回填 word/comments.xml 中的批注正文。"""
+    import os
+    import tempfile
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    by_key: dict[tuple[str, int], str] = {}
+    for b in blocks:
+        if b.block_type != "comment" or len(b.path) < 2:
+            continue
+        text = (b.translated_text or b.original_text or "").strip()
+        if not text:
+            continue
+        by_key[(str(b.path[0]), int(b.path[1]))] = b.translated_text or b.original_text or ""
+
+    if not by_key:
+        return
+    try:
+        with zipfile.ZipFile(out_path, "r") as zin:
+            if "word/comments.xml" not in zin.namelist():
+                return
+            root = ET.fromstring(zin.read("word/comments.xml"))
+            for comment_el in root.findall(f"{{{_W_NS}}}comment"):
+                cid = comment_el.get(f"{{{_W_NS}}}id") or comment_el.get("id") or ""
+                for p_idx, p_el in enumerate(comment_el.findall(f".//{{{_W_NS}}}p")):
+                    key = (str(cid), p_idx)
+                    if key not in by_key:
+                        continue
+                    new_text = by_key[key]
+                    t_nodes = list(p_el.findall(f".//{{{_W_NS}}}t"))
+                    if not t_nodes:
+                        continue
+                    t_nodes[0].text = new_text
+                    for t_el in t_nodes[1:]:
+                        t_el.text = ""
+            new_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            archive = {item.filename: zin.read(item.filename) for item in zin.infolist()}
+        archive["word/comments.xml"] = new_xml
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".docx")
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_name)
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for name, data in archive.items():
+                zout.writestr(name, data)
+        shutil.copy2(tmp_path, out_path)
+        tmp_path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _write_txt(out_path: Path, blocks: List[TextBlock]) -> None:

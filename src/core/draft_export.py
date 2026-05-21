@@ -234,8 +234,9 @@ def _next_unique_tc_id_word(
 def _word_row_joined(row, col_n: int) -> str:
     parts: List[str] = []
     try:
-        for ci in range(min(col_n, len(row.cells))):
-            parts.append(_word_cell_text_best(row.cells[ci]))
+        cells = _word_unique_cells(row)
+        for ci in range(min(col_n, len(cells))):
+            parts.append(_word_cell_text_best(cells[ci]))
     except Exception:
         pass
     return "\t".join(parts)
@@ -358,10 +359,35 @@ def _xlsx_split_row_values_for_insert(raw: str, col_hint: int) -> List[str]:
             return parts
     if col_hint < 2 or len(s) < 50:
         return [s]
+    # 用例/风险编号常见 GN71-274（含连字符）；旧式 ^([A-Z]{2,5}\d{1,4}) 无法匹配，会整串落入首列导致表格“错位”
+    mhy = re.match(r"^([A-Z]{2,8}\d{1,4}-\d{1,4})(.+)$", s)
+    if mhy:
+        parts: List[str] = [mhy.group(1)]
+        rest = (mhy.group(2) or "").strip()
+        if not rest:
+            return [s]
+        m_srs = re.match(r"^([A-Z]{2,10}_\d{3,4})(.*)$", rest)
+        if m_srs:
+            parts.append(m_srs.group(1))
+            rest = (m_srs.group(2) or "").strip()
+        if not rest:
+            return parts if len(parts) >= 2 else [s]
+        chunks = re.split(r"(?<=[a-z0-9\)\.\”\"])(?=[A-Z][a-zA-Z])", rest)
+        for ch in chunks:
+            ch = ch.strip()
+            if ch:
+                parts.append(ch)
+        if len(parts) < 2:
+            return [s]
+        if len(parts) > col_hint and col_hint >= 2:
+            head = parts[: col_hint - 1]
+            tail = " ".join(parts[col_hint - 1 :])
+            parts = head + [tail]
+        return parts
     m = re.match(r"^([A-Z]{2,5}\d{1,4})(.+)$", s)
     if not m:
         return [s]
-    parts: List[str] = [m.group(1)]
+    parts = [m.group(1)]
     rest = (m.group(2) or "").strip()
     if not rest:
         return [s]
@@ -377,6 +403,336 @@ def _xlsx_split_row_values_for_insert(raw: str, col_hint: int) -> List[str]:
         tail = " ".join(parts[col_hint - 1 :])
         parts = head + [tail]
     return parts
+
+
+# 用于在锚点行上方识别「表头行」，以便按列名对齐写入 insert_table_row
+_TABLE_HEADER_LIKENESS_KEYS = (
+    "编号",
+    "用例",
+    "测试",
+    "需求",
+    "追溯",
+    "类型",
+    "项",
+    "条件",
+    "步骤",
+    "预期",
+    "系统",
+    "版本",
+    "摘要",
+    "名称",
+    "描述",
+    "内容",
+    "环境",
+    "平台",
+    "兼容",
+    "接口",
+    "case",
+    "id",
+    "req",
+    "type",
+    "step",
+    "result",
+    "os",
+    "platform",
+    "title",
+    "name",
+    "procedure",
+    "priority",
+    "pre",
+)
+
+
+def _table_header_likeness(labels: List[str]) -> int:
+    joined = " ".join((x or "").strip() for x in labels)
+    lo = joined.lower()
+    n = 0
+    for k in _TABLE_HEADER_LIKENESS_KEYS:
+        if k.lower() in lo:
+            n += 1
+    return n
+
+
+def _hdr_key_match_score(header_cell: str, key: str) -> float:
+    a = re.sub(r"\s+", " ", (header_cell or "").strip())
+    b = re.sub(r"\s+", " ", (key or "").strip())
+    if not a or not b:
+        return 0.0
+    al, bl = a.lower(), b.lower()
+    if bl in al or al in bl:
+        return 1.0
+    return float(SequenceMatcher(None, al, bl).ratio())
+
+
+def _map_row_dict_to_vals_by_headers(
+    header_labels: List[str], row_dict: Dict[str, Any], col_n: int
+) -> List[str]:
+    """将 {表头关键字: 值} 映射到与表同序的 col_n 个单元格；未匹配列留空。"""
+    n = max(1, int(col_n))
+    hdr = list(header_labels or [])
+    while len(hdr) < n:
+        hdr.append("")
+    hdr = hdr[:n]
+    vals = [""] * n
+    for j in range(n):
+        hcell = hdr[j]
+        if not (hcell or "").strip():
+            continue
+        best_v = ""
+        best_sc = 0.48
+        for ki, vi in row_dict.items():
+            k = str(ki).strip()
+            if not k:
+                continue
+            sc = _hdr_key_match_score(hcell, k)
+            if sc > best_sc:
+                best_sc = sc
+                best_v = "" if vi is None else str(vi).strip()
+        if best_sc >= 0.48:
+            vals[j] = best_v
+    return vals
+
+
+def _coerce_row_by_header_from_op(op: Dict[str, Any], new_text: str) -> Optional[Dict[str, Any]]:
+    """从 op['row_by_header'] 或 JSON 形态的 new_text 得到列名->值 映射。"""
+    rbh = op.get("row_by_header")
+    if isinstance(rbh, dict) and rbh:
+        out = {str(k).strip(): v for k, v in rbh.items() if str(k).strip()}
+        return out or None
+    s = (new_text or "").strip()
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            j = json.loads(s)
+            if isinstance(j, dict) and j:
+                return {str(k).strip(): v for k, v in j.items() if str(k).strip()}
+        except Exception:
+            return None
+    return None
+
+
+def unescape_patch_text_literals(s: str) -> str:
+    """模型 JSON 中常写字面量 ``\\t``/``\\n``（反斜杠+t），导出前转为真实制表/换行。"""
+    if not s:
+        return s
+    out = (
+        s.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\r", "\r")
+    )
+    return out
+
+
+_TC_ROW_ID_RE = re.compile(r"^[A-Z]{2,8}\d{1,4}-\d{1,4}")
+
+
+def _looks_like_table_row_batch(text: str) -> bool:
+    """判断 new_text 是否应为表格插行（而非正文段落）。"""
+    s = unescape_patch_text_literals((text or "").strip())
+    if not s:
+        return False
+    lines = _split_table_rows_from_new_text(s)
+    tc_hits = sum(1 for ln in lines if _TC_ROW_ID_RE.match((ln or "").strip()))
+    if len(lines) >= 2 and tc_hits >= 2:
+        return True
+    if len(lines) == 1:
+        ln = lines[0]
+        if "\t" in ln and _TC_ROW_ID_RE.search(ln):
+            return True
+    if len(re.findall(r"[A-Z]{2,8}\d{1,4}-\d{1,4}", s)) >= 2:
+        return True
+    return False
+
+
+def _split_conjoined_tc_rows(line: str) -> List[str]:
+    """单行内粘连多条用例行（GN71-390…GN71-391…）时按编号切开。"""
+    s = (line or "").strip()
+    if not s:
+        return []
+    parts = re.split(r"(?=(?:[A-Z]{2,8}\d{1,4}-\d{1,4}))", s)
+    out = [p.strip() for p in parts if p.strip()]
+    return out if len(out) >= 2 else [s]
+
+
+def normalize_patch_operations(ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """规范化每条 operation 的 new_text，并将误用的段落插入升级为表格插行。"""
+    out: List[Dict[str, Any]] = []
+    for op in ops or []:
+        if not isinstance(op, dict):
+            continue
+        o = dict(op)
+        nt = o.get("new_text")
+        if nt is not None:
+            o["new_text"] = unescape_patch_text_literals(str(nt))
+        t = (o.get("type") or "").strip()
+        if t == "insert_paragraph_after_contains" and _looks_like_table_row_batch(
+            str(o.get("new_text") or "")
+        ):
+            o["type"] = "insert_table_row_after_contains"
+            o["_auto_upgraded_from"] = "insert_paragraph_after_contains"
+        out.append(o)
+    return out
+
+
+def normalize_patch_json_string(patch_json: str) -> str:
+    try:
+        obj = json.loads(patch_json or "{}")
+    except Exception:
+        return patch_json
+    if not isinstance(obj, dict):
+        return patch_json
+    raw_ops = obj.get("operations") or []
+    if not isinstance(raw_ops, list):
+        return patch_json
+    obj["operations"] = normalize_patch_operations(raw_ops)
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _split_table_rows_from_new_text(new_text: str) -> List[str]:
+    """
+    insert_table_row 的 new_text 可含多行：每行一条记录，列用 \\t 分隔。
+    模型常把 GN71-274\\t...\\nGN71-275\\t... 写在同一 operation 里。
+    """
+    raw = unescape_patch_text_literals(new_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return []
+    lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+    if len(lines) == 1:
+        split1 = _split_conjoined_tc_rows(lines[0])
+        if len(split1) >= 2:
+            lines = split1
+    if len(lines) <= 1:
+        return lines
+    row_like: List[str] = []
+    for ln in lines:
+        if "\t" in ln:
+            row_like.append(ln)
+            continue
+        if _TC_ROW_ID_RE.match(ln):
+            row_like.append(ln)
+    if len(row_like) >= 2:
+        return row_like
+    return [raw]
+
+
+def _vals_from_table_row_line(line: str, col_n: int) -> List[str]:
+    """单行 \\t 分列并补齐到 col_n。"""
+    cn = max(1, int(col_n))
+    vals = [x for x in (line or "").split("\t")]
+    if len(vals) == 1 and "\t" not in (line or ""):
+        vals2 = _xlsx_split_row_values_for_insert(line or "", cn)
+        if len(vals2) > 1:
+            vals = vals2
+    while len(vals) < cn:
+        vals.append("")
+    return vals[:cn]
+
+
+def _word_row_index_in_table(tbl, row_obj) -> int:
+    try:
+        tr = row_obj._tr
+        for i, r in enumerate(getattr(tbl, "rows", []) or []):
+            if getattr(r, "_tr", None) is tr:
+                return int(i)
+    except Exception:
+        pass
+    return -1
+
+
+def _word_find_header_row_labels(
+    tbl, anchor_r_idx: int, col_n: int
+) -> Tuple[int, List[str]]:
+    """
+    在锚点行上方识别表头，返回 (主表头行下标, 长度 col_n 的列名列表)。
+    优先选 unique_cells 数与 col_n 一致的行；否则合并多行表头（同列索引取首个非空）。
+    """
+    rows = list(getattr(tbl, "rows", []) or [])
+    cn = max(1, int(col_n))
+    if len(rows) < 2 or anchor_r_idx < 1:
+        return -1, []
+    best_r, best_score = -1, -1.0
+    for r in range(0, max(0, int(anchor_r_idx))):
+        try:
+            cells = _word_unique_cells(rows[r])
+            labels = [_word_cell_text_best(c).strip() for c in cells]
+        except Exception:
+            continue
+        if sum(1 for x in labels if x) < 2:
+            continue
+        ncol = len(labels)
+        exact = 1.5 if ncol == cn else 0.0
+        closeness = 1.0 - abs(ncol - cn) / max(cn, 8)
+        kw = _table_header_likeness(labels)
+        sc = kw * 2.0 + closeness + exact
+        if sc > best_score:
+            best_score, best_r = sc, r
+    if best_r >= 0 and best_score >= 2.0:
+        try:
+            cells = _word_unique_cells(rows[best_r])
+            labels = [_word_cell_text_best(c).strip() for c in cells]
+            if len(labels) == cn:
+                return best_r, labels
+        except Exception:
+            pass
+    stacked = [""] * cn
+    used_rows: List[int] = []
+    for r in range(max(0, int(anchor_r_idx) - 8), max(0, int(anchor_r_idx))):
+        try:
+            cells = _word_unique_cells(rows[r])
+            if len(cells) != cn:
+                continue
+            labels = [_word_cell_text_best(c).strip() for c in cells]
+            if _table_header_likeness(labels) < 1 and not any(labels):
+                continue
+            used_rows.append(r)
+            for j, t in enumerate(labels):
+                if t and not stacked[j]:
+                    stacked[j] = t
+        except Exception:
+            continue
+    if sum(1 for x in stacked if x) >= 2:
+        return (used_rows[0] if used_rows else -1), stacked
+    if best_r >= 0 and best_score >= 2.0:
+        try:
+            cells = _word_unique_cells(rows[best_r])
+            labels = [_word_cell_text_best(c).strip() for c in cells]
+            while len(labels) < cn:
+                labels.append("")
+            return best_r, labels[:cn]
+        except Exception:
+            pass
+    return -1, []
+
+
+def _xlsx_find_header_row_labels(
+    ws, anchor_r_idx: int, col_n: int
+) -> Tuple[int, List[str]]:
+    """Excel：在锚点行（1-based）之上找表头行，返回 (行号, 1..col_n 列表头文本)。"""
+    cn = max(1, min(int(col_n), 80))
+    best_r, best_sc = -1, -1.0
+    for r in range(1, max(1, int(anchor_r_idx))):
+        labels: List[str] = []
+        nonempty = 0
+        for c in range(1, cn + 1):
+            v = ws.cell(row=r, column=c).value
+            t = "" if v is None else str(v).strip()
+            labels.append(t)
+            if t:
+                nonempty += 1
+        if nonempty < 2:
+            continue
+        closeness = 1.0 - abs(nonempty - cn) / max(cn, 8)
+        kw = _table_header_likeness(labels)
+        sc = kw * 2.0 + closeness
+        if sc > best_sc:
+            best_sc, best_r = sc, r
+    if best_r < 0 or best_sc < 2.0:
+        return -1, []
+    labels2: List[str] = []
+    for c in range(1, cn + 1):
+        v = ws.cell(row=best_r, column=c).value
+        labels2.append("" if v is None else str(v).strip())
+    return best_r, labels2
 
 
 def _word_find_similar_row_idx(tbl, *, joined: str, col_n: int, start: int, end: int) -> int:
@@ -458,29 +814,113 @@ def _word_unique_cells(row) -> List[Any]:
     return out
 
 
-def _word_best_template_row_for_insert(tbl, anchor_row_idx: int):
+def _word_table_grid_col_count(tbl) -> int:
+    """Word 表格底层网格列数（tblGrid），与 row.cells 长度一致。"""
+    try:
+        from docx.oxml.ns import qn
+
+        grid = getattr(tbl._tbl, "tblGrid", None)
+        if grid is not None:
+            cols = grid.findall(qn("w:gridCol"))
+            if cols:
+                return len(cols)
+    except Exception:
+        pass
+    return 0
+
+
+def _word_row_unique_col_count(row) -> int:
+    try:
+        return max(1, len(_word_unique_cells(row)))
+    except Exception:
+        return 1
+
+
+def _word_table_col_n(tbl, anchor_row_idx: int) -> int:
     """
-    选择“更像数据行”的模板行用于克隆，避免克隆表头（表头常有合并单元格导致写入挤到同一格）。
-    优先：锚点下一行；否则在前几行中选 unique_cells 数最多的行。
+    确定与「数据行」一致的逻辑列数：锚点行及邻近行 unique_cells 的最大值，
+    并与 tblGrid 列数取 max，避免克隆/写入列数少于已有行导致错位。
+    """
+    rows = list(getattr(tbl, "rows", []) or [])
+    if not rows:
+        return 1
+    ai = max(0, min(int(anchor_row_idx), len(rows) - 1))
+    col_n = _word_row_unique_col_count(rows[ai])
+    lo = max(0, ai - 2)
+    hi = min(len(rows), ai + 4)
+    for r in range(lo, hi):
+        try:
+            labels = [
+                _word_cell_text_best(c).strip()
+                for c in _word_unique_cells(rows[r])
+            ]
+            if _table_header_likeness(labels) >= 3 and len(labels) < col_n:
+                continue
+            col_n = max(col_n, len(labels))
+        except Exception:
+            continue
+    grid_n = _word_table_grid_col_count(tbl)
+    if grid_n > 0:
+        for r in range(lo, hi):
+            try:
+                nc = len(list(getattr(rows[r], "cells", []) or []))
+                if nc == grid_n:
+                    col_n = max(col_n, _word_row_unique_col_count(rows[r]))
+            except Exception:
+                pass
+    return max(1, int(col_n))
+
+
+def _word_reference_row_for_insert(tbl, anchor_row_idx: int):
+    """
+    选择用于克隆结构的参考行：优先锚点行（数据行），否则在锚点附近选
+    unique_cells 最多且不像表头的行，保证新行列结构与已有数据行一致。
     """
     try:
         rows = list(getattr(tbl, "rows", []) or [])
         if not rows:
             return None
-        if 0 <= int(anchor_row_idx) < len(rows) - 1:
-            cand = rows[int(anchor_row_idx) + 1]
-            if len(_word_unique_cells(cand)) >= 2:
-                return cand
-        # 扫描前几行，选列数最多的（通常是数据行而非合并表头）
-        best = rows[min(max(int(anchor_row_idx), 0), len(rows) - 1)]
-        best_n = len(_word_unique_cells(best))
-        for r in rows[: min(6, len(rows))]:
-            n = len(_word_unique_cells(r))
-            if n > best_n:
-                best, best_n = r, n
+        ai = max(0, min(int(anchor_row_idx), len(rows) - 1))
+        anchor = rows[ai]
+        labels_a = [
+            _word_cell_text_best(c).strip() for c in _word_unique_cells(anchor)
+        ]
+        if _table_header_likeness(labels_a) < 3 and len(_word_unique_cells(anchor)) >= 2:
+            return anchor
+        target_n = _word_table_col_n(tbl, ai)
+        best = anchor
+        best_n = _word_row_unique_col_count(anchor)
+        for r in range(max(0, ai - 2), min(len(rows), ai + 4)):
+            row = rows[r]
+            labels = [
+                _word_cell_text_best(c).strip() for c in _word_unique_cells(row)
+            ]
+            if _table_header_likeness(labels) >= 3:
+                continue
+            n = len(_word_unique_cells(row))
+            if n >= target_n - 1 and n >= best_n:
+                best, best_n = row, n
         return best
     except Exception:
         return None
+
+
+def _word_best_template_row_for_insert(tbl, anchor_row_idx: int):
+    """兼容旧名：与 _word_reference_row_for_insert 相同。"""
+    return _word_reference_row_for_insert(tbl, anchor_row_idx)
+
+
+def _word_insert_row_cloned_after(tbl, structure_row, after_row):
+    """克隆 structure_row 的 tr，并插入到 after_row 之后（列结构一致）。"""
+    new_row = _word_clone_row_after(tbl, structure_row)
+    if new_row is None:
+        return None
+    try:
+        if after_row is not structure_row:
+            after_row._tr.addnext(new_row._tr)
+    except Exception:
+        pass
+    return new_row
 
 
 def _word_pick_value_cell_hits(
@@ -2028,10 +2468,14 @@ def export_like_base(
     title: str,
     content_text: str,
     meta: Optional[Dict] = None,
+    append_generated_content: bool = True,
 ) -> str:
     """
     按基础文件后缀导出同格式文件，并写入修订记录。
     返回 out_path。
+
+    append_generated_content=False：仅复制基底并写修订记录，不把 content_text 追加进正文
+    （就地 patch 失败且无 PATCH_JSON 时使用，避免破坏版式）。
     """
     meta = meta or {}
     base = Path(base_file_path)
@@ -2089,10 +2533,12 @@ def export_like_base(
             ws.delete_rows(1, ws.max_row or 1)
         else:
             ws = wb.create_sheet(appendix_name)
-        ws.cell(row=1, column=1, value=title or out.stem)
-        ws.cell(row=2, column=1, value=f"版本：{version_tag}")
-        for i, line in enumerate((content_text or "").splitlines(), start=4):
-            ws.cell(row=i, column=1, value=line)
+        if append_generated_content and (content_text or "").strip():
+            ws.cell(row=1, column=1, value=title or out.stem)
+            ws.cell(row=2, column=1, value=f"版本：{version_tag}")
+            body = unescape_patch_text_literals(content_text or "")
+            for i, line in enumerate(body.splitlines(), start=4):
+                ws.cell(row=i, column=1, value=line)
 
         wb.save(str(out))
         return str(out)
@@ -2193,7 +2639,9 @@ def export_docx_inplace_patch(
             pass
         return str(out), report
 
-    ops: List[Dict[str, Any]] = list(patch_obj.get("operations") or [])
+    ops: List[Dict[str, Any]] = normalize_patch_operations(
+        list(patch_obj.get("operations") or [])
+    )
     tc_rules = _compile_tc_id_rules((patch_obj or {}).get("tc_id_rules") or (meta or {}).get("tc_id_rules"))
     def _change_meta(op_obj: Dict[str, Any]) -> Dict[str, Any]:
         refs = op_obj.get("audit_point_refs")
@@ -2543,57 +2991,111 @@ def export_docx_inplace_patch(
                 insert_ok = 0
                 for tbl, r_idx, row in hits:
                     try:
-                        # 列数：避免表头合并单元格导致“多列同一格”
-                        tmpl_row = _word_best_template_row_for_insert(tbl, int(r_idx)) or row
-                        col_n = max(len(_word_unique_cells(tmpl_row)), 1)
-                        vals = [x for x in (new_text or "").split("\t")]
-                        # Word：模型若未按 \\t 分列，会导致整行写入首格；这里按列数做尽力拆分兜底
-                        if len(vals) == 1 and "\t" not in (new_text or ""):
-                            vals2 = _xlsx_split_row_values_for_insert(new_text or "", col_n)
-                            if len(vals2) > 1:
-                                vals = vals2
-                        if not vals or not any(str(x).strip() for x in vals):
+                        # 列数与克隆结构：与锚点及邻近数据行一致，避免新行列数少导致竖线错位
+                        ref_row = _word_reference_row_for_insert(tbl, int(r_idx)) or row
+                        col_n = _word_table_col_n(tbl, int(r_idx))
+                        row_dict = _coerce_row_by_header_from_op(op, new_text or "")
+                        hdr_align: Dict[str, Any] = {}
+                        pending_vals_list: List[List[str]] = []
+                        if row_dict:
+                            _hi, hdr_labels = _word_find_header_row_labels(
+                                tbl, int(r_idx), col_n
+                            )
+                            if hdr_labels and len(hdr_labels) > col_n:
+                                col_n = len(hdr_labels)
+                            if hdr_labels and any((x or "").strip() for x in hdr_labels):
+                                mapped = _map_row_dict_to_vals_by_headers(
+                                    hdr_labels, row_dict, col_n
+                                )
+                                pending_vals_list = [mapped]
+                                hdr_align = {
+                                    "header_row_index": int(_hi),
+                                    "header_labels_preview": [
+                                        (x or "")[:48]
+                                        for x in hdr_labels[: min(12, len(hdr_labels))]
+                                    ],
+                                    "row_by_header_keys": list(row_dict.keys())[:24],
+                                }
+                            elif (new_text or "").strip().startswith("{"):
+                                report["skipped"].append(
+                                    {
+                                        "op": op,
+                                        "reason": "row_by_header/JSON 需要可识别的表头行（锚点行上方），未插入",
+                                    }
+                                )
+                                continue
+                        else:
+                            for ln in _split_table_rows_from_new_text(new_text or ""):
+                                pending_vals_list.append(
+                                    _vals_from_table_row_line(ln, col_n)
+                                )
+                        if not pending_vals_list:
                             report["skipped"].append(
                                 {
                                     "op": op,
-                                    "reason": "new_text 按制表符分列后无有效单元格内容（仅空白/制表符），未插入行",
+                                    "reason": "new_text 无有效表格行（空行或非 \\t 分行）",
                                 }
                             )
                             continue
+                        cur_row = row
+                        cur_r_idx = int(r_idx)
+                        batch_n = len(pending_vals_list)
+                        for _row_i, vals in enumerate(pending_vals_list):
+                            while len(vals) < col_n:
+                                vals.append("")
+                            vals = vals[:col_n]
+                            if not vals or not any(str(x).strip() for x in vals):
+                                continue
 
-                        new_joined = "\t".join((vals[ci] if ci < len(vals) else "") for ci in range(col_n)).strip()
+                            new_joined = "\t".join(
+                            (vals[ci] if ci < len(vals) else "") for ci in range(col_n)
+                        ).strip()
+                        tc_col = 0
                         parsed = _parse_tc_id_first_cell(vals[0] or "", tc_rules)
                         if not parsed:
-                            try:
-                                if row.cells:
-                                    parsed = _parse_tc_id_first_cell(row.cells[0].text or "", tc_rules)
-                            except Exception:
-                                parsed = None
+                            for ii in range(1, min(len(vals), col_n)):
+                                    p2 = _parse_tc_id_first_cell(vals[ii] or "", tc_rules)
+                                    if p2:
+                                        parsed, tc_col = p2, ii
+                                        break
+                            if not parsed:
+                                try:
+                                    uc0 = _word_unique_cells(cur_row)
+                                    if uc0:
+                                        parsed = _parse_tc_id_first_cell(
+                                            _word_cell_text_best(uc0[0]) or "", tc_rules
+                                        )
+                                        if parsed:
+                                            tc_col = 0
+                                except Exception:
+                                    parsed = None
 
-                        # 无可解析编号时：在锚点附近窗口做强相似去重，避免重复插入“源文档已存在”的行
-                        if not parsed:
-                            ex2 = _word_find_similar_row_idx(
-                                tbl,
-                                joined=new_joined,
-                                col_n=col_n,
-                                start=max(0, int(r_idx) - 2),
-                                end=min(len(getattr(tbl, "rows", []) or []), int(r_idx) + 12),
-                            )
-                            if ex2 >= 0:
-                                ex_row2 = tbl.rows[ex2]
-                                before_joined2 = _word_row_joined(ex_row2, col_n)
-                                written_cells2: List[str] = []
-                                ex_cells2 = _word_unique_cells(ex_row2)
-                                for ci in range(min(col_n, len(ex_cells2))):
-                                    v = vals[ci] if ci < len(vals) else ""
-                                    before = (ex_cells2[ci].text or "") if ci < len(ex_cells2) else ""
-                                    if track_changes:
-                                        _replace_table_cell_with_track_changes(ex_cells2[ci], before, v)
-                                    else:
-                                        ex_cells2[ci].text = v
-                                    written_cells2.append(v)
-                                report["changes"].append(
-                                    {
+                            # 无可解析编号时：在锚点附近窗口做强相似去重，避免重复插入“源文档已存在”的行
+                            if not parsed:
+                                ex2 = _word_find_similar_row_idx(
+                                    tbl,
+                                    joined=new_joined,
+                                    col_n=col_n,
+                                    start=max(0, int(cur_r_idx) - 2),
+                                    end=min(
+                                        len(getattr(tbl, "rows", []) or []),
+                                        int(cur_r_idx) + 12,
+                                    ),
+                                )
+                                if ex2 >= 0:
+                                    ex_row2 = tbl.rows[ex2]
+                                    before_joined2 = _word_row_joined(ex_row2, col_n)
+                                    written_cells2: List[str] = []
+                                    ex_cells2 = _word_unique_cells(ex_row2)
+                                    for ci in range(min(col_n, len(ex_cells2))):
+                                        v = vals[ci] if ci < len(vals) else ""
+                                        before = (ex_cells2[ci].text or "") if ci < len(ex_cells2) else ""
+                                        if track_changes:
+                                            _replace_table_cell_with_track_changes(ex_cells2[ci], before, v)
+                                        else:
+                                            ex_cells2[ci].text = v
+                                        written_cells2.append(v)
+                                    ch_dup: Dict[str, Any] = {
                                         "type": "update_table_row_in_place",
                                         "anchor": anchor,
                                         "table_row_index": ex2,
@@ -2603,42 +3105,43 @@ def export_docx_inplace_patch(
                                         "note": "检测到源文档附近已存在高度相似行，已原地更新（避免重复插入）",
                                         **_change_meta(op),
                                     }
+                                    if hdr_align:
+                                        ch_dup["header_alignment"] = hdr_align
+                                    report["changes"].append(ch_dup)
+                                    insert_ok += 1
+                                    continue
+
+                            # 首列可解析为用例编号（如 GN3-22）：按表内同前缀最大编号 +1 分配；已存在编号则按整行相似度决定更新或新行
+                            if parsed:
+                                prefix, _n, rule = parsed
+                                max_n = _table_max_tc_suffix_for_prefix_word(tbl, prefix, tc_rules)
+                                next_id = _next_unique_tc_id_word(
+                                    tbl, prefix, rule, tc_rules, max_n + 1
                                 )
-                                insert_ok += 1
-                                continue
+                                id_cell = (vals[tc_col] or "").strip()
+                                ex_idx = _table_find_row_idx_by_id_any_cell(tbl, id_cell)
 
-                        # 首列可解析为用例编号（如 GN3-22）：按表内同前缀最大编号 +1 分配；已存在编号则按整行相似度决定更新或新行
-                        if parsed:
-                            prefix, _n, rule = parsed
-                            max_n = _table_max_tc_suffix_for_prefix_word(tbl, prefix, tc_rules)
-                            next_id = _next_unique_tc_id_word(
-                                tbl, prefix, rule, tc_rules, max_n + 1
-                            )
-                            id_cell = (vals[0] or "").strip()
-                            ex_idx = _table_find_row_idx_by_id_any_cell(tbl, id_cell)
-
-                            if ex_idx >= 0:
-                                ex_row = tbl.rows[ex_idx]
-                                before_joined = _word_row_joined(ex_row, col_n)
-                                sim = SequenceMatcher(
-                                    None, new_joined, (before_joined or "").strip()
-                                ).ratio()
-                                if sim >= _TC_ROW_SIMILARITY_UPDATE_THRESHOLD:
-                                    written_cells: List[str] = []
-                                    ex_cells = _word_unique_cells(ex_row)
-                                    for ci in range(min(col_n, len(ex_cells))):
-                                        v = vals[ci] if ci < len(vals) else ""
-                                        before = (ex_cells[ci].text or "") if ci < len(ex_cells) else ""
-                                        if track_changes:
-                                            _replace_table_cell_with_track_changes(
-                                                ex_cells[ci], before, v
-                                            )
-                                        else:
-                                            ex_cells[ci].text = v
-                                        written_cells.append(v)
-                                    joined = "\t".join(written_cells)
-                                    report["changes"].append(
-                                        {
+                                if ex_idx >= 0:
+                                    ex_row = tbl.rows[ex_idx]
+                                    before_joined = _word_row_joined(ex_row, col_n)
+                                    sim = SequenceMatcher(
+                                        None, new_joined, (before_joined or "").strip()
+                                    ).ratio()
+                                    if sim >= _TC_ROW_SIMILARITY_UPDATE_THRESHOLD:
+                                        written_cells: List[str] = []
+                                        ex_cells = _word_unique_cells(ex_row)
+                                        for ci in range(min(col_n, len(ex_cells))):
+                                            v = vals[ci] if ci < len(vals) else ""
+                                            before = (ex_cells[ci].text or "") if ci < len(ex_cells) else ""
+                                            if track_changes:
+                                                _replace_table_cell_with_track_changes(
+                                                    ex_cells[ci], before, v
+                                                )
+                                            else:
+                                                ex_cells[ci].text = v
+                                            written_cells.append(v)
+                                        joined = "\t".join(written_cells)
+                                        ch_sim: Dict[str, Any] = {
                                             "type": "update_table_row_in_place",
                                             "anchor": anchor,
                                             "table_row_index": ex_idx,
@@ -2652,50 +3155,91 @@ def export_docx_inplace_patch(
                                             ),
                                             **_change_meta(op),
                                         }
-                                    )
-                                    insert_ok += 1
-                                    continue
-                                vals[0] = next_id
-                            else:
-                                vals[0] = next_id
+                                        if hdr_align:
+                                            ch_sim["header_alignment"] = hdr_align
+                                        report["changes"].append(ch_sim)
+                                        insert_ok += 1
+                                        continue
+                                    # 编号已存在但内容差异大：新行用 max+1，避免覆盖原用例
+                                    vals[tc_col] = next_id
+                                elif not id_cell:
+                                    # 未给编号：自动分配 max+1
+                                    vals[tc_col] = next_id
+                                # else：模型给出的新编号（如 GN71-274）且表中不存在，保留原值插入
 
-                        # 插入新行：优先克隆锚点行（保留格式/结构），失败则回退 add_row
-                        # 注意：不要克隆表头（可能合并单元格）；用“模板行（更像数据行）”来克隆
-                        new_row = _word_clone_row_after(tbl, tmpl_row)
-                        if new_row is None:
-                            new_row = tbl.add_row()
-                        new_cells = _word_unique_cells(new_row)
-                        for ci in range(min(col_n, len(new_cells))):
-                            v = vals[ci] if ci < len(vals) else ""
-                            if track_changes:
-                                _replace_table_cell_with_track_changes(new_cells[ci], "", v)
-                            else:
-                                new_cells[ci].text = v
-                        # add_row 回退时需要把新行移动到锚点后；克隆插入已在 clone 内完成
-                        try:
-                            if getattr(new_row, "_tr", None) is not None and new_row is not None and (new_row is not row):
-                                if new_row._tr.getparent() is not None and new_row._tr.getprevious() is not row._tr:
-                                    row._tr.addnext(new_row._tr)
-                        except Exception:
-                            pass
-                        written_cells = [(vals[ci] if ci < len(vals) else "") for ci in range(col_n)]
-                        joined = "\t".join(written_cells)
-                        ch: Dict[str, Any] = {
-                            "type": t,
-                            "anchor": anchor,
-                            "table_row_index": r_idx,
-                            "before": "",
-                            "after": joined,
-                            "cells_preview": [str(x).strip() for x in written_cells],
-                        }
-                        if parsed:
-                            ch["tc_id_assigned"] = (vals[0] or "").strip()
-                            ch["note"] = (
-                                "首列已按表内同模块（前缀）最大编号 +1 分配，避免与已有编号冲突"
-                            )
-                        ch.update(_change_meta(op))
-                        report["changes"].append(ch)
-                        insert_ok += 1
+                            # 插入新行：克隆与数据行同结构的 tr，插在锚点行之后（禁止 add_row 造成列宽不一致）
+                            new_row = _word_insert_row_cloned_after(tbl, ref_row, cur_row)
+                            if new_row is None and ref_row is not cur_row:
+                                new_row = _word_insert_row_cloned_after(tbl, cur_row, cur_row)
+                            new_cells = _word_unique_cells(new_row) if new_row is not None else []
+                            if new_row is not None and len(new_cells) < col_n:
+                                try:
+                                    if new_row._tr.getparent() is not None:
+                                        new_row._tr.getparent().remove(new_row._tr)
+                                except Exception:
+                                    pass
+                                new_row = _word_insert_row_cloned_after(tbl, cur_row, cur_row)
+                                new_cells = (
+                                    _word_unique_cells(new_row) if new_row is not None else []
+                                )
+                            if new_row is None:
+                                report["skipped"].append(
+                                    {
+                                        "op": op,
+                                        "reason": f"无法克隆表格行（需与锚点行同 {col_n} 列结构），未插入",
+                                    }
+                                )
+                                continue
+                            new_cells = _word_unique_cells(new_row)
+                            write_n = min(col_n, len(new_cells))
+                            if write_n < col_n:
+                                report["errors"].append(
+                                    {
+                                        "op": op,
+                                        "error": (
+                                            f"克隆行逻辑列数 {len(new_cells)} 少于数据行 {col_n}，"
+                                            "仅写入前若干列，请检查表格合并"
+                                        ),
+                                    }
+                                )
+                            for ci in range(write_n):
+                                v = vals[ci] if ci < len(vals) else ""
+                                if track_changes:
+                                    _replace_table_cell_with_track_changes(
+                                        new_cells[ci], "", v
+                                    )
+                                else:
+                                    new_cells[ci].text = v
+                            written_cells = [(vals[ci] if ci < len(vals) else "") for ci in range(col_n)]
+                            joined = "\t".join(written_cells)
+                            ch: Dict[str, Any] = {
+                                "type": t,
+                                "anchor": anchor,
+                                "table_row_index": cur_r_idx,
+                                "before": "",
+                                "after": joined,
+                                "cells_preview": [str(x).strip() for x in written_cells],
+                            }
+                            if parsed:
+                                ch["tc_id_assigned"] = (vals[tc_col] or "").strip()
+                                ch["note"] = (
+                                    "首列已按表内同模块（前缀）最大编号 +1 分配，避免与已有编号冲突"
+                                )
+                            if hdr_align:
+                                ch["header_alignment"] = hdr_align
+                            if batch_n > 1:
+                                ch["batch_index"] = int(_row_i) + 1
+                                ch["batch_total"] = int(batch_n)
+                                ch["note"] = (
+                                    (ch.get("note") or "")
+                                    + f"；批量插入第 {ch['batch_index']}/{batch_n} 行"
+                                ).strip("；")
+                            ch.update(_change_meta(op))
+                            report["changes"].append(ch)
+                            insert_ok += 1
+                            cur_row = new_row
+                            ni = _word_row_index_in_table(tbl, new_row)
+                            cur_r_idx = ni if ni >= 0 else int(cur_r_idx) + 1
                     except Exception as _ie:
                         report["errors"].append({"op": op, "error": f"插入表格行失败：{_ie}"})
                 if insert_ok:
@@ -2790,7 +3334,9 @@ def export_xlsx_inplace_patch(
     shutil.copyfile(str(base), str(out))
     wb = openpyxl.load_workbook(str(out))
 
-    ops: List[Dict[str, Any]] = list((patch_obj or {}).get("operations") or [])
+    ops: List[Dict[str, Any]] = normalize_patch_operations(
+        list((patch_obj or {}).get("operations") or [])
+    )
     tc_rules = _compile_tc_id_rules((patch_obj or {}).get("tc_id_rules") or (meta or {}).get("tc_id_rules"))
     def _change_meta(op_obj: Dict[str, Any]) -> Dict[str, Any]:
         refs = op_obj.get("audit_point_refs")
@@ -2942,12 +3488,44 @@ def export_xlsx_inplace_patch(
                     report["skipped"].append({"op": op, "reason": f"插入行锚点命中不唯一：{len(hits)}"})
                     continue
                 ws, r_idx = hits[0]
-                vals = [x for x in (new_text or "").split("\t")]
                 col_hint = max(_xlsx_last_nonblank_col(ws, r_idx), 1)
-                if len(vals) == 1 and "\t" not in (new_text or ""):
-                    vals2 = _xlsx_split_row_values_for_insert(new_text or "", col_hint)
-                    if len(vals2) > 1:
-                        vals = vals2
+                col_n_scan = min(80, max(col_hint, int(ws.max_column or 0), 1))
+                row_dict = _coerce_row_by_header_from_op(op, new_text or "")
+                hdr_align: Dict[str, Any] = {}
+                vals: List[str] = []
+                if row_dict:
+                    _hr, hdr_labels = _xlsx_find_header_row_labels(
+                        ws, int(r_idx), col_n_scan
+                    )
+                    if hdr_labels and any((x or "").strip() for x in hdr_labels):
+                        vals = _map_row_dict_to_vals_by_headers(
+                            hdr_labels, row_dict, col_n_scan
+                        )
+                        hdr_align = {
+                            "header_row_index": int(_hr),
+                            "header_labels_preview": [
+                                (x or "")[:48] for x in hdr_labels[: min(12, len(hdr_labels))]
+                            ],
+                            "row_by_header_keys": list(row_dict.keys())[:24],
+                        }
+                    elif (new_text or "").strip().startswith("{"):
+                        report["skipped"].append(
+                            {
+                                "op": op,
+                                "reason": "row_by_header/JSON 需要可识别的表头行（锚点行上方），未插入",
+                            }
+                        )
+                        continue
+                if not vals:
+                    vals = [x for x in (new_text or "").split("\t")]
+                    if len(vals) == 1 and "\t" not in (new_text or "") and not (
+                        (new_text or "").strip().startswith("{")
+                    ):
+                        vals2 = _xlsx_split_row_values_for_insert(
+                            new_text or "", col_hint
+                        )
+                        if len(vals2) > 1:
+                            vals = vals2
                 if not vals or not any(str(x).strip() for x in vals):
                     report["skipped"].append(
                         {
@@ -2958,19 +3536,37 @@ def export_xlsx_inplace_patch(
                     continue
                 try:
                     col_n = min(80, max(len(vals), col_hint, int(ws.max_column or 0), 1))
+                    while len(vals) < col_n:
+                        vals.append("")
+                    vals = vals[:col_n]
                     new_joined = "\t".join(
                         (vals[ci] if ci < len(vals) else "") for ci in range(col_n)
                     ).strip()
+                    tc_col = 0
                     parsed = _parse_tc_id_first_cell(vals[0] or "", tc_rules)
+                    if not parsed:
+                        for ii in range(1, min(len(vals), col_n)):
+                            p2 = _parse_tc_id_first_cell(vals[ii] or "", tc_rules)
+                            if p2:
+                                parsed, tc_col = p2, ii
+                                break
                     if not parsed:
                         try:
                             av = ws.cell(row=r_idx, column=1).value
-                            parsed = _parse_tc_id_first_cell("" if av is None else str(av), tc_rules)
+                            parsed = _parse_tc_id_first_cell(
+                                "" if av is None else str(av), tc_rules
+                            )
+                            if parsed:
+                                tc_col = 0
                         except Exception:
                             parsed = None
 
                     if not parsed:
-                        rid = _xlsx_first_cell_risk_id_token(vals[0] or "")
+                        rid = None
+                        for vi in vals:
+                            rid = _xlsx_first_cell_risk_id_token(vi or "")
+                            if rid:
+                                break
                         if rid:
                             ex_r2 = _xlsx_find_row_by_id_any_col(ws, rid)
                             if ex_r2 >= 0:
@@ -2979,22 +3575,23 @@ def export_xlsx_inplace_patch(
                                     v = vals[ci - 1] if ci - 1 < len(vals) else ""
                                     ws.cell(row=ex_r2, column=ci, value=v)
                                 joined2 = "\t".join(
-                                    (vals[ci] if ci < len(vals) else "") for ci in range(len(vals))
+                                    (vals[ci] if ci < len(vals) else "") for ci in range(col_n)
                                 )
-                                report["changes"].append(
-                                    {
-                                        "type": "update_table_row_in_place",
-                                        "anchor": anchor,
-                                        "sheet": ws.title,
-                                        "row_index": ex_r2,
-                                        "tc_id": rid,
-                                        "before": before_joined2,
-                                        "after": joined2,
-                                        "cells_preview": [str(x).strip() for x in vals],
-                                        "note": "首列编号/风险号已存在，已原地更新整行（避免重复插入）",
-                                        **_change_meta(op),
-                                    }
-                                )
+                                ch_r2: Dict[str, Any] = {
+                                    "type": "update_table_row_in_place",
+                                    "anchor": anchor,
+                                    "sheet": ws.title,
+                                    "row_index": ex_r2,
+                                    "tc_id": rid,
+                                    "before": before_joined2,
+                                    "after": joined2,
+                                    "cells_preview": [str(x).strip() for x in vals],
+                                    "note": "首列编号/风险号已存在，已原地更新整行（避免重复插入）",
+                                    **_change_meta(op),
+                                }
+                                if hdr_align:
+                                    ch_r2["header_alignment"] = hdr_align
+                                report["changes"].append(ch_r2)
                                 report["applied"].append({"op": op, "hits": 1})
                                 continue
 
@@ -3004,7 +3601,7 @@ def export_xlsx_inplace_patch(
                         next_id = _next_unique_tc_id_xlsx(
                             ws, prefix, rule, tc_rules, max_n + 1
                         )
-                        id_cell = (vals[0] or "").strip()
+                        id_cell = (vals[tc_col] or "").strip()
                         ex_r = _xlsx_find_row_by_id_any_col(ws, id_cell)
                         if ex_r >= 0:
                             before_joined = _xlsx_row_joined(ws, ex_r, col_n)
@@ -3016,35 +3613,38 @@ def export_xlsx_inplace_patch(
                                     v = vals[ci - 1] if ci - 1 < len(vals) else ""
                                     ws.cell(row=ex_r, column=ci, value=v)
                                 joined = "\t".join(
-                                    (vals[ci] if ci < len(vals) else "") for ci in range(len(vals))
+                                    (vals[ci] if ci < len(vals) else "") for ci in range(col_n)
                                 )
-                                report["changes"].append(
-                                    {
-                                        "type": "update_table_row_in_place",
-                                        "anchor": anchor,
-                                        "sheet": ws.title,
-                                        "row_index": ex_r,
-                                        "tc_id": id_cell,
-                                        "similarity": round(sim, 4),
-                                        "before": before_joined,
-                                        "after": joined,
-                                        "cells_preview": [str(x).strip() for x in vals],
-                                        "note": (
-                                            f"首列编号已存在且整行相似度≥{_TC_ROW_SIMILARITY_UPDATE_THRESHOLD}，已原地更新该行"
-                                        ),
-                                        **_change_meta(op),
-                                    }
-                                )
+                                ch_xu: Dict[str, Any] = {
+                                    "type": "update_table_row_in_place",
+                                    "anchor": anchor,
+                                    "sheet": ws.title,
+                                    "row_index": ex_r,
+                                    "tc_id": id_cell,
+                                    "similarity": round(sim, 4),
+                                    "before": before_joined,
+                                    "after": joined,
+                                    "cells_preview": [str(x).strip() for x in vals],
+                                    "note": (
+                                        f"首列编号已存在且整行相似度≥{_TC_ROW_SIMILARITY_UPDATE_THRESHOLD}，已原地更新该行"
+                                    ),
+                                    **_change_meta(op),
+                                }
+                                if hdr_align:
+                                    ch_xu["header_alignment"] = hdr_align
+                                report["changes"].append(ch_xu)
                                 report["applied"].append({"op": op, "hits": 1})
                                 continue
-                            vals[0] = next_id
-                        else:
-                            vals[0] = next_id
+                            vals[tc_col] = next_id
+                        elif not id_cell:
+                            vals[tc_col] = next_id
 
                     ws.insert_rows(r_idx + 1)
                     for ci, v in enumerate(vals, start=1):
                         ws.cell(row=r_idx + 1, column=ci, value=v)
-                    joined = "\t".join(vals)
+                    joined = "\t".join(
+                        (vals[i] if i < len(vals) else "") for i in range(col_n)
+                    )
                     chx: Dict[str, Any] = {
                         "type": t,
                         "anchor": anchor,
@@ -3055,8 +3655,10 @@ def export_xlsx_inplace_patch(
                         "cells_preview": [str(x).strip() for x in vals],
                     }
                     if parsed:
-                        chx["tc_id_assigned"] = (vals[0] or "").strip()
+                        chx["tc_id_assigned"] = (vals[tc_col] or "").strip()
                         chx["note"] = "首列已按表内同模块（前缀）最大编号 +1 分配"
+                    if hdr_align:
+                        chx["header_alignment"] = hdr_align
                     chx.update(_change_meta(op))
                     report["changes"].append(chx)
                     report["applied"].append({"op": op, "hits": 1})

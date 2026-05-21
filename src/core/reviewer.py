@@ -16,6 +16,7 @@ from .knowledge_base import KnowledgeBase
 from .document_loader import load_single_file
 from .db import get_dimension_options, get_corrections_for_collection, get_review_extra_instructions
 from .display_filename import is_probable_temp_upload_basename
+from .audit_handoff import _default_action_for_severity
 
 
 def _registration_strictness_context(registration_type: str) -> str:
@@ -1073,29 +1074,53 @@ class DocumentReviewer:
             body = body[:cap] + "\n\n（知识库参考过长已截断）"
         return body
 
+    def _parse_audit_points_json_payload(self, text: str) -> Optional[List[dict]]:
+        """尽力从 LLM 原文抽取审核点 JSON（数组或单对象），减少「提示级解析失败」误报。"""
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+                raw = "\n".join(lines[1:-1]).strip()
+            else:
+                raw = "\n".join(lines[1:]).strip()
+        candidates: List[str] = []
+        a0, a1 = raw.find("["), raw.rfind("]") + 1
+        if a0 >= 0 and a1 > a0:
+            candidates.append(raw[a0:a1])
+        o0, o1 = raw.find("{"), raw.rfind("}") + 1
+        if o0 >= 0 and o1 > o0:
+            candidates.append(raw[o0:o1])
+        for block in re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", raw, flags=re.DOTALL):
+            if block and block not in candidates:
+                candidates.append(block)
+        for cand in candidates:
+            for variant in (
+                cand,
+                re.sub(r",\s*]", "]", cand),
+                re.sub(r",\s*}", "}", cand),
+            ):
+                try:
+                    parsed = json.loads(variant)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, list):
+                    return [x for x in parsed if isinstance(x, dict)]
+                if isinstance(parsed, dict):
+                    return [parsed]
+        return None
+
     def _parse_audit_points(self, llm_response: str) -> List[AuditPoint]:
         text = llm_response.strip()
 
-        json_start = text.find("[")
-        json_end = text.rfind("]") + 1
-        if json_start == -1 or json_end == 0:
+        data = self._parse_audit_points_json_payload(text)
+        if not data:
             return [AuditPoint(
                 category="解析错误",
                 severity="info",
                 location="N/A",
-                description=f"LLM 响应无法解析为结构化数据：{text[:200]}",
-                regulation_ref="N/A",
-                suggestion="请重新审核",
-            )]
-
-        try:
-            data = json.loads(text[json_start:json_end])
-        except json.JSONDecodeError:
-            return [AuditPoint(
-                category="解析错误",
-                severity="info",
-                location="N/A",
-                description=f"JSON 解析失败：{text[json_start:json_start+200]}",
+                description=f"LLM 响应无法解析为结构化审核点：{text[:200]}",
                 regulation_ref="N/A",
                 suggestion="请重新审核",
             )]
@@ -1124,6 +1149,8 @@ class DocumentReviewer:
                 if inferred == "无需修改" and (p.severity or "").lower() == "high":
                     # 建议无需修改时不应是高风险，避免界面出现“建议不改但风险高”的冲突
                     p.severity = "info"
+            elif not (p.action or "").strip():
+                p.action = _default_action_for_severity(p.severity)
         return points
 
     def _deduplicate_audit_points(self, points: List[AuditPoint]) -> List[AuditPoint]:

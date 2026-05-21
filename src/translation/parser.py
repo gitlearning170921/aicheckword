@@ -3,9 +3,14 @@
 支持 .docx（python-docx）、.txt、.xlsx（openpyxl）。
 """
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
+import zipfile
+import xml.etree.ElementTree as ET
 
 from .models import TextBlock, SUPPORTED_EXTENSIONS
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_W = "{%s}" % _W_NS
 
 
 def parse_document(file_path: str) -> List[TextBlock]:
@@ -28,6 +33,80 @@ def parse_document(file_path: str) -> List[TextBlock]:
     raise ValueError(f"未实现解析: {suffix}")
 
 
+def _paragraph_text_as_revised(para) -> str:
+    """近似「接受修订后」文本：跳过 w:del / w:moveFrom，保留 w:ins 与普通 run。"""
+    try:
+        from docx.oxml.ns import qn
+
+        pieces: List[str] = []
+        for t in para._element.iter(qn("w:t")):
+            txt = t.text
+            if not txt:
+                continue
+            el = t
+            skip = False
+            while el is not None:
+                tag = el.tag
+                if tag in (qn("w:del"), qn("w:moveFrom")):
+                    skip = True
+                    break
+                el = el.getparent()
+            if skip:
+                continue
+            pieces.append(txt)
+        return "".join(pieces).strip()
+    except Exception:
+        return (para.text or "").strip()
+
+
+def _paragraphs_in_hf_container(container, doc) -> list:
+    """页眉/页脚内全部段落（含表格内嵌段落），顺序与 OOXML 一致。"""
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph
+
+    out = []
+    try:
+        root = container._element
+    except Exception:
+        return out
+    for p_el in root.iter(qn("w:p")):
+        try:
+            out.append(Paragraph(p_el, doc))
+        except Exception:
+            pass
+    return out
+
+
+def _parse_docx_comments(path: Path) -> List[TextBlock]:
+    """解析 word/comments.xml 中的批注正文（侧边修订说明等）。"""
+    blocks: List[TextBlock] = []
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            if "word/comments.xml" not in zf.namelist():
+                return blocks
+            root = ET.fromstring(zf.read("word/comments.xml"))
+    except Exception:
+        return blocks
+    for comment_el in root.findall(f"{_W}comment"):
+        cid = comment_el.get(f"{_W}id") or comment_el.get("id") or ""
+        p_idx = 0
+        for p_el in comment_el.findall(f".//{_W}p"):
+            parts = []
+            for t_el in p_el.findall(f".//{_W}t"):
+                if t_el.text:
+                    parts.append(t_el.text)
+            text = "".join(parts).strip()
+            blocks.append(
+                TextBlock(
+                    block_type="comment",
+                    path=(str(cid), p_idx),
+                    original_text=text,
+                )
+            )
+            p_idx += 1
+    return blocks
+
+
 def _parse_docx(path: Path) -> List[TextBlock]:
     from docx import Document
     from docx.oxml.table import CT_Tbl
@@ -42,7 +121,7 @@ def _parse_docx(path: Path) -> List[TextBlock]:
     for child in body:
         if isinstance(child, CT_P):
             para = Paragraph(child, doc)
-            text = (para.text or "").strip()
+            text = _paragraph_text_as_revised(para)
             blocks.append(TextBlock(
                 block_type="paragraph",
                 path=(len(blocks),),
@@ -53,7 +132,11 @@ def _parse_docx(path: Path) -> List[TextBlock]:
             for row_idx, row in enumerate(table.rows):
                 for col_idx, cell in enumerate(row.cells):
                     if isinstance(cell, _Cell):
-                        text = (cell.text or "").strip()  # 保留换行，便于翻译后回填
+                        if cell.paragraphs:
+                            chunks = [_paragraph_text_as_revised(p) for p in cell.paragraphs]
+                            text = "\n".join(c for c in chunks if c).strip()
+                        else:
+                            text = (cell.text or "").strip()
                     else:
                         text = ""
                     blocks.append(TextBlock(
@@ -62,23 +145,24 @@ def _parse_docx(path: Path) -> List[TextBlock]:
                         original_text=text,
                     ))
             table_idx += 1
-    # 页眉、页脚（按 section 顺序）
+    # 页眉、页脚：遍历容器内全部 w:p（含表格内），避免仅 top-level paragraphs 漏译
     for section_idx, section in enumerate(doc.sections):
         try:
-            for p_idx, para in enumerate(section.header.paragraphs):
+            for p_idx, para in enumerate(_paragraphs_in_hf_container(section.header, doc)):
                 blocks.append(TextBlock(
                     block_type="header",
                     path=(section_idx, "h", p_idx),
-                    original_text=(para.text or "").strip(),
+                    original_text=_paragraph_text_as_revised(para),
                 ))
-            for p_idx, para in enumerate(section.footer.paragraphs):
+            for p_idx, para in enumerate(_paragraphs_in_hf_container(section.footer, doc)):
                 blocks.append(TextBlock(
                     block_type="footer",
                     path=(section_idx, "f", p_idx),
-                    original_text=(para.text or "").strip(),
+                    original_text=_paragraph_text_as_revised(para),
                 ))
         except Exception:
             pass
+    blocks.extend(_parse_docx_comments(path))
     return blocks
 
 
