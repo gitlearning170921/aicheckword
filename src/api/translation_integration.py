@@ -12,6 +12,7 @@ LLM 凭据透传与 draft / audit 集成一致：X-Client-Llm-* / X-Client-Curso
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import threading
 import traceback
@@ -44,6 +45,7 @@ from src.core.llm_factory import ClientLlmConfig
 from src.core.operation_logs_invalidation import invalidate_operation_logs_cache
 from src.translation.models import SUPPORTED_EXTENSIONS
 from src.translation.correction import save_glossary_correction_entries
+from src.translation.parser import parse_document
 from src.translation.pipeline import correct_path, translate_file
 
 
@@ -56,6 +58,7 @@ _executor = ThreadPoolExecutor(max_workers=2)
 _VALID_LANGS = ("en", "de", "zh")
 _MAX_FILES_PER_JOB = 5
 _MAX_CORRECT_FILES_PER_JOB = 10
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _INVOKABLE_TRANSLATION_PROVIDERS = frozenset(
     {"openai", "deepseek", "lingyi", "ollama", "tongyi"}
 )
@@ -94,6 +97,8 @@ class TranslationJobPayload(BaseModel):
     aiword_upload_id_map: Optional[Dict[str, str]] = None
     aiword_user_id: str = ""
     aiword_task_id: str = ""
+    post_check_residual_cjk: bool = True
+    residual_cjk_sample_limit: int = Field(default=8, ge=1, le=50)
 
 
 class TranslationCorrectionJobPayload(BaseModel):
@@ -110,6 +115,46 @@ class TranslationCorrectionJobPayload(BaseModel):
     aiword_upload_id_map: Optional[Dict[str, str]] = None
     aiword_user_id: str = ""
     aiword_task_id: str = ""
+    post_check_residual_cjk: bool = True
+    residual_cjk_sample_limit: int = Field(default=8, ge=1, le=50)
+
+
+def _collect_residual_cjk_warnings(
+    out_path: Path,
+    *,
+    display_name: str,
+    target_lang: str,
+    sample_limit: int = 8,
+) -> Optional[Dict[str, Any]]:
+    """英/德目标语时，扫描输出文档是否仍残留中文文本。"""
+    if target_lang not in ("en", "de"):
+        return None
+    try:
+        blocks = parse_document(str(out_path))
+    except Exception:
+        return None
+    count = 0
+    samples: List[str] = []
+    for b in blocks:
+        txt = str(getattr(b, "original_text", "") or "")
+        if not txt:
+            continue
+        for ln in txt.splitlines() or [txt]:
+            t = (ln or "").strip()
+            if not t:
+                continue
+            if _CJK_RE.search(t):
+                count += 1
+                if len(samples) < sample_limit:
+                    samples.append(t[:160])
+    if count <= 0:
+        return None
+    return {
+        "file": display_name,
+        "out_file": out_path.name,
+        "count": count,
+        "samples": samples,
+    }
 
 
 @router.get("/meta")
@@ -222,6 +267,7 @@ def _run_translation_job(job_id: str) -> None:
         kb_query_extra = (payload.kb_query_extra or "").strip() or None
         out_files: List[Path] = []
         failed_files: List[Dict[str, str]] = []
+        residual_cjk_warnings: List[Dict[str, Any]] = []
         shared_cache: Dict[Any, Any] = {}
         shared_glossary: Dict[Any, Any] = {}
 
@@ -251,6 +297,15 @@ def _run_translation_job(job_id: str) -> None:
                 p = Path(rendered)
                 if p.is_file():
                     out_files.append(p)
+                    if bool(payload.post_check_residual_cjk):
+                        warn = _collect_residual_cjk_warnings(
+                            p,
+                            display_name=disp,
+                            target_lang=target_lang,
+                            sample_limit=int(payload.residual_cjk_sample_limit or 8),
+                        )
+                        if warn:
+                            residual_cjk_warnings.append(warn)
                 add_operation_log(
                     op_type=OP_TYPE_TRANSLATION,
                     collection=payload.collection,
@@ -289,6 +344,7 @@ def _run_translation_job(job_id: str) -> None:
             "out_files": [str(p) for p in out_files],
             "out_file_names": [Path(p).name for p in out_files],
             "failed_files": failed_files,
+            "residual_cjk_warnings": residual_cjk_warnings,
         }
         summary_path = job_dir / "summary.json"
         summary_path.write_text(
@@ -309,11 +365,14 @@ def _run_translation_job(job_id: str) -> None:
                 f"失败：所有文件翻译为空（失败 {len(failed_files)} 条）。"
                 + (f" 主因：{_top}" if _top else "")
             )
+        elif residual_cjk_warnings:
+            finish_msg = f"完成（检测到 {len(residual_cjk_warnings)} 个文件仍含中文片段）"
 
         result_obj = {
             "target_lang": target_lang,
             "out_files": [Path(p).name for p in out_files],
             "failed_files": failed_files,
+            "residual_cjk_warnings": residual_cjk_warnings,
             "translation_empty": bool(translation_empty),
             "zip_path": str(zip_path),
         }
@@ -406,6 +465,7 @@ def _run_correction_job(job_id: str) -> None:
         manual_rules = _parse_manual_rules(payload.manual_rules)
         out_files: List[Path] = []
         failed_files: List[Dict[str, str]] = []
+        residual_cjk_warnings: List[Dict[str, Any]] = []
         merged_stats: Dict[str, int] = {
             "total_blocks": 0,
             "changed_blocks": 0,
@@ -436,6 +496,15 @@ def _run_correction_job(job_id: str) -> None:
                     pp = Path(p)
                     if pp.is_file():
                         out_files.append(pp)
+                        if bool(payload.post_check_residual_cjk):
+                            warn = _collect_residual_cjk_warnings(
+                                pp,
+                                display_name=disp,
+                                target_lang=target_lang,
+                                sample_limit=int(payload.residual_cjk_sample_limit or 8),
+                            )
+                            if warn:
+                                residual_cjk_warnings.append(warn)
                 if isinstance(stats, dict):
                     for k in merged_stats.keys():
                         try:
@@ -494,6 +563,7 @@ def _run_correction_job(job_id: str) -> None:
             "failed_files": failed_files,
             "stats": merged_stats,
             "glossary_saved": glossary_saved,
+            "residual_cjk_warnings": residual_cjk_warnings,
         }
         summary_path = job_dir / "summary.json"
         summary_path.write_text(
@@ -514,6 +584,8 @@ def _run_correction_job(job_id: str) -> None:
                 f"失败：所有文件校正为空（失败 {len(failed_files)} 条）。"
                 + (f" 主因：{_top}" if _top else "")
             )
+        elif residual_cjk_warnings:
+            finish_msg = f"校正完成（检测到 {len(residual_cjk_warnings)} 个文件仍含中文片段）"
 
         result_obj = {
             "target_lang": target_lang,
@@ -523,6 +595,7 @@ def _run_correction_job(job_id: str) -> None:
             "zip_path": str(zip_path),
             "stats": merged_stats,
             "glossary_saved": glossary_saved,
+            "residual_cjk_warnings": residual_cjk_warnings,
         }
         _update_job(
             job_id,

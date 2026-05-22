@@ -172,6 +172,27 @@ def _zh_punctuation_to_western(text: str) -> str:
     return t
 
 
+def _normalize_western_spacing(text: str) -> str:
+    """英文/德文轻量空格规范：标点后补空格、去除标点前多余空格。"""
+    if not text:
+        return text
+    parts = str(text).split("\n")
+    out: List[str] = []
+    for ln in parts:
+        s = ln
+        # 折叠连续空白为单空格（不跨行）
+        s = re.sub(r"[ \t]{2,}", " ", s)
+        # 去除标点前空格
+        s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+        # 标点后补一个空格（若后面接字母/数字且当前不是换行）
+        s = re.sub(r"([,.;:!?])([A-Za-z0-9\u00c0-\u024f])", r"\1 \2", s)
+        # 左括号后、右括号前不保留多余空格
+        s = re.sub(r"\(\s+", "(", s)
+        s = re.sub(r"\s+\)", ")", s)
+        out.append(s.strip())
+    return "\n".join(out)
+
+
 def _cache_lookup(cache: Dict[str, str], s: str) -> Optional[str]:
     if not s:
         return None
@@ -462,6 +483,7 @@ def _repair_untranslated_lines(
             fixed = _fix_common_en_truncations(fixed)
         if t in (TARGET_LANG_EN, TARGET_LANG_DE):
             fixed = _zh_punctuation_to_western(fixed)
+            fixed = _normalize_western_spacing(fixed)
         results[i] = fixed
         _cache_store(cache, src, fixed)
         nk = _normalize_cache_key(src)
@@ -518,6 +540,7 @@ def translate_sentences(
                     hit = _fix_common_en_truncations(hit)
                 if tlang in (TARGET_LANG_EN, TARGET_LANG_DE):
                     hit = _zh_punctuation_to_western(hit)
+                    hit = _normalize_western_spacing(hit)
                 batch_results.append(hit)
             else:
                 need_indices.append(len(batch_results))
@@ -542,6 +565,7 @@ def translate_sentences(
                     en_u = _fix_common_en_truncations(en_u)
                 if tlang in (TARGET_LANG_EN, TARGET_LANG_DE):
                     en_u = _zh_punctuation_to_western(en_u)
+                    en_u = _normalize_western_spacing(en_u)
                 trans_map[src_u] = en_u
             for k, src in enumerate(to_call):
                 en = trans_map.get(src, src)
@@ -566,7 +590,7 @@ def translate_sentences(
         running_glossary,
     )
     if tlang in (TARGET_LANG_EN, TARGET_LANG_DE):
-        results = [_zh_punctuation_to_western(r) for r in results]
+        results = [_normalize_western_spacing(_zh_punctuation_to_western(r)) for r in results]
     if tlang == TARGET_LANG_EN:
         results = [_fix_common_en_truncations(r) for r in results]
     return results

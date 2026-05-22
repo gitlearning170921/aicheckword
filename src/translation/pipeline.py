@@ -68,37 +68,16 @@ def _replace_paragraph_text_keep_format(para, new_text: str) -> None:
     替换段落文字，尽量保留字体/格式；若段落含图片则只改文字 run，不删图片。
     """
     from docx.oxml.ns import qn
-    if _paragraph_has_drawing(para):
-        text_runs = [r for r in para.runs if r._element.find(qn("w:drawing")) is None]
-        if text_runs:
-            text_runs[0].text = new_text
-            for r in text_runs[1:]:
-                r.text = ""
+    # 不使用 para.clear()，避免破坏页脚中的 PAGE/NUMPAGES 域、制表位与对齐结构。
+    # 仅改写现有文本 run：首个文本节点写新内容，其余文本节点置空，保留非文本对象（图片/域）与版式。
+    text_runs = [r for r in para.runs if r._element.find(qn("w:drawing")) is None]
+    if text_runs:
+        text_runs[0].text = new_text
+        for r in text_runs[1:]:
+            r.text = ""
         return
     if not para.runs:
         para.add_run(new_text)
-        return
-    try:
-        first = para.runs[0]
-        font_name = first.font.name
-        font_size = first.font.size
-        bold = first.bold
-        italic = first.italic
-    except Exception:
-        font_name = font_size = bold = italic = None
-    para.clear()
-    run = para.add_run(new_text)
-    if font_name is not None:
-        try:
-            run.font.name = font_name
-            if font_size is not None:
-                run.font.size = font_size
-            if bold is not None:
-                run.bold = bold
-            if italic is not None:
-                run.italic = italic
-        except Exception:
-            pass
 
 
 def _write_docx(source_path: Path, out_path: Path, blocks: List[TextBlock]) -> None:
