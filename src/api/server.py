@@ -3,6 +3,9 @@
 import sys
 import os
 import logging
+import re
+import time
+import uuid
 from pathlib import Path
 
 _root = Path(__file__).resolve().parent.parent.parent
@@ -42,7 +45,7 @@ from typing import Any, Dict, List, Optional
 
 import json
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Header, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import (
@@ -347,6 +350,34 @@ class CollectionRequest(BaseModel):
     collection: str = "regulations"
 
 
+class ChatReplyOptions(BaseModel):
+    domain: str = "system_record_writing"
+    knowledge_category: str = "program"
+    top_k: int = Field(default=0, ge=0, le=30)
+    min_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    max_reply_chars: int = Field(default=220, ge=60, le=500)
+
+
+class ChatReplyRequest(BaseModel):
+    query: str
+    group_id: str = ""
+    message_id: str = ""
+    trigger_type: str = "at_or_keyword"
+    context: Optional[Dict[str, Any]] = None
+    options: Optional[ChatReplyOptions] = None
+    collection: str = "regulations"
+    current_provider: Optional[str] = None
+
+
+class ChatFeedbackRequest(BaseModel):
+    request_id: str
+    group_id: str = ""
+    message_id: str = ""
+    feedback_type: str = ""
+    operator: str = ""
+    corrected_answer: str = ""
+
+
 class QuizGenerateSetRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -491,6 +522,140 @@ def _merge_review_context(
             continue
         ctx[k] = v
     return ctx or None
+
+
+def _extract_first_json_object(text: str) -> Dict[str, Any]:
+    s = (text or "").strip()
+    if not s:
+        return {}
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", s)
+    if not m:
+        return {}
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _chat_bearer_token(authorization: Optional[str]) -> str:
+    raw = (authorization or "").strip()
+    if not raw:
+        return ""
+    if raw.lower().startswith("bearer "):
+        return raw[7:].strip()
+    return raw
+
+
+def _ensure_chat_api_authorized(authorization: Optional[str]) -> None:
+    expected = (getattr(settings, "chat_api_auth_token", "") or "").strip()
+    # 未配置 token 时放行，便于本地联调
+    if not expected:
+        return
+    got = _chat_bearer_token(authorization)
+    if not got or got != expected:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+_CHAT_INVOKABLE_PROVIDERS = frozenset({"openai", "deepseek", "lingyi", "ollama", "tongyi", "cursor"})
+
+
+def _resolve_chat_provider(
+    raw: Optional[str],
+    *,
+    header_provider: str = "",
+) -> tuple[str, Optional[str]]:
+    """钉钉/联调聊天：解析实际 provider；Cursor 可用但较慢，不自动回退。"""
+    p = (raw or header_provider or getattr(settings, "provider", "") or "deepseek").strip().lower()
+    if not p:
+        return "deepseek", None
+    if p in _CHAT_INVOKABLE_PROVIDERS:
+        return p, None
+    fb = (getattr(settings, "provider", "") or "deepseek").strip().lower()
+    if fb not in _CHAT_INVOKABLE_PROVIDERS:
+        fb = "deepseek"
+    return fb, f"不支持的 provider={p}，已改用 {fb}"
+
+
+def _invoke_chat_llm_text(
+    prompt_text: str,
+    current_provider: Optional[str] = None,
+    *,
+    client_llm: Optional[Any] = None,
+    header_provider: str = "",
+) -> str:
+    from src.core.llm_factory import ClientLlmConfig, invoke_chat_direct
+
+    provider, _ = _resolve_chat_provider(current_provider, header_provider=header_provider)
+    cl = client_llm if isinstance(client_llm, ClientLlmConfig) else None
+    model_override = ((cl.model if cl else "") or (getattr(settings, "llm_model", "") or "").strip() or None)
+    if provider == "cursor":
+        from src.core.cursor_agent import complete_task
+
+        return complete_task(prompt_text, client_llm=cl if cl and cl.has_any() else None)
+    try:
+        return invoke_chat_direct(
+            prompt_text,
+            temperature=0.1,
+            provider=(provider or None),
+            model=model_override,
+            client_llm=cl if cl and cl.has_any() else None,
+        )
+    except Exception:
+        from src.core.llm_factory import create_chat_llm
+
+        llm = create_chat_llm(temperature=0.1)
+        msg = llm.invoke(prompt_text)
+        return getattr(msg, "content", str(msg))
+
+
+def _classify_chat_intent(
+    query: str,
+    current_provider: Optional[str] = None,
+    *,
+    client_llm: Optional[Any] = None,
+    header_provider: str = "",
+) -> Dict[str, Any]:
+    prompt = (
+        "你是意图分类器。仅输出 JSON，不要输出其他内容。\n"
+        "用户问题：\n"
+        f"{query}\n\n"
+        "判断并返回：\n"
+        "{\n"
+        '  "is_system_record_writing": true/false,\n'
+        '  "is_date_or_personnel_question": true/false,\n'
+        '  "normalized_question": "归一化问题",\n'
+        '  "reason": "一句话原因"\n'
+        "}\n"
+        "规则：\n"
+        "1) 只有“医疗器械质量管理体系运行记录怎么写/怎么填/记录项怎么写”相关才算 is_system_record_writing=true。\n"
+        "2) 涉及“日期写什么/什么时候写/人员写谁/谁签字/谁审核/谁批准”即 is_date_or_personnel_question=true。\n"
+    )
+    out = _extract_first_json_object(
+        _invoke_chat_llm_text(
+            prompt,
+            current_provider=current_provider,
+            client_llm=client_llm,
+            header_provider=header_provider,
+        )
+    )
+    if out:
+        return out
+    q = (query or "").strip()
+    low = q.lower()
+    date_or_personnel = any(x in low for x in ("日期", "什么时候", "人员", "谁签", "谁审核", "谁批准", "写谁"))
+    system_record = any(x in low for x in ("体系", "记录", "仓库", "设备", "电脑", "人事", "培训", "采购", "台账"))
+    return {
+        "is_system_record_writing": bool(system_record),
+        "is_date_or_personnel_question": bool(date_or_personnel),
+        "normalized_question": q,
+        "reason": "fallback",
+    }
 
 
 @app.get("/")
@@ -948,6 +1113,225 @@ def knowledge_search_options(collection: str = Query("regulations", description=
 def clear_knowledge(request: CollectionRequest):
     agent = get_agent(request.collection)
     return agent.clear_knowledge()
+
+
+@app.post("/api/chat/reply/generate")
+def chat_reply_generate(
+    body: ChatReplyRequest,
+    http_request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_request_id: Optional[str] = Header(default=None),
+):
+    from .draft_integration import _header_provider, _parse_client_llm
+
+    _ensure_chat_api_authorized(authorization)
+    started = time.time()
+    request_id = (x_request_id or "").strip() or f"chat-{uuid.uuid4().hex[:12]}"
+    query = (body.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query 不能为空")
+
+    client_llm = _parse_client_llm(http_request)
+    hp = _header_provider(http_request)
+    eff_provider, provider_note = _resolve_chat_provider(
+        body.current_provider, header_provider=hp
+    )
+
+    opts = body.options or ChatReplyOptions()
+    allowed_domain = (getattr(settings, "chat_allowed_domain", "system_record_writing") or "system_record_writing").strip()
+    allowed_category = (getattr(settings, "chat_allowed_knowledge_category", "program") or "program").strip()
+    requested_domain = (opts.domain or "").strip() or allowed_domain
+    requested_category = (opts.knowledge_category or "").strip() or allowed_category
+    if requested_domain != allowed_domain or requested_category != allowed_category:
+        return {
+            "request_id": request_id,
+            "need_human": True,
+            "answer": "",
+            "confidence": 0.0,
+            "reason": "首版仅支持体系运行记录写作，且仅基于程序文件知识库。",
+            "references": [],
+            "model_used": (getattr(settings, "llm_model", "") or "").strip(),
+            "latency_ms": int((time.time() - started) * 1000),
+        }
+
+    intent = _classify_chat_intent(
+        query,
+        current_provider=eff_provider,
+        client_llm=client_llm if client_llm.has_any() else None,
+        header_provider=hp,
+    )
+    if not bool(intent.get("is_system_record_writing")):
+        return {
+            "request_id": request_id,
+            "need_human": True,
+            "answer": "",
+            "confidence": 0.0,
+            "reason": "问题不在首版体系记录填写范围内。",
+            "references": [],
+            "model_used": (getattr(settings, "llm_model", "") or "").strip(),
+            "latency_ms": int((time.time() - started) * 1000),
+        }
+    if bool(intent.get("is_date_or_personnel_question")):
+        return {
+            "request_id": request_id,
+            "need_human": True,
+            "answer": "",
+            "confidence": 0.0,
+            "reason": "首版不自动回答日期与人员填写问题。",
+            "references": [],
+            "model_used": (getattr(settings, "llm_model", "") or "").strip(),
+            "latency_ms": int((time.time() - started) * 1000),
+        }
+
+    agent = get_agent(body.collection or "regulations")
+    top_k = int(opts.top_k or 0) or int(getattr(settings, "chat_default_top_k", 6) or 6)
+    top_k = max(2, min(20, top_k))
+    min_similarity = float(opts.min_similarity or 0.0) or float(getattr(settings, "chat_min_similarity", 0.55) or 0.55)
+    conf_threshold = float(getattr(settings, "chat_confidence_threshold", 0.65) or 0.65)
+    max_reply_chars = int(opts.max_reply_chars or 220)
+
+    scored_refs: List[Dict[str, Any]] = []
+    try:
+        scored = agent.kb.search_with_scores(query, top_k=max(top_k * 4, 20))
+    except Exception:
+        scored = []
+    for pair in scored or []:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        doc, score = pair
+        md = getattr(doc, "metadata", {}) or {}
+        if str(md.get("category") or "").strip() != allowed_category:
+            continue
+        scored_refs.append(
+            {
+                "content": (getattr(doc, "page_content", "") or "").strip(),
+                "score": float(score) if score is not None else 0.0,
+                "file_name": str(md.get("source_file") or "未知"),
+                "category": str(md.get("category") or ""),
+            }
+        )
+        if len(scored_refs) >= top_k:
+            break
+    if len(scored_refs) < 2:
+        docs = agent.kb.search_by_category(query, category=allowed_category, top_k=top_k)
+        for d in docs or []:
+            md = getattr(d, "metadata", {}) or {}
+            scored_refs.append(
+                {
+                    "content": (getattr(d, "page_content", "") or "").strip(),
+                    "score": 0.0,
+                    "file_name": str(md.get("source_file") or "未知"),
+                    "category": str(md.get("category") or ""),
+                }
+            )
+    if len(scored_refs) < 2:
+        return {
+            "request_id": request_id,
+            "need_human": True,
+            "answer": "",
+            "confidence": 0.0,
+            "reason": "未检索到足够的程序文件依据。",
+            "references": [],
+            "model_used": (getattr(settings, "llm_model", "") or "").strip(),
+            "latency_ms": int((time.time() - started) * 1000),
+        }
+    top_score = float(scored_refs[0].get("score") or 0.0)
+    if top_score and top_score < min_similarity:
+        return {
+            "request_id": request_id,
+            "need_human": True,
+            "answer": "",
+            "confidence": top_score,
+            "reason": "程序文件匹配度不足，建议人工确认。",
+            "references": [],
+            "model_used": (getattr(settings, "llm_model", "") or "").strip(),
+            "latency_ms": int((time.time() - started) * 1000),
+        }
+
+    refs_prompt = []
+    for idx, r in enumerate(scored_refs[:top_k], start=1):
+        snippet = (r["content"] or "")[:400]
+        refs_prompt.append(
+            f"[{idx}] 文件: {r['file_name']}\n分类: {r['category']}\n片段: {snippet}"
+        )
+    answer_prompt = (
+        "你是医疗器械质量管理体系记录填写助手。\n"
+        "任务：根据“程序文件”片段回答用户“怎么写记录”的问题。\n"
+        "限制：\n"
+        "1) 仅可依据给定程序文件片段回答；无法确认就 need_human=true。\n"
+        "2) 首版不回答日期写法和人员填写问题。\n"
+        "3) 不输出法规结论，不编造不存在的字段。\n"
+        "4) 输出简洁、可执行。\n\n"
+        f"用户问题：{query}\n\n"
+        "程序文件片段：\n"
+        + "\n\n".join(refs_prompt)
+        + "\n\n仅输出 JSON：\n"
+        "{\n"
+        '  "need_human": false,\n'
+        '  "answer": "回答内容",\n'
+        '  "confidence": 0.0,\n'
+        '  "reason": "一句话原因"\n'
+        "}"
+    )
+    llm_out = _extract_first_json_object(
+        _invoke_chat_llm_text(
+            answer_prompt,
+            current_provider=eff_provider,
+            client_llm=client_llm if client_llm.has_any() else None,
+            header_provider=hp,
+        )
+    )
+    answer = str(llm_out.get("answer") or "").strip()
+    answer = answer[:max_reply_chars]
+    try:
+        confidence = float(llm_out.get("confidence", 0.0) or 0.0)
+    except Exception:
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    need_human = bool(llm_out.get("need_human"))
+    if not answer:
+        need_human = True
+    if confidence < conf_threshold:
+        need_human = True
+
+    references = []
+    for r in scored_refs[: min(3, len(scored_refs))]:
+        references.append(
+            {
+                "source": "knowledge_base",
+                "file_name": r.get("file_name") or "未知",
+                "category": r.get("category") or allowed_category,
+                "snippet": (r.get("content") or "")[:120],
+            }
+        )
+    out_body: Dict[str, Any] = {
+        "request_id": request_id,
+        "need_human": need_human,
+        "answer": "" if need_human else answer,
+        "confidence": confidence,
+        "reason": str(llm_out.get("reason") or ""),
+        "references": references,
+        "model_used": (getattr(settings, "llm_model", "") or "").strip(),
+        "effective_provider": eff_provider,
+        "latency_ms": int((time.time() - started) * 1000),
+    }
+    if provider_note:
+        out_body["provider_note"] = provider_note
+    return out_body
+
+
+@app.post("/api/chat/feedback")
+def chat_feedback(
+    request: ChatFeedbackRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    _ensure_chat_api_authorized(authorization)
+    return {
+        "ok": True,
+        "request_id": request.request_id,
+        "accepted": True,
+        "message": "feedback received",
+    }
 
 
 @app.post("/quiz/sets/generate")

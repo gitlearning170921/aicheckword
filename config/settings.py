@@ -114,6 +114,13 @@ class Settings(BaseSettings):
     # API 服务
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    # 聊天能力 API（供 aiword 调用）
+    chat_api_auth_token: str = ""
+    chat_default_top_k: int = 6
+    chat_min_similarity: float = 0.55
+    chat_confidence_threshold: float = 0.65
+    chat_allowed_knowledge_category: str = "program"
+    chat_allowed_domain: str = "system_record_writing"
 
     # 文件目录
     training_docs_dir: str = "./training_docs"
