@@ -40,6 +40,42 @@ class ClientLlmConfig:
         )
 
 
+_DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
+    "deepseek": "deepseek-chat",
+    "openai": "gpt-4o-mini",
+    "lingyi": "yi-lightning",
+    "tongyi": "qwen-plus",
+    "ollama": "qwen2.5",
+}
+
+
+def default_model_for_provider(provider: Optional[str]) -> str:
+    """按 provider 取默认模型；仅当与全局 settings.provider 一致时才用 settings.llm_model。"""
+    p = (provider or settings.provider or "deepseek").strip().lower()
+    if p == (settings.provider or "").strip().lower() and (settings.llm_model or "").strip():
+        return settings.llm_model.strip()
+    return _DEFAULT_MODEL_BY_PROVIDER.get(p, settings.llm_model or "qwen-plus")
+
+
+def resolve_model_for_provider(
+    provider: Optional[str],
+    *,
+    model: Optional[str] = None,
+    client_llm: Optional[ClientLlmConfig] = None,
+) -> str:
+    """解析本次请求实际使用的模型名，避免「选通义却带 deepseek-chat 模型名」。"""
+    p = (provider or settings.provider or "").strip().lower()
+    explicit = ((client_llm.model if client_llm else "") or model or "").strip()
+    if explicit:
+        el = explicit.lower()
+        if p == "tongyi" and any(x in el for x in ("deepseek", "gpt", "yi-lightning", "claude", "gemini")):
+            return default_model_for_provider("tongyi")
+        if p == "deepseek" and "qwen" in el and "deepseek" not in el:
+            return default_model_for_provider("deepseek")
+        return explicit
+    return default_model_for_provider(p)
+
+
 def merged_cursor_launch_params(client_llm: Optional[ClientLlmConfig] = None) -> dict[str, str]:
     """合并请求级 ClientLlmConfig 与 ``settings``，得到 Cursor Agents 所需的 Key / Base / 仓库 / ref。"""
     cl = client_llm
@@ -256,7 +292,7 @@ def invoke_chat_direct(
     """
     p = (provider or settings.provider or "").strip().lower()
     cl = client_llm
-    m = ((cl.model if cl else "") or model or settings.llm_model or "").strip()
+    m = resolve_model_for_provider(p, model=model, client_llm=cl)
 
     if p == "tongyi":
         # 通义走 DashScope 官方域名，与 OpenAI 兼容服务的 Base URL 无关；侧栏也无「通义 Base URL」项。

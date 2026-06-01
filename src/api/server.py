@@ -41,6 +41,7 @@ class _QuietDraftJobStatusPollAccessFilter(logging.Filter):
 
 
 import tempfile
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import json
@@ -355,7 +356,8 @@ class ChatReplyOptions(BaseModel):
     knowledge_category: str = "program"
     top_k: int = Field(default=0, ge=0, le=30)
     min_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
-    max_reply_chars: int = Field(default=220, ge=60, le=500)
+    max_reply_chars: int = Field(default=280, ge=80, le=600)
+    max_detail_chars: int = Field(default=0, ge=0, le=6000)
 
 
 class ChatReplyRequest(BaseModel):
@@ -562,7 +564,207 @@ def _ensure_chat_api_authorized(authorization: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+def _chat_normalize_answer_text(text: Any) -> str:
+    """LLM 有时输出字面量 \\n，统一为换行便于展示。"""
+    s = str(text or "").strip()
+    if "\\n" in s:
+        s = s.replace("\\r\\n", "\n").replace("\\n", "\n")
+    return s
+
+
+def _chat_as_str_list(val: Any, *, limit: int = 8) -> List[str]:
+    out: List[str] = []
+    if isinstance(val, list):
+        for x in val:
+            s = str(x or "").strip()
+            if s and s not in out:
+                out.append(s)
+    elif isinstance(val, str) and val.strip():
+        for part in re.split(r"[,，;；\n]", val):
+            s = part.strip()
+            if s and s not in out:
+                out.append(s)
+    return out[:limit]
+
+
+def _chat_retrieval_plan(intent: Dict[str, Any], query: str) -> Dict[str, Any]:
+    """由意图分析产出检索计划（查询扩展 + 主题词），通用适配各业务域，不单靠仓库等硬编码。"""
+    q = str(intent.get("normalized_question") or query or "").strip() or (query or "").strip()
+    search_queries = _chat_as_str_list(intent.get("search_queries"), limit=6)
+    if not search_queries:
+        search_queries = [
+            q,
+            f"{q} 程序文件 管理制度 体系运行记录",
+            f"{q} SOP 规程 记录 填写要求",
+        ]
+    boost_terms = _chat_as_str_list(intent.get("topic_keywords") or intent.get("relevant_topics"), limit=10)
+    penalty_terms = _chat_as_str_list(intent.get("avoid_topics") or intent.get("irrelevant_topics"), limit=8)
+    return {
+        "search_queries": search_queries,
+        "boost_terms": boost_terms,
+        "penalty_terms": penalty_terms,
+        "normalized_question": q,
+    }
+
+
+def _chat_ref_domain_score(query: str, ref: Dict[str, Any], ctx: Dict[str, Any]) -> float:
+    """向量分 + 业务域关键词加减分（文件名与片段正文均参与）。"""
+    base = float(ref.get("score") or 0.0)
+    blob = f"{ref.get('file_name') or ''}\n{(ref.get('content') or '')[:1200]}"
+    for term in ctx.get("boost_terms") or []:
+        if term and term in blob:
+            base += 0.14
+    for term in ctx.get("penalty_terms") or []:
+        if term and term in blob:
+            base -= 0.42
+    q = (query or "").strip()
+    if q and q[:8] in blob:
+        base += 0.05
+    return base
+
+
+def _chat_retrieve_program_scored_refs(
+    agent: Any,
+    query: str,
+    *,
+    allowed_category: str,
+    top_k: int,
+    plan: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """程序文件检索：多查询扩展 + category 过滤 + 主题词加减分（计划由 LLM 意图分析生成）。"""
+    ctx = plan if isinstance(plan, dict) else _chat_retrieval_plan({}, query)
+    pool: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _push(doc: Any, score: float) -> None:
+        md = getattr(doc, "metadata", {}) or {}
+        if str(md.get("category") or "").strip() != allowed_category:
+            return
+        content = (getattr(doc, "page_content", "") or "").strip()
+        file_name = str(md.get("source_file") or "未知")
+        key = f"{file_name}\n{content[:200]}"
+        if key in seen:
+            return
+        seen.add(key)
+        pool.append(
+            {
+                "content": content,
+                "score": float(score) if score is not None else 0.0,
+                "file_name": file_name,
+                "category": str(md.get("category") or ""),
+            }
+        )
+
+    over_k = max(top_k * 6, 24)
+    for sq in ctx.get("search_queries") or [query]:
+        sq = (sq or "").strip()
+        if not sq:
+            continue
+        try:
+            for pair in agent.kb.search_with_scores(sq, top_k=over_k) or []:
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    _push(pair[0], pair[1])
+        except Exception:
+            pass
+        try:
+            for doc in agent.kb.search_by_category(sq, category=allowed_category, top_k=over_k) or []:
+                _push(doc, 0.55)
+        except Exception:
+            pass
+
+    pool.sort(key=lambda r: _chat_ref_domain_score(query, r, ctx), reverse=True)
+    return pool[:top_k]
+
+
+def _chat_rerank_refs_with_llm(
+    query: str,
+    candidates: List[Dict[str, Any]],
+    *,
+    top_k: int,
+    current_provider: Optional[str] = None,
+    client_llm: Optional[Any] = None,
+    header_provider: str = "",
+) -> tuple[List[Dict[str, Any]], float, str]:
+    """用 LLM 从候选片段中挑选与用户问题真正相关的程序文件依据（通用，非关键词表）。"""
+    if not candidates:
+        return [], 0.0, "无候选片段"
+    if len(candidates) <= top_k:
+        ctx = {"boost_terms": [], "penalty_terms": []}
+        score = _chat_ref_domain_score(query, candidates[0], ctx) if candidates else 0.0
+        return candidates, score, "候选较少，跳过重排"
+
+    lines: List[str] = []
+    for i, r in enumerate(candidates[:14], start=1):
+        snippet = (r.get("content") or "")[:320].replace("\n", " ")
+        lines.append(f"[{i}] 文件: {r.get('file_name') or '未知'}\n片段: {snippet}")
+    prompt = (
+        "你是知识库检索质检员。用户要问的是医疗器械质量管理体系「运行记录怎么写」。\n"
+        f"用户问题：{query}\n\n"
+        "下列是从程序文件知识库召回的候选片段。请判断哪些片段**确实**能用来回答该问题"
+        "（制度要求、记录项目、填写要点等），与问题业务域无关的（如问仓库管理却只有软件确认）不要选。\n\n"
+        + "\n\n".join(lines)
+        + "\n\n仅输出 JSON：\n"
+        "{\n"
+        '  "selected": [1, 3],\n'
+        '  "scores": {"1": 0.92, "2": 0.05},\n'
+        '  "reason": "一句话说明选择依据"\n'
+        "}\n"
+        "selected 为相关条目编号（至少 0 个，最多 "
+        f"{top_k}"
+        " 个）；scores 为各编号 0~1 相关度。"
+    )
+    out = _extract_first_json_object(
+        _invoke_chat_llm_text(
+            prompt,
+            current_provider=current_provider,
+            client_llm=client_llm,
+            header_provider=header_provider,
+        ).text
+    )
+    selected_raw = out.get("selected") if isinstance(out, dict) else []
+    scores_map = out.get("scores") if isinstance(out, dict) else {}
+    reason = str(out.get("reason") or "").strip() if isinstance(out, dict) else ""
+
+    selected_idx: List[int] = []
+    if isinstance(selected_raw, list):
+        for x in selected_raw:
+            try:
+                n = int(x)
+                if 1 <= n <= len(candidates):
+                    selected_idx.append(n)
+            except (TypeError, ValueError):
+                continue
+    selected_idx = list(dict.fromkeys(selected_idx))[:top_k]
+
+    if not selected_idx:
+        return [], 0.0, reason or "LLM 未选中任何相关程序文件片段"
+
+    picked: List[Dict[str, Any]] = []
+    rel_scores: List[float] = []
+    for n in selected_idx:
+        ref = dict(candidates[n - 1])
+        key = str(n)
+        try:
+            rel = float((scores_map or {}).get(key, scores_map.get(str(n), 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            rel = 0.0
+        ref["relevance_score"] = max(0.0, min(1.0, rel))
+        picked.append(ref)
+        if rel > 0:
+            rel_scores.append(rel)
+    top_rel = max(rel_scores) if rel_scores else 0.72
+    return picked, top_rel, reason or "已按语义重排"
+
+
 _CHAT_INVOKABLE_PROVIDERS = frozenset({"openai", "deepseek", "lingyi", "ollama", "tongyi", "cursor"})
+_CHAT_FALLBACK_PROVIDER = "deepseek"
+
+
+@dataclass
+class _ChatLlmInvokeResult:
+    text: str
+    provider_used: str
+    fallback_note: Optional[str] = None
 
 
 def _resolve_chat_provider(
@@ -588,30 +790,47 @@ def _invoke_chat_llm_text(
     *,
     client_llm: Optional[Any] = None,
     header_provider: str = "",
-) -> str:
+) -> _ChatLlmInvokeResult:
     from src.core.llm_factory import ClientLlmConfig, invoke_chat_direct
 
     provider, _ = _resolve_chat_provider(current_provider, header_provider=header_provider)
     cl = client_llm if isinstance(client_llm, ClientLlmConfig) else None
-    model_override = ((cl.model if cl else "") or (getattr(settings, "llm_model", "") or "").strip() or None)
     if provider == "cursor":
         from src.core.cursor_agent import complete_task
 
-        return complete_task(prompt_text, client_llm=cl if cl and cl.has_any() else None)
-    try:
+        return _ChatLlmInvokeResult(
+            text=complete_task(prompt_text, client_llm=cl if cl and cl.has_any() else None),
+            provider_used="cursor",
+        )
+
+    def _call(prov: str, use_cl: Optional[ClientLlmConfig]) -> str:
         return invoke_chat_direct(
             prompt_text,
             temperature=0.1,
-            provider=(provider or None),
-            model=model_override,
-            client_llm=cl if cl and cl.has_any() else None,
+            provider=prov,
+            model=None,
+            client_llm=use_cl if use_cl and use_cl.has_any() else None,
         )
-    except Exception:
-        from src.core.llm_factory import create_chat_llm
 
-        llm = create_chat_llm(temperature=0.1)
-        msg = llm.invoke(prompt_text)
-        return getattr(msg, "content", str(msg))
+    try:
+        return _ChatLlmInvokeResult(
+            text=_call(provider, cl),
+            provider_used=provider,
+        )
+    except Exception as primary_err:
+        if provider == _CHAT_FALLBACK_PROVIDER:
+            raise
+        err_short = str(primary_err).strip().replace("\n", " ")[:200]
+        try:
+            return _ChatLlmInvokeResult(
+                text=_call(_CHAT_FALLBACK_PROVIDER, None),
+                provider_used=_CHAT_FALLBACK_PROVIDER,
+                fallback_note=f"{provider} 调用失败，已回退 DeepSeek：{err_short}",
+            )
+        except Exception as fallback_err:
+            raise RuntimeError(
+                f"{provider} 调用失败（{err_short}），DeepSeek 回退也失败（{fallback_err}）"
+            ) from fallback_err
 
 
 def _classify_chat_intent(
@@ -622,19 +841,27 @@ def _classify_chat_intent(
     header_provider: str = "",
 ) -> Dict[str, Any]:
     prompt = (
-        "你是意图分类器。仅输出 JSON，不要输出其他内容。\n"
+        "你是医疗器械体系运行记录问答的前置分析器。仅输出 JSON。\n"
         "用户问题：\n"
         f"{query}\n\n"
-        "判断并返回：\n"
+        "判断用户意图，并**同时**给出用于检索程序文件知识库的查询计划（须贴合用户业务域，"
+        "如问仓库管理员应检索仓库/仓储/物料管理制度，而非无关的软件确认程序）。\n"
+        "返回：\n"
         "{\n"
         '  "is_system_record_writing": true/false,\n'
         '  "is_date_or_personnel_question": true/false,\n'
-        '  "normalized_question": "归一化问题",\n'
+        '  "normalized_question": "归一化后的完整问题",\n'
+        '  "search_queries": ["检索句1", "检索句2", "检索句3"],\n'
+        '  "topic_keywords": ["相关主题词1", "相关主题词2"],\n'
+        '  "avoid_topics": ["应排除的无关主题1"],\n'
         '  "reason": "一句话原因"\n'
         "}\n"
         "规则：\n"
-        "1) 只有“医疗器械质量管理体系运行记录怎么写/怎么填/记录项怎么写”相关才算 is_system_record_writing=true。\n"
-        "2) 涉及“日期写什么/什么时候写/人员写谁/谁签字/谁审核/谁批准”即 is_date_or_personnel_question=true。\n"
+        "1) 只有「体系运行记录怎么写/怎么填/记录项怎么写」相关才算 is_system_record_writing=true。\n"
+        "2) 涉及日期/人员/签字/审核/批准等即 is_date_or_personnel_question=true。\n"
+        "3) search_queries 写 3～5 条中文检索句，包含可能的制度名称、业务域、记录类型；"
+        "不要编造不存在的文件编号。\n"
+        "4) topic_keywords / avoid_topics 用于过滤明显跑题的召回结果。\n"
     )
     out = _extract_first_json_object(
         _invoke_chat_llm_text(
@@ -642,7 +869,7 @@ def _classify_chat_intent(
             current_provider=current_provider,
             client_llm=client_llm,
             header_provider=header_provider,
-        )
+        ).text
     )
     if out:
         return out
@@ -654,6 +881,9 @@ def _classify_chat_intent(
         "is_system_record_writing": bool(system_record),
         "is_date_or_personnel_question": bool(date_or_personnel),
         "normalized_question": q,
+        "search_queries": [q, f"{q} 程序文件 管理制度 体系运行记录"],
+        "topic_keywords": [],
+        "avoid_topics": [],
         "reason": "fallback",
     }
 
@@ -1188,43 +1418,23 @@ def chat_reply_generate(
     top_k = max(2, min(20, top_k))
     min_similarity = float(opts.min_similarity or 0.0) or float(getattr(settings, "chat_min_similarity", 0.55) or 0.55)
     conf_threshold = float(getattr(settings, "chat_confidence_threshold", 0.65) or 0.65)
-    max_reply_chars = int(opts.max_reply_chars or 220)
+    max_summary_chars = max(80, min(600, int(opts.max_reply_chars or 280)))
+    max_detail_chars = int(opts.max_detail_chars or 0) or int(
+        getattr(settings, "chat_max_detail_chars", 2400) or 2400
+    )
+    max_detail_chars = max(200, min(6000, max_detail_chars))
 
-    scored_refs: List[Dict[str, Any]] = []
-    try:
-        scored = agent.kb.search_with_scores(query, top_k=max(top_k * 4, 20))
-    except Exception:
-        scored = []
-    for pair in scored or []:
-        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-            continue
-        doc, score = pair
-        md = getattr(doc, "metadata", {}) or {}
-        if str(md.get("category") or "").strip() != allowed_category:
-            continue
-        scored_refs.append(
-            {
-                "content": (getattr(doc, "page_content", "") or "").strip(),
-                "score": float(score) if score is not None else 0.0,
-                "file_name": str(md.get("source_file") or "未知"),
-                "category": str(md.get("category") or ""),
-            }
-        )
-        if len(scored_refs) >= top_k:
-            break
-    if len(scored_refs) < 2:
-        docs = agent.kb.search_by_category(query, category=allowed_category, top_k=top_k)
-        for d in docs or []:
-            md = getattr(d, "metadata", {}) or {}
-            scored_refs.append(
-                {
-                    "content": (getattr(d, "page_content", "") or "").strip(),
-                    "score": 0.0,
-                    "file_name": str(md.get("source_file") or "未知"),
-                    "category": str(md.get("category") or ""),
-                }
-            )
-    if len(scored_refs) < 2:
+    retrieval_plan = _chat_retrieval_plan(intent, query)
+    search_query = str(retrieval_plan.get("normalized_question") or query).strip() or query
+    recall_k = max(top_k * 3, 12)
+    candidates = _chat_retrieve_program_scored_refs(
+        agent,
+        search_query,
+        allowed_category=allowed_category,
+        top_k=recall_k,
+        plan=retrieval_plan,
+    )
+    if len(candidates) < 2:
         return {
             "request_id": request_id,
             "need_human": True,
@@ -1235,14 +1445,32 @@ def chat_reply_generate(
             "model_used": (getattr(settings, "llm_model", "") or "").strip(),
             "latency_ms": int((time.time() - started) * 1000),
         }
-    top_score = float(scored_refs[0].get("score") or 0.0)
-    if top_score and top_score < min_similarity:
+    scored_refs, top_score, rerank_reason = _chat_rerank_refs_with_llm(
+        search_query,
+        candidates,
+        top_k=top_k,
+        current_provider=eff_provider,
+        client_llm=client_llm if client_llm.has_any() else None,
+        header_provider=hp,
+    )
+    if len(scored_refs) < 2:
+        return {
+            "request_id": request_id,
+            "need_human": True,
+            "answer": "",
+            "confidence": 0.0,
+            "reason": rerank_reason or "召回片段与问题业务域不匹配，建议人工确认。",
+            "references": [],
+            "model_used": (getattr(settings, "llm_model", "") or "").strip(),
+            "latency_ms": int((time.time() - started) * 1000),
+        }
+    if top_score < min_similarity:
         return {
             "request_id": request_id,
             "need_human": True,
             "answer": "",
             "confidence": top_score,
-            "reason": "程序文件匹配度不足，建议人工确认。",
+            "reason": rerank_reason or "程序文件匹配度不足，建议人工确认。",
             "references": [],
             "model_used": (getattr(settings, "llm_model", "") or "").strip(),
             "latency_ms": int((time.time() - started) * 1000),
@@ -1259,37 +1487,51 @@ def chat_reply_generate(
         "任务：根据“程序文件”片段回答用户“怎么写记录”的问题。\n"
         "限制：\n"
         "1) 仅可依据给定程序文件片段回答；无法确认就 need_human=true。\n"
-        "2) 首版不回答日期写法和人员填写问题。\n"
-        "3) 不输出法规结论，不编造不存在的字段。\n"
-        "4) 输出简洁、可执行。\n\n"
+        "2) 仅使用与用户业务域一致的片段；已预筛选，若仍不对则 need_human=true。\n"
+        "3) 首版不回答日期写法和人员填写问题。\n"
+        "4) 不输出法规结论，不编造不存在的字段。\n"
+        "5) 输出简洁、可执行，列清记录项与依据来源文件。\n\n"
         f"用户问题：{query}\n\n"
         "程序文件片段：\n"
         + "\n\n".join(refs_prompt)
         + "\n\n仅输出 JSON：\n"
         "{\n"
         '  "need_human": false,\n'
-        '  "answer": "回答内容",\n'
+        '  "answer_summary": "2～4 句简化总结（群消息用，列关键记录项）",\n'
+        '  "answer_detail": "详细版：分条说明怎么写、依据哪份程序文件（可用换行）",\n'
+        '  "answer": "与 answer_summary 相同（兼容）",\n'
         '  "confidence": 0.0,\n'
         '  "reason": "一句话原因"\n'
         "}"
     )
-    llm_out = _extract_first_json_object(
-        _invoke_chat_llm_text(
-            answer_prompt,
-            current_provider=eff_provider,
-            client_llm=client_llm if client_llm.has_any() else None,
-            header_provider=hp,
-        )
+    answer_invoke = _invoke_chat_llm_text(
+        answer_prompt,
+        current_provider=eff_provider,
+        client_llm=client_llm if client_llm.has_any() else None,
+        header_provider=hp,
     )
-    answer = str(llm_out.get("answer") or "").strip()
-    answer = answer[:max_reply_chars]
+    llm_out = _extract_first_json_object(answer_invoke.text)
+    llm_provider_used = answer_invoke.provider_used
+    if answer_invoke.fallback_note:
+        provider_note = (
+            f"{provider_note}；{answer_invoke.fallback_note}"
+            if provider_note
+            else answer_invoke.fallback_note
+        )
+    answer_summary = _chat_normalize_answer_text(
+        llm_out.get("answer_summary") or llm_out.get("answer") or ""
+    )[:max_summary_chars]
+    answer_detail = _chat_normalize_answer_text(
+        llm_out.get("answer_detail") or llm_out.get("answer") or answer_summary
+    )[:max_detail_chars]
+    answer = answer_summary
     try:
         confidence = float(llm_out.get("confidence", 0.0) or 0.0)
     except Exception:
         confidence = 0.0
     confidence = max(0.0, min(1.0, confidence))
     need_human = bool(llm_out.get("need_human"))
-    if not answer:
+    if not answer_summary and not answer_detail:
         need_human = True
     if confidence < conf_threshold:
         need_human = True
@@ -1304,15 +1546,26 @@ def chat_reply_generate(
                 "snippet": (r.get("content") or "")[:120],
             }
         )
+    from src.core.llm_factory import resolve_model_for_provider
+
+    cl_for_model = (
+        client_llm
+        if client_llm.has_any() and llm_provider_used == eff_provider
+        else None
+    )
+    model_label = resolve_model_for_provider(llm_provider_used, client_llm=cl_for_model)
     out_body: Dict[str, Any] = {
         "request_id": request_id,
         "need_human": need_human,
-        "answer": "" if need_human else answer,
+        "answer": "" if need_human else answer_summary,
+        "answer_summary": "" if need_human else answer_summary,
+        "answer_detail": "" if need_human else answer_detail,
         "confidence": confidence,
         "reason": str(llm_out.get("reason") or ""),
         "references": references,
-        "model_used": (getattr(settings, "llm_model", "") or "").strip(),
+        "model_used": f"{llm_provider_used}:{model_label}",
         "effective_provider": eff_provider,
+        "llm_provider_used": llm_provider_used,
         "latency_ms": int((time.time() - started) * 1000),
     }
     if provider_note:
