@@ -624,10 +624,13 @@ def check_input_vector_duplicates(body: CheckInputVectorDuplicatesBody):
 
 @router.get("/meta")
 def draft_meta(
+    request: Request,
     collection: str = Query("regulations"),
     base_case_id: Optional[int] = Query(None, description="若提供则返回该案例下模板文件名列表"),
 ):
     try:
+        from src.api.server import _resolve_request_collection
+        collection = _resolve_request_collection(request, collection)
         bcid: Optional[int] = None
         if base_case_id is not None and int(base_case_id) > 0:
             bcid = int(base_case_id)
@@ -653,6 +656,7 @@ def draft_meta(
 
 @router.get("/page-bootstrap")
 def draft_page_bootstrap(
+    request: Request,
     collection: str = Query("regulations"),
     base_case_id: Optional[int] = Query(None),
     templates: Optional[List[str]] = Query(
@@ -661,8 +665,10 @@ def draft_page_bootstrap(
 ):
     """初稿页完整 UI 元数据（aiword 薄代理透传，勿在 BFF 重复拼 author_role 等）。"""
     try:
+        from src.api.server import _resolve_request_collection
         from src.core.draft_integration_ui_meta import build_draft_page_bootstrap
 
+        collection = _resolve_request_collection(request, collection)
         bcid: Optional[int] = None
         if base_case_id is not None and int(base_case_id) > 0:
             bcid = int(base_case_id)
@@ -734,6 +740,12 @@ async def draft_create_job(
         body = DraftGeneratePayload.model_validate(json.loads(payload))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"payload JSON 无效: {e}") from e
+
+    try:
+        from src.api.server import _resolve_request_collection
+        body.collection = _resolve_request_collection(request, body.collection or "regulations")
+    except Exception:
+        pass
 
     client_llm = _parse_client_llm(request)
     if not bool(getattr(settings, "draft_interop_personal_keys_only", True)):

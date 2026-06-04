@@ -1,0 +1,30 @@
+---
+description: aicheckword 所有 collection 入口必须经 _resolve_request_collection 解析（多公司租户）
+alwaysApply: true
+---
+
+# aicheckword 多公司租户：collection 解析契约
+
+## 1. 唯一入口
+
+- 任何接收 `collection`（Form/Query/Pydantic body）的 HTTP 路由，**必须**在函数体开头通过
+  `_resolve_request_collection(req, collection)` 重写 `collection`，确保多租户开启时按
+  `X-Aiword-Company-Id` 映射到 `companies.knowledge_collection`。
+- Form/Query：函数签名加 `req: Request`，先 `collection = _resolve_request_collection(req, collection)`。
+- Pydantic body：`body.collection = _resolve_request_collection(req, body.collection or "regulations")`，仅在主进程入口做一次，不在异步任务里再次解析（异步任务以 `payload.collection` 为准）。
+
+## 2. 同步契约
+
+- 公司映射表 `companies` 由 aiword 端通过 `POST /admin/companies/sync` upsert、`DELETE /admin/companies/sync/{aiword_company_id}` 删除；本地不允许直接编辑 `companies` 表（除运维场景）。
+- Streamlit 侧栏的「公司选择器」只能从本地 `companies` 表读取（`list_companies()`），不展示外部 ID。
+
+## 3. 禁止行为
+
+- 禁止某些路由「信任请求体里的 `collection`」而跳过解析，否则会跨公司读到错的知识库。
+- 禁止在 `aicheckword` 内部新增「自身判断当前公司」的开关；公司归属来自 aiword 通过 Header 注入，aicheckword 不维护登录态。
+
+## 4. 自检
+
+- 新增/改动路由后必须 grep 自检：
+  - 该函数体出现 `_resolve_request_collection(`；
+  - 函数签名含 `req: Request`（Form/Query）或读取 `request` 后赋值 body（Pydantic body）。

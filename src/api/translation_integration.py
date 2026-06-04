@@ -159,9 +159,15 @@ def _collect_residual_cjk_warnings(
 
 @router.get("/meta")
 def translation_meta(
+    request: Request,
     collection: str = Query("regulations"),
 ):
     """翻译页元数据：项目下拉 + 目标语言 + 公司信息配置（来源 app_settings.translation_company_config）。"""
+    try:
+        from src.api.server import _resolve_request_collection
+        collection = _resolve_request_collection(request, collection)
+    except Exception:
+        pass
     try:
         tcfg = get_translation_config() or {}
     except Exception:
@@ -631,6 +637,12 @@ async def translation_create_job(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"payload JSON 无效: {e}") from e
 
+    try:
+        from src.api.server import _resolve_request_collection
+        body.collection = _resolve_request_collection(request, body.collection or "regulations")
+    except Exception:
+        pass
+
     target_lang = (body.target_lang or "en").strip().lower()
     if target_lang not in _VALID_LANGS:
         raise HTTPException(
@@ -752,6 +764,12 @@ async def translation_correct_create_job(
         body = TranslationCorrectionJobPayload.model_validate(json.loads(payload))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"payload JSON 无效: {e}") from e
+
+    try:
+        from src.api.server import _resolve_request_collection
+        body.collection = _resolve_request_collection(request, body.collection or "regulations")
+    except Exception:
+        pass
 
     target_lang = (body.target_lang or "en").strip().lower()
     if target_lang not in _VALID_LANGS:

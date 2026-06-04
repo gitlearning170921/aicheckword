@@ -64,8 +64,14 @@ from src.core.db import (
     REGISTRATION_COMPONENTS,
     list_projects,
     list_project_cases,
+    list_companies,
+    create_project_case,
+    get_project_case,
+    upsert_company_mapping,
+    delete_company_by_aiword_id,
 )
 from src.core.project_option_label import format_project_option_label
+from src.core.document_loader import load_single_file, split_documents
 from config.runtime_settings import apply_runtime_config_dict, sync_cursor_overrides_from_settings
 from src.core.db import load_app_settings
 from src.core.quiz import service as quiz_service
@@ -98,6 +104,31 @@ app.include_router(translation_integration_router)
 app.include_router(integration_common_router)
 
 _agents: Dict[str, ReviewAgent] = {}
+
+
+def _collection_by_company_header(company_id: str) -> str:
+    cid = str(company_id or "").strip()
+    if not cid:
+        return ""
+    try:
+        for row in list_companies() or []:
+            rid = str(row.get("id") or "").strip()
+            aid = str(row.get("aiword_company_id") or "").strip()
+            if cid in (rid, aid):
+                return str(row.get("knowledge_collection") or "").strip() or "regulations"
+    except Exception:
+        return ""
+    return ""
+
+
+def _resolve_request_collection(req: Request, provided: Optional[str]) -> str:
+    h = str(req.headers.get("X-Aiword-Company-Id") or "").strip()
+    if h:
+        by_header = _collection_by_company_header(h)
+        if by_header:
+            return by_header
+    p = str(provided or "").strip()
+    return p or "regulations"
 
 
 def _configure_api_service_console_timestamps() -> None:
@@ -345,6 +376,15 @@ class KnowledgeQueryRequest(BaseModel):
     case_type: Optional[str] = None
     # 仍保留 collection 供多租户场景，不对外强调
     collection: str = "regulations"
+
+
+class CompanySyncRequest(BaseModel):
+    aiword_company_id: str = Field(..., description="aiword organizations.id")
+    name: str = Field(..., description="公司名称")
+    slug: str = Field(..., description="公司 slug")
+    knowledge_collection: str = Field(..., description="知识库 collection")
+    is_active: bool = True
+    is_default: bool = False
 
 
 class CollectionRequest(BaseModel):
@@ -914,17 +954,46 @@ def swagger_ui_redirect():
 
 
 @app.get("/status")
-def agent_status(collection: str = "regulations"):
-    agent = get_agent(collection)
+def agent_status(req: Request, collection: str = "regulations"):
+    agent = get_agent(_resolve_request_collection(req, collection))
     return agent.get_status()
+
+
+@app.post("/admin/companies/sync")
+def admin_companies_sync(body: CompanySyncRequest):
+    try:
+        row = upsert_company_mapping(
+            aiword_company_id=body.aiword_company_id,
+            name=body.name,
+            slug=body.slug,
+            knowledge_collection=body.knowledge_collection,
+            is_active=bool(body.is_active),
+            is_default=bool(body.is_default),
+        )
+        return {"ok": True, "data": row}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.delete("/admin/companies/sync/{aiword_company_id}")
+def admin_companies_sync_delete(aiword_company_id: str):
+    try:
+        ok = delete_company_by_aiword_id(aiword_company_id)
+        return {"ok": True, "data": {"deleted": bool(ok)}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/train/upload")
 async def train_upload(
+    req: Request,
     files: List[UploadFile] = File(...),
     collection: str = Form("regulations"),
     category: str = Form("regulation"),
 ):
+    collection = _resolve_request_collection(req, collection)
     agent = get_agent(collection)
     results = []
 
@@ -958,16 +1027,123 @@ async def train_upload(
 
 
 @app.post("/train/directory")
-def train_directory(dir_path: str = Form(...), collection: str = Form("regulations"), category: str = Form("regulation")):
+def train_directory(
+    req: Request,
+    dir_path: str = Form(...),
+    collection: str = Form("regulations"),
+    category: str = Form("regulation"),
+):
     if not Path(dir_path).exists():
         raise HTTPException(status_code=404, detail=f"目录不存在：{dir_path}")
+    collection = _resolve_request_collection(req, collection)
     agent = get_agent(collection)
     result = agent.train(dir_path, category=category)
     return result
 
 
+@app.post("/train/project-cases/create")
+def train_project_case_create(
+    req: Request,
+    collection: str = Form("regulations"),
+    case_name: str = Form(...),
+    product_name: str = Form(""),
+    registration_country: str = Form(""),
+    registration_type: str = Form(""),
+    registration_component: str = Form(""),
+    project_form: str = Form(""),
+    scope_of_application: str = Form(""),
+    case_name_en: str = Form(""),
+    product_name_en: str = Form(""),
+    registration_country_en: str = Form(""),
+    document_language: str = Form("zh"),
+    project_key: str = Form(""),
+):
+    collection = _resolve_request_collection(req, collection)
+    nm = str(case_name or "").strip()
+    if not nm:
+        raise HTTPException(status_code=400, detail="case_name 不能为空")
+    try:
+        case_id = create_project_case(
+            collection=collection,
+            case_name=nm,
+            product_name=product_name or "",
+            registration_country=registration_country or "",
+            registration_type=registration_type or "",
+            registration_component=registration_component or "",
+            project_form=project_form or "",
+            scope_of_application=scope_of_application or "",
+            case_name_en=case_name_en or "",
+            product_name_en=product_name_en or "",
+            registration_country_en=registration_country_en or "",
+            document_language=document_language or "zh",
+            project_key=project_key or "",
+        )
+        row = get_project_case(int(case_id))
+        return {"ok": True, "data": {"case_id": int(case_id), "case": row or {}}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/train/project-cases/upload")
+async def train_project_case_upload(
+    req: Request,
+    files: List[UploadFile] = File(...),
+    collection: str = Form("regulations"),
+    case_id: int = Form(...),
+):
+    collection = _resolve_request_collection(req, collection)
+    case = get_project_case(int(case_id))
+    if not case or str(case.get("collection") or "").strip() != collection:
+        raise HTTPException(status_code=404, detail="case_id 不存在或不属于当前 collection")
+    agent = get_agent(collection)
+    results = []
+    for f in files:
+        suffix = Path(str(f.filename or "")).suffix
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            raw = await f.read()
+            tmp.write(raw)
+            tmp_path = tmp.name
+        try:
+            docs = load_single_file(tmp_path)
+            chunks = split_documents(docs)
+            n = agent.kb.add_documents(
+                chunks,
+                file_name=str(f.filename or Path(tmp_path).name),
+                category="project_case",
+                case_id=int(case_id),
+            )
+            results.append(
+                {
+                    "status": "success",
+                    "original_filename": str(f.filename or ""),
+                    "chunks_added": int(n or 0),
+                }
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "status": "error",
+                    "original_filename": str(f.filename or ""),
+                    "message": str(e),
+                }
+            )
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+    return {
+        "ok": True,
+        "data": {
+            "collection": collection,
+            "case_id": int(case_id),
+            "files_processed": len(results),
+            "total_chunks_added": sum(int(x.get("chunks_added") or 0) for x in results),
+            "details": results,
+        },
+    }
+
+
 @app.post("/review/upload")
 async def review_upload(
+    req: Request,
     files: List[UploadFile] = File(...),
     collection: str = Form("regulations"),
     project_id: Optional[int] = Form(None),
@@ -992,6 +1168,7 @@ async def review_upload(
     system_functionality_text: str = Form(""),
     current_provider: str = Form(""),
 ):
+    collection = _resolve_request_collection(req, collection)
     agent = get_agent(collection)
     reports = []
     parsed_ctx: Dict[str, Any] = {}
@@ -1054,7 +1231,8 @@ async def review_upload(
 
 
 @app.post("/review/text")
-def review_text(request: TextReviewRequest):
+def review_text(req: Request, request: TextReviewRequest):
+    request.collection = _resolve_request_collection(req, request.collection)
     agent = get_agent(request.collection)
     merged_ctx = _merge_review_context(
         request.review_context,
@@ -1088,7 +1266,8 @@ def review_text(request: TextReviewRequest):
 
 
 @app.post("/knowledge/search")
-def search_knowledge(request: KnowledgeQueryRequest):
+def search_knowledge(req: Request, request: KnowledgeQueryRequest):
+    request.collection = _resolve_request_collection(req, request.collection)
     agent = get_agent(request.collection)
     # 仅按指定维度查询；以维度组合为检索种子，再按 metadata 二次过滤
     extra_terms = []
@@ -1198,8 +1377,9 @@ def search_knowledge(request: KnowledgeQueryRequest):
 
 
 @app.get("/knowledge/search/options")
-def knowledge_search_options(collection: str = Query("regulations", description="知识库名称")):
+def knowledge_search_options(req: Request, collection: str = Query("regulations", description="知识库名称")):
     """返回查询参数可选值（与页面一致）"""
+    collection = _resolve_request_collection(req, collection)
     def _uniq(values: List[str]) -> List[str]:
         out: List[str] = []
         seen = set()
@@ -1340,7 +1520,8 @@ def knowledge_search_options(collection: str = Query("regulations", description=
 
 
 @app.post("/knowledge/clear")
-def clear_knowledge(request: CollectionRequest):
+def clear_knowledge(req: Request, request: CollectionRequest):
+    request.collection = _resolve_request_collection(req, request.collection)
     agent = get_agent(request.collection)
     return agent.clear_knowledge()
 
@@ -1413,6 +1594,7 @@ def chat_reply_generate(
             "latency_ms": int((time.time() - started) * 1000),
         }
 
+    body.collection = _resolve_request_collection(http_request, body.collection or "regulations")
     agent = get_agent(body.collection or "regulations")
     top_k = int(opts.top_k or 0) or int(getattr(settings, "chat_default_top_k", 6) or 6)
     top_k = max(2, min(20, top_k))
@@ -1588,10 +1770,11 @@ def chat_feedback(
 
 
 @app.post("/quiz/sets/generate")
-def quiz_generate_set(request: QuizGenerateSetRequest):
+def quiz_generate_set(http_req: Request, request: QuizGenerateSetRequest):
     if request.exam_track not in EXAM_TRACKS:
         raise HTTPException(status_code=400, detail=f"exam_track 不支持: {request.exam_track}")
     try:
+        request.collection = _resolve_request_collection(http_req, request.collection)
         data = quiz_service.generate_set(
             collection=request.collection,
             exam_track=request.exam_track,
@@ -1614,10 +1797,11 @@ def quiz_generate_set(request: QuizGenerateSetRequest):
 
 
 @app.post("/quiz/practice/generate-set")
-def quiz_generate_practice_set(request: QuizPracticeSetRequest):
+def quiz_generate_practice_set(http_req: Request, request: QuizPracticeSetRequest):
     if request.exam_track not in EXAM_TRACKS:
         raise HTTPException(status_code=400, detail=f"exam_track 不支持: {request.exam_track}")
     try:
+        request.collection = _resolve_request_collection(http_req, request.collection)
         data = quiz_service.generate_set(
             collection=request.collection,
             exam_track=request.exam_track,
@@ -1655,10 +1839,11 @@ def quiz_generate_practice_set(request: QuizPracticeSetRequest):
 
 
 @app.post("/quiz/bank/ingest-by-ai")
-def quiz_ingest_bank_by_ai(request: QuizIngestByAIRequest):
+def quiz_ingest_bank_by_ai(http_req: Request, request: QuizIngestByAIRequest):
     if request.exam_track not in EXAM_TRACKS:
         raise HTTPException(status_code=400, detail=f"exam_track 不支持: {request.exam_track}")
     try:
+        request.collection = _resolve_request_collection(http_req, request.collection)
         data = quiz_service.ingest_bank_by_ai(
             collection=request.collection,
             exam_track=request.exam_track,
@@ -1683,9 +1868,10 @@ def quiz_ingest_bank_by_ai(request: QuizIngestByAIRequest):
 
 
 @app.get("/quiz/tools/project-cases")
-def quiz_tools_project_cases(collection: str = Query("regulations", description="知识库 collection")):
+def quiz_tools_project_cases(req: Request, collection: str = Query("regulations", description="知识库 collection")):
     """已训练入库（knowledge_docs 有 project_case 块）的项目案例列表，供考试中心下拉。"""
     try:
+        collection = _resolve_request_collection(req, collection)
         rows = quiz_service.list_ready_project_cases_for_quiz(collection=collection)
         return {"ok": True, "data": {"cases": rows, "collection": collection}}
     except Exception as e:
@@ -1736,11 +1922,13 @@ def quiz_publish_set(set_id: int):
 
 @app.post("/quiz/sets/{set_id}/review-by-ai")
 def quiz_review_set_by_ai(
+    req: Request,
     set_id: int,
     collection: str = Query("regulations"),
     created_by: str = Query("system"),
 ):
     try:
+        collection = _resolve_request_collection(req, collection)
         return {"ok": True, "data": quiz_service.start_review_set_by_ai_job(collection=collection, set_id=set_id, created_by=created_by)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1756,6 +1944,7 @@ def quiz_review_job_get(job_id: int):
 
 @app.get("/quiz/sets")
 def quiz_sets_list(
+    req: Request,
     collection: str = Query("regulations"),
     set_type: str = Query(""),
     exam_track: str = Query(""),
@@ -1765,6 +1954,7 @@ def quiz_sets_list(
     offset: int = Query(0, ge=0),
 ):
     try:
+        collection = _resolve_request_collection(req, collection)
         return {
             "ok": True,
             "data": quiz_service.list_sets(
@@ -1804,9 +1994,11 @@ def quiz_start_exam(set_id: int, request: QuizAttemptStartRequest):
 
 @app.post("/quiz/practice/submit")
 def quiz_submit_practice(
+    req: Request,
     body: QuizPracticeSubmitRequest,
     attempt_id: Optional[int] = Query(default=None, ge=1, description="兼容旧调用：也可仅 query 传 attempt_id"),
 ):
+    body.collection = _resolve_request_collection(req, body.collection)
     aid = attempt_id or body.attempt_id
     # 兼容 aiword 仅传 set_id 的场景：自动创建一次 practice attempt，再提交答案
     if not aid and body.set_id:
@@ -1839,10 +2031,11 @@ def quiz_submit_exam(attempt_id: int, request: QuizSubmitAnswersRequest):
 
 
 @app.post("/quiz/attempts/{attempt_id}/grade-by-cache")
-def quiz_grade_by_cache(attempt_id: int, collection: str = Query("regulations"), paper_id: Optional[int] = Query(None)):
+def quiz_grade_by_cache(req: Request, attempt_id: int, collection: str = Query("regulations"), paper_id: Optional[int] = Query(None)):
     if quiz_service.is_exam_attempt(attempt_id=attempt_id):
         raise HTTPException(status_code=404, detail="exam attempt 已迁移到 aiword 本地考试，当前接口不再提供")
     try:
+        collection = _resolve_request_collection(req, collection)
         data = quiz_service.grade_attempt_by_cache(collection=collection, attempt_id=attempt_id, paper_id=paper_id)
         return {"ok": True, "data": data}
     except Exception as e:
@@ -1850,10 +2043,11 @@ def quiz_grade_by_cache(attempt_id: int, collection: str = Query("regulations"),
 
 
 @app.post("/quiz/attempts/{attempt_id}/auto-grade")
-def quiz_auto_grade(attempt_id: int, collection: str = Query("regulations"), paper_id: Optional[int] = Query(None)):
+def quiz_auto_grade(req: Request, attempt_id: int, collection: str = Query("regulations"), paper_id: Optional[int] = Query(None)):
     if quiz_service.is_exam_attempt(attempt_id=attempt_id):
         raise HTTPException(status_code=404, detail="exam attempt 已迁移到 aiword 本地考试，当前接口不再提供")
     try:
+        collection = _resolve_request_collection(req, collection)
         data = quiz_service.auto_grade_attempt(collection=collection, attempt_id=attempt_id, paper_id=paper_id)
         return {"ok": True, "data": data}
     except Exception as e:
@@ -1874,7 +2068,7 @@ def quiz_attempt_grading_status(attempt_id: int):
 
 
 @app.get("/quiz/attempts/{attempt_id}/answers")
-def quiz_attempt_answers(attempt_id: int, collection: str = Query("regulations")):
+def quiz_attempt_answers(req: Request, attempt_id: int, collection: str = Query("regulations")):
     """
     返回 attempt 的作答明细（题干/选项/标准答案/学生答案等），用于 aiword 的考试/练习详情展示。
 
@@ -1885,6 +2079,7 @@ def quiz_attempt_answers(attempt_id: int, collection: str = Query("regulations")
     if quiz_service.is_exam_attempt(attempt_id=attempt_id):
         raise HTTPException(status_code=404, detail="exam attempt 已迁移到 aiword 本地考试，当前接口不再提供")
     try:
+        collection = _resolve_request_collection(req, collection)
         _ = collection  # 预留参数，避免上层固定传参导致 422
         return {"ok": True, "data": quiz_service.get_attempt_answers_with_questions(attempt_id=attempt_id)}
     except Exception as e:
@@ -1892,8 +2087,9 @@ def quiz_attempt_answers(attempt_id: int, collection: str = Query("regulations")
 
 
 @app.post("/quiz/grading-rules/upsert")
-def quiz_upsert_grading_rules(request: QuizUpsertGradingRuleRequest):
+def quiz_upsert_grading_rules(req: Request, request: QuizUpsertGradingRuleRequest):
     try:
+        request.collection = _resolve_request_collection(req, request.collection)
         data = quiz_service.upsert_grading_rule(
             collection=request.collection,
             paper_id=request.paper_id,
@@ -1924,13 +2120,14 @@ class QuizPaperGradeByAIRequest(BaseModel):
 
 
 @app.post("/quiz/grading/paper-by-ai")
-def quiz_grade_paper_by_ai(request: QuizPaperGradeByAIRequest):
+def quiz_grade_paper_by_ai(req: Request, request: QuizPaperGradeByAIRequest):
     """整卷主观判分：创建异步 job，返回 job_id。证据定位仅需文件名。"""
     if request.exam_track not in EXAM_TRACKS:
         raise HTTPException(status_code=400, detail=f"exam_track 不支持: {request.exam_track}")
     if not request.items:
         raise HTTPException(status_code=422, detail="items 不能为空")
     try:
+        request.collection = _resolve_request_collection(req, request.collection)
         data = quiz_service.start_paper_grading_job(
             collection=request.collection,
             exam_track=request.exam_track,
@@ -1955,8 +2152,9 @@ def quiz_grade_paper_job(job_id: str):
 
 
 @app.get("/quiz/bank/tracks")
-def quiz_bank_tracks(collection: str = "regulations"):
+def quiz_bank_tracks(req: Request, collection: str = "regulations"):
     try:
+        collection = _resolve_request_collection(req, collection)
         return {"ok": True, "data": quiz_service.get_tracks_inventory(collection)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1964,11 +2162,13 @@ def quiz_bank_tracks(collection: str = "regulations"):
 
 @app.get("/quiz/wrongbook")
 def quiz_wrongbook_get(
+    req: Request,
     collection: str = Query("regulations"),
     user_id: str = Query("", description="学生 user_id，由网关注入"),
     limit: int = Query(80, ge=1, le=200),
 ):
     try:
+        collection = _resolve_request_collection(req, collection)
         return {"ok": True, "data": quiz_service.student_wrongbook(collection=collection, user_id=user_id, limit=limit)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1994,12 +2194,14 @@ def quiz_student_exams_compat():
 
 @app.get("/quiz/student/unpracticed-bank")
 def quiz_student_unpracticed_bank(
+    req: Request,
     collection: str = Query("regulations"),
     user_id: str = Query("", description="学生 user_id，由网关注入"),
     exam_track: str = Query(""),
     limit: int = Query(100, ge=0, le=300),
 ):
     try:
+        collection = _resolve_request_collection(req, collection)
         return {
             "ok": True,
             "data": quiz_service.student_unpracticed_bank(
@@ -2012,6 +2214,7 @@ def quiz_student_unpracticed_bank(
 
 @app.get("/quiz/bank/questions")
 def quiz_bank_questions_list(
+    req: Request,
     collection: str = Query("regulations"),
     exam_track: str = Query(""),
     q: str = Query(""),
@@ -2023,6 +2226,7 @@ def quiz_bank_questions_list(
     offset: int = Query(0, ge=0),
 ):
     try:
+        collection = _resolve_request_collection(req, collection)
         data = quiz_service.admin_list_bank_questions(
             collection=collection,
             exam_track=exam_track,
@@ -2041,11 +2245,13 @@ def quiz_bank_questions_list(
 
 @app.patch("/quiz/bank/questions/{question_id}")
 def quiz_bank_question_patch(
+    req: Request,
     question_id: int,
     request: QuizBankQuestionPatchRequest,
     collection: str = Query("regulations"),
 ):
     try:
+        collection = _resolve_request_collection(req, collection)
         data = quiz_service.admin_patch_bank_question(
             collection=collection,
             question_id=int(question_id),
@@ -2068,8 +2274,9 @@ def quiz_bank_question_patch(
 
 
 @app.delete("/quiz/bank/questions/{question_id}")
-def quiz_bank_question_delete(question_id: int, collection: str = Query("regulations")):
+def quiz_bank_question_delete(req: Request, question_id: int, collection: str = Query("regulations")):
     try:
+        collection = _resolve_request_collection(req, collection)
         data = quiz_service.admin_delete_bank_question(collection=collection, question_id=int(question_id))
         return {"ok": True, "data": data}
     except Exception as e:
@@ -2118,9 +2325,11 @@ def quiz_effective_config():
 
 @app.post("/checklist/generate")
 def generate_checklist(
+    req: Request,
     collection: str = Form("regulations"),
     base_checklist: Optional[str] = Form(None),
 ):
+    collection = _resolve_request_collection(req, collection)
     agent = get_agent(collection)
     checklist = agent.generate_checklist(base_checklist=base_checklist)
     return {"checklist": checklist, "total_points": len(checklist)}
@@ -2128,6 +2337,7 @@ def generate_checklist(
 
 @app.post("/checklist/train")
 def train_checklist(
+    req: Request,
     collection: str = Form("regulations"),
     checklist_json: str = Form(...),
 ):
@@ -2136,6 +2346,7 @@ def train_checklist(
         checklist = json.loads(checklist_json)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"JSON 解析失败：{e}")
+    collection = _resolve_request_collection(req, collection)
     agent = get_agent(collection)
     count = agent.train_checklist(checklist)
     return {"status": "success", "chunks_added": count, "total_points": len(checklist)}
@@ -2183,7 +2394,7 @@ class IntegrationRecordRequest(BaseModel):
 
 
 @app.post("/api/integration/review-kdocs")
-def integration_review_kdocs(req: IntegrationKdocsReviewRequest):
+def integration_review_kdocs(http_req: Request, req: IntegrationKdocsReviewRequest):
     """
     核心集成接口：通过金山文档链接审核文档。
     1. 用 kdocs_download_url 通过金山文档开放平台提取纯文本
@@ -2194,7 +2405,7 @@ def integration_review_kdocs(req: IntegrationKdocsReviewRequest):
     kdocs_url = (req.kdocs_url or "").strip()
     download_url = (req.kdocs_download_url or "").strip()
     fn = (req.file_name or "").strip() or "文档.docx"
-    collection = (req.collection or "regulations").strip()
+    collection = _resolve_request_collection(http_req, (req.collection or "regulations").strip())
 
     if not kdocs_url and not download_url:
         raise HTTPException(status_code=400, detail="请提供金山文档链接（kdocs_url 或 kdocs_download_url）")

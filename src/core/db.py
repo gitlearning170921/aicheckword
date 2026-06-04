@@ -4,6 +4,7 @@ import copy
 import json
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import pymysql
@@ -210,6 +211,22 @@ def _init_db_schema_locked() -> None:
                         registration_countries LONGTEXT COMMENT 'JSON array, default ["中国","美国","欧盟"]',
                         project_forms LONGTEXT COMMENT 'JSON array, default ["Web","APP","PC"]',
                         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS companies (
+                        id VARCHAR(36) PRIMARY KEY,
+                        name VARCHAR(128) NOT NULL,
+                        slug VARCHAR(64) NOT NULL,
+                        knowledge_collection VARCHAR(128) NOT NULL,
+                        aiword_company_id VARCHAR(36) DEFAULT '',
+                        is_active TINYINT(1) DEFAULT 1,
+                        is_default TINYINT(1) DEFAULT 0,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY uq_companies_name (name),
+                        UNIQUE KEY uq_companies_slug (slug),
+                        UNIQUE KEY uq_companies_collection (knowledge_collection)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """)
                 cur.execute("""
@@ -535,6 +552,29 @@ def _init_db_schema_locked() -> None:
                 _add_column_if_missing(cur, "app_settings", "review_summary_prompt", "LONGTEXT COMMENT '审核总结提示词，为空则使用内置默认'")
                 _add_column_if_missing(cur, "app_settings", "translation_target_lang", "VARCHAR(8) DEFAULT 'en' COMMENT '文档翻译目标语言：en/de/zh'")
                 _add_column_if_missing(cur, "app_settings", "translation_company_config", "LONGTEXT COMMENT 'JSON: 公司信息翻译配置 company_name/address/contact/phone 等'")
+                _add_column_if_missing(cur, "companies", "aiword_company_id", "VARCHAR(36) DEFAULT ''")
+                _add_column_if_missing(cur, "companies", "is_active", "TINYINT(1) DEFAULT 1")
+                _add_column_if_missing(cur, "companies", "is_default", "TINYINT(1) DEFAULT 0")
+                cur.execute(
+                    """
+                    INSERT INTO companies (id, name, slug, knowledge_collection, aiword_company_id, is_active, is_default)
+                    SELECT %s, %s, %s, %s, '', 1, 1 FROM DUAL
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM companies WHERE knowledge_collection = %s
+                    )
+                    """,
+                    (
+                        "00000000-0000-0000-0000-000000000001",
+                        "南京鱼跃软件技术有限公司",
+                        "nanjing-yuyue-software",
+                        "regulations",
+                        "regulations",
+                    ),
+                )
+                cur.execute(
+                    "UPDATE companies SET is_default = 1 WHERE knowledge_collection = %s",
+                    ("regulations",),
+                )
                 _add_column_if_missing(
                     cur,
                     "app_settings",
@@ -1852,6 +1892,156 @@ def save_dimension_options(
                     params.append(1)
                     cur.execute("UPDATE dimension_options SET " + ", ".join(updates) + " WHERE id = %s", params)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def list_companies() -> list[dict]:
+    """公司列表（多租户扩展；旧库无 companies 表时回退默认公司）。"""
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, slug, knowledge_collection, aiword_company_id, is_active, is_default
+                FROM companies
+                ORDER BY is_default DESC, created_at ASC
+                """
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            if rows:
+                return rows
+    except Exception:
+        pass
+    finally:
+        conn.close()
+    return [
+        {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "南京鱼跃软件技术有限公司",
+            "slug": "nanjing-yuyue-software",
+            "knowledge_collection": "regulations",
+            "aiword_company_id": "",
+            "is_active": 1,
+            "is_default": 1,
+        }
+    ]
+
+
+def company_by_collection(collection: str) -> Optional[dict]:
+    ck = (collection or "").strip()
+    if not ck:
+        ck = "regulations"
+    for row in list_companies():
+        if str(row.get("knowledge_collection") or "").strip() == ck:
+            return row
+    return None
+
+
+def upsert_company_mapping(
+    *,
+    aiword_company_id: str,
+    name: str,
+    slug: str,
+    knowledge_collection: str,
+    is_active: bool = True,
+    is_default: bool = False,
+) -> dict:
+    """按 aiword_company_id 幂等写入/更新 companies 映射。"""
+    aid = str(aiword_company_id or "").strip()
+    if not aid:
+        raise ValueError("aiword_company_id 不能为空")
+    nm = str(name or "").strip()
+    kc = str(knowledge_collection or "").strip() or "regulations"
+    sg = str(slug or "").strip() or kc
+    if not nm:
+        raise ValueError("name 不能为空")
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM companies
+                WHERE aiword_company_id = %s
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (aid,),
+            )
+            row = cur.fetchone()
+            if row and row.get("id"):
+                cid = str(row.get("id"))
+                cur.execute(
+                    """
+                    UPDATE companies
+                    SET name = %s,
+                        slug = %s,
+                        knowledge_collection = %s,
+                        is_active = %s,
+                        is_default = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                    """,
+                    (
+                        nm,
+                        sg,
+                        kc,
+                        1 if is_active else 0,
+                        1 if is_default else 0,
+                        cid,
+                    ),
+                )
+            else:
+                cid = str(uuid.uuid4())
+                cur.execute(
+                    """
+                    INSERT INTO companies
+                    (id, name, slug, knowledge_collection, aiword_company_id, is_active, is_default)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        cid,
+                        nm,
+                        sg,
+                        kc,
+                        aid,
+                        1 if is_active else 0,
+                        1 if is_default else 0,
+                    ),
+                )
+            if is_default:
+                cur.execute(
+                    "UPDATE companies SET is_default = CASE WHEN id = %s THEN 1 ELSE 0 END",
+                    (cid,),
+                )
+            cur.execute(
+                """
+                SELECT id, name, slug, knowledge_collection, aiword_company_id, is_active, is_default
+                FROM companies WHERE id = %s LIMIT 1
+                """,
+                (cid,),
+            )
+            out = dict(cur.fetchone() or {})
+        conn.commit()
+        return out
+    finally:
+        conn.close()
+
+
+def delete_company_by_aiword_id(aiword_company_id: str) -> bool:
+    aid = str(aiword_company_id or "").strip()
+    if not aid:
+        return False
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM companies WHERE aiword_company_id = %s", (aid,))
+            deleted = int(cur.rowcount or 0)
+        conn.commit()
+        return deleted > 0
     finally:
         conn.close()
 

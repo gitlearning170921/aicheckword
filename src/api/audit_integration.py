@@ -482,6 +482,12 @@ async def audit_create_job(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"payload JSON 无效: {e}") from e
 
+    try:
+        from src.api.server import _resolve_request_collection
+        body.collection = _resolve_request_collection(request, body.collection or "regulations")
+    except Exception:
+        pass
+
     mode = (body.mode or "single").lower().strip() or "single"
     if mode not in _VALID_MODES:
         raise HTTPException(
@@ -606,11 +612,17 @@ def audit_job_download(job_id: str):
 
 @router.get("/reports/by-upload")
 def audit_reports_by_upload(
+    request: Request,
     aiword_upload_id: str = Query("", description="aiword UploadRecord.id"),
     file_name: str = Query("", description="展示名（fallback）"),
     collection: str = Query("regulations"),
     limit: int = Query(5, ge=1, le=20),
 ):
+    try:
+        from src.api.server import _resolve_request_collection
+        collection = _resolve_request_collection(request, collection)
+    except Exception:
+        pass
     """按 aiword 上传维度查最近的审核报告。
 
     匹配优先级：
@@ -809,10 +821,16 @@ class PrepareAuditModifyDraftBody(BaseModel):
 
 
 @router.post("/audit-modify/prepare-draft-payload")
-def prepare_audit_modify_draft_payload(body: PrepareAuditModifyDraftBody):
+def prepare_audit_modify_draft_payload(request: Request, body: PrepareAuditModifyDraftBody):
     """
     一步生成 aiword 提交 ``/api/integration/draft/jobs`` 所需的 payload 片段（与 Streamlit 审核后修改对齐）。
     """
+    try:
+        from src.api.server import _resolve_request_collection
+        body.collection = _resolve_request_collection(request, body.collection or "regulations")
+    except Exception:
+        pass
+
     from src.core.integration_ui_meta import (
         collapse_remediation_to_template,
         merge_project_into_post_audit_meta,

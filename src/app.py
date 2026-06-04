@@ -213,6 +213,7 @@ from src.core.db import (
     update_project_case,
     update_knowledge_docs_case_id,
     get_knowledge_docs_by_case_id,
+    list_companies,
     upsert_draft_file_skills_rules,
     get_draft_file_skills_rules,
     delete_draft_file_skills_rules,
@@ -1093,11 +1094,39 @@ def render_sidebar():
 
         # --- 知识库 ---
         st.subheader("知识库")
-        collection = st.text_input(
-            "知识库名称",
-            value=st.session_state.get("collection_name", "regulations"),
-            help="不同项目可使用不同的知识库名称",
-        )
+        companies = []
+        try:
+            companies = [c for c in (list_companies() or []) if bool(c.get("is_active", True))]
+        except Exception:
+            companies = []
+        if companies:
+            options = [
+                f"{str(c.get('name') or '未命名公司').strip()} ({str(c.get('knowledge_collection') or 'regulations').strip()})"
+                for c in companies
+            ]
+            prev_company_id = str(st.session_state.get("selected_company_id") or "").strip()
+            idx = 0
+            for i, c in enumerate(companies):
+                if str(c.get("id") or "").strip() == prev_company_id:
+                    idx = i
+                    break
+            pick = st.selectbox(
+                "所属公司",
+                options,
+                index=max(0, min(idx, len(options) - 1)),
+                help="无需登录，手动切换公司后将自动切换对应知识库 collection",
+            )
+            pick_idx = options.index(pick)
+            selected_company = companies[pick_idx]
+            st.session_state.selected_company_id = str(selected_company.get("id") or "").strip()
+            collection = str(selected_company.get("knowledge_collection") or "regulations").strip() or "regulations"
+            st.caption(f"当前公司知识库：`{collection}`")
+        else:
+            collection = st.text_input(
+                "知识库名称",
+                value=st.session_state.get("collection_name", "regulations"),
+                help="不同项目可使用不同的知识库名称",
+            )
         st.session_state.collection_name = collection
 
         # 侧栏仅用缓存统计，不初始化 Agent，避免切换功能时卡顿
