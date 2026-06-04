@@ -72,6 +72,16 @@ API_DIR_KEYS = [
     "db_path",
 ]
 
+# 钉钉/aiword 聊天回复 API（/api/chat/reply/generate）；须与 config.settings.Settings 字段同名
+_CHAT_API_SETTING_KEYS: Tuple[str, ...] = (
+    "chat_api_auth_token",
+    "chat_default_top_k",
+    "chat_min_similarity",
+    "chat_confidence_threshold",
+    "chat_allowed_knowledge_category",
+    "chat_allowed_domain",
+)
+
 KDOCS_KEYS = ["kdocs_app_id", "kdocs_app_key"]
 
 # 初稿集成 Tab；须与 config.settings.Settings 中字段同名（仅当 model 含该键时参与 FLAT 对账）
@@ -208,6 +218,7 @@ _GROUPED = (
     | _AI_TAB_KEYS
     | {"cursor_verify_ssl", "cursor_trust_env"}
     | (set(_DRAFT_INTEGRATION_SETTING_KEYS) & _all)
+    | (set(_CHAT_API_SETTING_KEYS) & _all)
 )
 if _GROUPED != _all:
     missing = sorted(_all - _GROUPED)
@@ -284,6 +295,12 @@ FIELD_LABELS: Dict[str, str] = {
     "draft_interop_allowed_providers": "初稿联调：允许的 provider（逗号分隔小写；留空=服务端不限制）",
     "draft_interop_personal_keys_only": "初稿联调：须个人 Key 且禁止回落系统各厂商 Key（与 Header 语义一致）",
     "draft_interop_notes": "初稿联调：给 aiword 等客户端展示的备注（纯文本）",
+    "chat_api_auth_token": "聊天 API Bearer Token（留空=本地联调不校验；aiword 可配置 AICHECKWORD_CHAT_API_KEY）",
+    "chat_default_top_k": "聊天检索默认 top_k（程序文件片段数，默认 6）",
+    "chat_min_similarity": "聊天检索最低相似度（0~1，默认 0.55）",
+    "chat_confidence_threshold": "聊天回答最低置信度（低于则转人工，默认 0.65）",
+    "chat_allowed_knowledge_category": "聊天允许的知识库分类（首版 program=程序文件）",
+    "chat_allowed_domain": "聊天允许的业务域（首版 system_record_writing=体系运行记录）",
     "api_host": "FastAPI 监听地址",
     "api_port": "FastAPI 端口",
     "training_docs_dir": "训练文档目录",
@@ -322,6 +339,7 @@ def _is_secret(name: str) -> bool:
         "qianfan_sk",
         "cursor_api_key",
         "kdocs_app_key",
+        "chat_api_auth_token",
     }
 
 
@@ -699,6 +717,14 @@ def render_system_config_body() -> None:
         _render_static_keys("审核稳定性（DeepSeek 等）", REVIEW_STABILITY_KEYS)
     elif section == "API 目录":
         _render_static_keys("API 服务与目录", API_DIR_KEYS)
+        _present_chat = [k for k in _CHAT_API_SETTING_KEYS if k in settings.model_fields]
+        if _present_chat:
+            st.markdown("**钉钉 / aiword 聊天回复 API**")
+            st.caption(
+                "供 aiword 钉钉机器人联调与回调调用 `POST /api/chat/reply/generate`。"
+                "Token 留空便于本机联调；生产环境建议填写并与 aiword 的 AICHECKWORD_CHAT_API_KEY 一致。"
+            )
+            _render_static_keys("聊天检索与鉴权", _present_chat)
     elif section == "金山文档":
         _render_static_keys("金山文档开放平台", KDOCS_KEYS)
 
