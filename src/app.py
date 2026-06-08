@@ -1092,11 +1092,14 @@ def render_sidebar():
 
         st.markdown("---")
 
-        # --- 知识库 ---
-        st.subheader("知识库")
+        # --- 知识库（按公司） ---
+        st.subheader("按公司 · 知识库")
+        st.caption("切换公司后，训练、查询与审核均使用该公司的独立知识库 collection。")
         companies = []
         try:
             companies = [c for c in (list_companies() or []) if bool(c.get("is_active", True))]
+            if not companies:
+                companies = list(list_companies() or [])
         except Exception:
             companies = []
         if companies:
@@ -1111,10 +1114,10 @@ def render_sidebar():
                     idx = i
                     break
             pick = st.selectbox(
-                "所属公司",
+                "训练/查询所属公司",
                 options,
                 index=max(0, min(idx, len(options) - 1)),
-                help="无需登录，手动切换公司后将自动切换对应知识库 collection",
+                help="切换公司将自动切换对应知识库；第一步「法规训练」等页面均受此选择影响",
             )
             pick_idx = options.index(pick)
             selected_company = companies[pick_idx]
@@ -1718,6 +1721,24 @@ def _train_single_file(
 def render_step1_page():
     """第一步：训练法规/程序/案例 + 生成审核点"""
     st.header("① 法规训练 & 生成审核点")
+    collection = st.session_state.get("collection_name", "regulations")
+    company_label = "默认公司"
+    try:
+        sel_id = str(st.session_state.get("selected_company_id") or "").strip()
+        for row in list_companies() or []:
+            rid = str(row.get("id") or "").strip()
+            kc = str(row.get("knowledge_collection") or "regulations").strip() or "regulations"
+            if sel_id and rid == sel_id:
+                company_label = str(row.get("name") or company_label).strip() or company_label
+                break
+            if not sel_id and kc == collection:
+                company_label = str(row.get("name") or company_label).strip() or company_label
+    except Exception:
+        pass
+    st.info(
+        f"当前训练目标：**{company_label}** · 知识库 `{collection}`。"
+        " 可在左侧栏「训练/查询所属公司」切换后再上传训练。"
+    )
     st.markdown(
         "**第一步**：上传法规、标准、程序文件、项目案例，训练法规知识库。"
         "训练完成后，可让 AI 基于知识库**自动生成审核点清单**，"
@@ -11579,7 +11600,11 @@ def render_translation_page():
     # 历史翻译结果：查看与下载
     with st.expander("📥 历史翻译结果", expanded=False):
         try:
-            trans_logs = get_operation_logs(op_type=OP_TYPE_TRANSLATION, limit=50)
+            trans_logs = get_operation_logs(
+                op_type=OP_TYPE_TRANSLATION,
+                collection=st.session_state.get("collection_name", "regulations"),
+                limit=50,
+            )
             if not trans_logs:
                 st.caption("暂无历史翻译记录。")
             else:
@@ -12125,14 +12150,6 @@ def render_operations_page():
 
     st.markdown("---")
 
-    summary = get_operation_summary()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("训练批次数", summary["total_train_batches"])
-    c2.metric("审核批次数", summary["total_review_batches"])
-    c3.metric("今日操作数", summary["today_operations"])
-
-    st.markdown("---")
-
     col_filter, col_limit = st.columns(2)
     with col_filter:
         op_type_filter = st.selectbox(
@@ -12186,12 +12203,29 @@ def render_operations_page():
     }
     op_type = type_map.get(op_type_filter, None)
 
-    only_current = st.checkbox("仅当前知识库", value=False, key="op_only_collection")
+    only_current = st.checkbox("仅当前知识库", value=True, key="op_only_collection")
     collection_filter = st.session_state.get("collection_name", "regulations") if only_current else None
+    company_label = st.session_state.get("collection_name", "regulations")
+    try:
+        for row in list_companies() or []:
+            if str(row.get("knowledge_collection") or "").strip() == company_label:
+                company_label = str(row.get("name") or company_label)
+                break
+    except Exception:
+        pass
     st.caption(
-        "「审核后修改」与「文档初稿生成」在库中同为 `draft_generate`，通过 `extra.post_audit` / `source=post_audit` 区分；"
-        "写入后已自动失效操作记录缓存。"
+        f"当前公司知识库：**{company_label}** · `{st.session_state.get('collection_name', 'regulations')}`。"
+        " 取消勾选「仅当前知识库」可查看全部公司记录。"
+        " 「审核后修改」与「文档初稿生成」在库中同为 `draft_generate`，通过 `extra.post_audit` 区分。"
     )
+
+    summary = get_operation_summary(collection_filter)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("训练批次数", summary["total_train_batches"])
+    c2.metric("审核批次数", summary["total_review_batches"])
+    c3.metric("今日操作数", summary["today_operations"])
+
+    st.markdown("---")
 
     if op_type == "__post_audit__":
         _fetch_n = max(int(limit or 50), 50) * 8

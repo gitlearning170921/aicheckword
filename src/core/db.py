@@ -1046,26 +1046,30 @@ def get_operation_logs(
         conn.close()
 
 
-def get_operation_summary() -> Dict[str, Any]:
+def get_operation_summary(collection: Optional[str] = None) -> Dict[str, Any]:
     init_db()
     conn = _get_conn()
+    coll = (collection or "").strip()
+    coll_sql = " AND collection = %s" if coll else ""
+    coll_args = (coll,) if coll else ()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT COUNT(*) AS c FROM operation_logs WHERE op_type = %s",
-                (OP_TYPE_TRAIN_BATCH,),
+                "SELECT COUNT(*) AS c FROM operation_logs WHERE op_type = %s" + coll_sql,
+                (OP_TYPE_TRAIN_BATCH,) + coll_args,
             )
             total_train_batches = cur.fetchone()["c"]
             cur.execute(
-                "SELECT COUNT(*) AS c FROM operation_logs WHERE op_type = %s",
-                (OP_TYPE_REVIEW_BATCH,),
+                "SELECT COUNT(*) AS c FROM operation_logs WHERE op_type = %s" + coll_sql,
+                (OP_TYPE_REVIEW_BATCH,) + coll_args,
             )
             total_review_batches = cur.fetchone()["c"]
             cur.execute(
                 """
                 SELECT COUNT(*) AS c FROM operation_logs
                 WHERE op_type IN (%s, %s, %s, %s, %s, %s, %s) AND DATE(created_at) = CURDATE()
-                """,
+                """
+                + coll_sql,
                 (
                     OP_TYPE_TRAIN_BATCH,
                     OP_TYPE_REVIEW_BATCH,
@@ -1074,7 +1078,8 @@ def get_operation_summary() -> Dict[str, Any]:
                     "draft_generate",
                     "draft_generate_job",
                     "draft_export",
-                ),
+                )
+                + coll_args,
             )
             today_ops = cur.fetchone()["c"]
         return {
