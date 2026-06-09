@@ -1654,11 +1654,35 @@ def _grade_single_subjective_with_llm(
     *, collection: str, attempt_id: int, paper_id: Optional[int], r: Dict[str, Any]
 ) -> None:
     qid = int(r["question_id"])
+    ua = r.get("user_answer")
+    ua_text = _subjective_user_answer_text(ua)
+    if not ua_text:
+        repo.update_answer_grade(
+            answer_id=int(r["answer_id"]),
+            auto_score=0.0,
+            final_score=0.0,
+            is_correct=False,
+            teacher_comment="未作答或答案为空",
+            graded_by_cache=False,
+        )
+        return
+    if len(ua_text) < 8:
+        repo.update_answer_grade(
+            answer_id=int(r["answer_id"]),
+            auto_score=0.0,
+            final_score=0.0,
+            is_correct=False,
+            teacher_comment="答案过短",
+            graded_by_cache=False,
+        )
+        return
     prompt = f"""
 请按 0~1 评分并返回 JSON: {{"score":0.0,"comment":"..."}}。
 题干: {r.get('stem') or ''}
 标准答案要点: {json.dumps(r.get('answer'), ensure_ascii=False)}
-学生答案: {json.dumps(r.get('user_answer'), ensure_ascii=False)}
+学生答案: {json.dumps(ua, ensure_ascii=False)}
+
+规则：未作答=0；明显不全或缺少关键要点不得超过0.35；仅部分正确0.35~0.65；基本完整才可用0.65以上。
 """.strip()
     try:
         prov = (settings.quiz_provider or settings.provider or "").strip().lower()
@@ -1667,6 +1691,7 @@ def _grade_single_subjective_with_llm(
         raw = invoke_chat_direct(prompt, temperature=temp, provider=prov, model=model)
         data = json.loads(_norm_json_text(raw))
         score = max(0.0, min(1.0, float(data.get("score") or 0.0)))
+        score = _cap_subjective_score_by_answer_length(score, ua_text)
         comment = str(data.get("comment") or "ai_score")
     except Exception:
         score = 0.0
@@ -1863,6 +1888,44 @@ def _evidence_for_subjective(agent: ReviewAgent, exam_track: str, stem: str, top
     return out
 
 
+def _subjective_user_answer_text(user_answer: Any) -> str:
+    if user_answer is None:
+        return ""
+    if isinstance(user_answer, str):
+        return user_answer.strip()
+    if isinstance(user_answer, (int, float, bool)):
+        return str(user_answer).strip()
+    if isinstance(user_answer, dict):
+        for key in ("value", "text", "answer", "content"):
+            if key in user_answer and user_answer[key] is not None:
+                s = str(user_answer[key]).strip()
+                if s:
+                    return s
+        parts = [str(v).strip() for v in user_answer.values() if v is not None and str(v).strip()]
+        return " ".join(parts).strip()
+    if isinstance(user_answer, list):
+        parts = [str(x).strip() for x in user_answer if x is not None and str(x).strip()]
+        return " ".join(parts).strip()
+    return str(user_answer).strip()
+
+
+def _cap_subjective_score_by_answer_length(score: float, ua_text: str) -> float:
+    sc = max(0.0, min(1.0, float(score)))
+    txt = str(ua_text or "").strip()
+    if not txt:
+        return 0.0
+    n = len(txt)
+    if n < 8:
+        return 0.0
+    if n < 30:
+        return min(sc, 0.15)
+    if n < 80:
+        return min(sc, 0.35)
+    if n < 150:
+        return min(sc, 0.65)
+    return sc
+
+
 def _grade_subjective_question_llm(
     *,
     exam_track: str,
@@ -1871,6 +1934,26 @@ def _grade_subjective_question_llm(
     evidence: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """返回 {score(0~1), reason, recommendation, evidence_used[]}；证据只要求文件名定位。"""
+    ua_text = _subjective_user_answer_text(user_answer)
+    if not ua_text:
+        used_fallback = []
+        for e in (evidence or [])[:1]:
+            sf = str(e.get("source_file") or "").strip()
+            if sf:
+                used_fallback.append({"source_file": sf, "snippet": str(e.get("snippet") or "")[:300]})
+        return {
+            "score": 0.0,
+            "reason": "未作答或答案为空",
+            "recommendation": "请按题干要点完整作答后再提交。",
+            "evidence_used": used_fallback,
+        }
+    if len(ua_text) < 8:
+        return {
+            "score": 0.0,
+            "reason": "答案过短，无法视为有效作答",
+            "recommendation": "请补充关键要点与依据。",
+            "evidence_used": [],
+        }
     ev_lines = "\n".join(
         [f"- {str(e.get('source_file') or '').strip()}: {str(e.get('snippet') or '')[:240]}" for e in (evidence or [])]
     )
@@ -1891,6 +1974,10 @@ def _grade_subjective_question_llm(
 
 要求：
 - score 为 0~1 浮点数
+- 未作答、空白或与题干无关：score 必须为 0
+- 明显不全、缺少多数关键要点：score 不得超过 0.35
+- 仅部分正确：score 宜在 0.35~0.65
+- 基本完整且要点正确：score 宜在 0.65~0.85；仅当几乎全面正确才可用 0.9 以上
 - evidence_used 至少返回 1 条（仅需要 source_file 文件名；snippet 可截断）
 - 不要输出除 JSON 外的任何文本
 """.strip()
@@ -1917,6 +2004,7 @@ def _grade_subjective_question_llm(
                 break
         if not used2 and evidence:
             used2 = [{"source_file": str(evidence[0].get("source_file") or "").strip(), "snippet": str(evidence[0].get("snippet") or "")[:500]}]
+        score = _cap_subjective_score_by_answer_length(score, ua_text)
         return {"score": score, "reason": reason, "recommendation": reco, "evidence_used": used2}
     except Exception:
         # 失败兜底：保留证据文件名，便于审计与排查
