@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+# aicheckword Streamlit 运维 UI（按需；基于 API 镜像叠加 UI 栈）
+ARG AICHECKWORD_BASE_TAG=local
+FROM aicheckword:${AICHECKWORD_BASE_TAG}
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+
+USER root
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install streamlit "altair<5" "protobuf>=3.20.0,<=3.20.3"
+
+# API 镜像 .dockerignore 排除了 Streamlit 入口，此处补入
+COPY src/app.py src/system_config_ui.py /app/src/
+
+USER app
+
+EXPOSE 8501
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://127.0.0.1:8501/_stcore/health || exit 1
+
+CMD ["streamlit", "run", "src/app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]

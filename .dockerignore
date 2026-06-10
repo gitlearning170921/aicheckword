@@ -12,8 +12,14 @@ ENV/
 knowledge_store/
 uploads/
 training_docs/
+docs/
+tests/
+scripts/
 *.log
 *.pid
 .env
-.env.txt
+.env*
+*.md
 deploy/backup/
+src/app.py
+src/system_config_ui.py
