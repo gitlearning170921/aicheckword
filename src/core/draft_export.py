@@ -193,6 +193,13 @@ def _table_find_row_idx_by_id_any_cell(
     t = (id_text or "").strip()
     if not t:
         return -1
+    # 禁止用单个严重程度刻度（1/2）或罗马区划匹配行，否则会误更新整行并覆盖正确 Risk ID
+    if re.match(r"^[12]$", t):
+        return -1
+    if re.match(r"^(I|II|III|IV|V)$", t, re.I):
+        return -1
+    if not _looks_like_row_id_token(t) and len(t) <= 3:
+        return -1
     try:
         rows = tbl.rows
         lim = min(len(rows), max_rows)
@@ -427,6 +434,12 @@ _TABLE_HEADER_LIKENESS_KEYS = (
     "平台",
     "兼容",
     "接口",
+    "人员",
+    "活动",
+    "时间",
+    "personnel",
+    "activity",
+    "date",
     "case",
     "id",
     "req",
@@ -440,6 +453,18 @@ _TABLE_HEADER_LIKENESS_KEYS = (
     "procedure",
     "priority",
     "pre",
+    "风险",
+    "危险",
+    "伤害",
+    "措施",
+    "严重",
+    "概率",
+    "验证",
+    "hazard",
+    "harm",
+    "severity",
+    "measure",
+    "risk",
 )
 
 
@@ -453,6 +478,11 @@ def _table_header_likeness(labels: List[str]) -> int:
     return n
 
 
+_RISK_ID_CELL_RE = re.compile(
+    r"^(?:[A-Z]{1,6}\d{1,4}(?:-\d{1,4})?|[A-Z]{2,8}\d{1,4}-\d{1,4})$"
+)
+
+
 def _hdr_key_match_score(header_cell: str, key: str) -> float:
     a = re.sub(r"\s+", " ", (header_cell or "").strip())
     b = re.sub(r"\s+", " ", (key or "").strip())
@@ -461,35 +491,157 @@ def _hdr_key_match_score(header_cell: str, key: str) -> float:
     al, bl = a.lower(), b.lower()
     if bl in al or al in bl:
         return 1.0
+    # 过短键（如 "1"、"D"）禁止仅靠模糊比匹配到表头，避免严重/概率等数值错列
+    if len(b) <= 2 and not re.search(r"[a-z\u4e00-\u9fff]", b, re.I):
+        return 0.0
     return float(SequenceMatcher(None, al, bl).ratio())
+
+
+def _header_column_role(header_cell: str) -> str:
+    """根据表头文本推断列语义，用于写入前校验与保护已有 ID。"""
+    h = re.sub(r"\s+", " ", (header_cell or "").strip())
+    if not h:
+        return "unknown"
+    hl = h.lower()
+    if re.search(r"严重|severity", hl) and not re.search(r"\bid\b|编号", hl):
+        return "severity"
+    if re.search(r"概率|probabil", hl):
+        return "probability"
+    if re.search(r"风险区域|风险区|risk\s*area|\barea\b", hl, re.I):
+        return "risk_area"
+    if re.search(r"措施类型|measure\s*type", hl, re.I) or (("类型" in h or "type" in hl) and "措施" in h):
+        return "measure_type"
+    if re.search(r"危险\(源\)|危险（源）|可预见|危险情况|伤害", h):
+        return "text"
+    if re.search(
+        r"risk\s*id|\bid\b|编号|用例|追溯",
+        hl,
+        re.I,
+    ) or ("风险" in h and "id" in hl):
+        return "id"
+    if re.search(r"风险需求|措施.*id|需求.*id|cs0|verification|验证方法", hl, re.I):
+        return "measure_id"
+    return "text"
+
+
+def _looks_like_row_id_token(value: str) -> bool:
+    v = (value or "").strip()
+    if not v:
+        return False
+    # 1/2 在宽表中几乎都是严重度刻度，不应作为 Risk ID 去匹配/覆盖行
+    if re.match(r"^[12]$", v):
+        return False
+    if re.match(r"^(I|II|III|IV|V)$", v, re.I):
+        return False
+    if re.match(r"^[A-D]$", v, re.I):
+        return False
+    if re.match(r"^[3-9]$", v):
+        return True
+    if re.match(r"^[A-Z]{1,8}\d{1,4}(?:-\d{1,4})?$", v, re.I):
+        return True
+    if re.match(r"^[A-Z]{2,8}_\d{2,4}$", v, re.I):
+        return True
+    if re.match(r"^JC\d+$", v, re.I):
+        return True
+    if re.match(r"^CS\d+$", v, re.I):
+        return True
+    if re.match(r"^\d{2,4}$", v):
+        return True
+    return bool(_RISK_ID_CELL_RE.match(v)) and len(v) >= 3
+
+
+def _value_matches_column_role(role: str, value: str) -> bool:
+    v = (value or "").strip()
+    if not v:
+        return True
+    if role == "id":
+        return _looks_like_row_id_token(v)
+    if role == "measure_id":
+        return bool(re.match(r"^(CS|REQ|SRS|URS|GN|HC|JC|BRCMS)[A-Z0-9_-]*$", v, re.I)) or (
+            len(v) <= 16 and re.search(r"\d", v)
+        )
+    if role in ("severity", "probability"):
+        return bool(re.match(r"^[1-5]$", v))
+    if role == "risk_area":
+        return bool(re.match(r"^(I|II|III|IV|V|[1-5])$", v, re.I))
+    if role == "measure_type":
+        return len(v) <= 3
+    return True
+
+
+def _validate_row_vals_for_headers(
+    header_labels: List[str], vals: List[str], col_n: int
+) -> Optional[str]:
+    cn = max(1, int(col_n))
+    hdr = list(header_labels or [])
+    while len(hdr) < cn:
+        hdr.append("")
+    hdr = hdr[:cn]
+    mismatches: List[str] = []
+    for j in range(cn):
+        v = str((vals[j] if j < len(vals) else "") or "").strip()
+        if not v:
+            continue
+        role = _header_column_role(hdr[j])
+        if role in ("id", "measure_id", "severity", "probability", "risk_area", "measure_type"):
+            if not _value_matches_column_role(role, v):
+                mismatches.append(
+                    f"列{j + 1}「{(hdr[j] or '')[:24]}」({role}) 不可写入「{v[:32]}」"
+                )
+    if mismatches:
+        return "表头列类型校验失败：" + "；".join(mismatches[:5])
+    return None
+
+
+def _table_row_looks_shifted_severity(vals: List[str], col_n: int) -> bool:
+    """首几列为「严重程度+概率+风险区域」数字/罗马字符，疑似整行左移错列。"""
+    cn = max(1, int(col_n))
+    if cn < 6 or len(vals or []) < 3:
+        return False
+    v0 = str((vals or [""])[0] or "").strip()
+    v1 = str((vals or ["", ""])[1] or "").strip()
+    v2 = str((vals or ["", "", ""])[2] or "").strip()
+    if re.match(r"^[1-5]$", v0) and re.match(r"^[1-5]$", v1) and re.match(
+        r"^(I|II|III|IV|V)$", v2, re.I
+    ):
+        return True
+    if re.match(r"^[1-5]$", v0) and re.match(r"^[1-5]$", v1) and not _looks_like_row_id_token(v0):
+        return True
+    return False
 
 
 def _map_row_dict_to_vals_by_headers(
     header_labels: List[str], row_dict: Dict[str, Any], col_n: int
 ) -> List[str]:
-    """将 {表头关键字: 值} 映射到与表同序的 col_n 个单元格；未匹配列留空。"""
+    """将 {表头关键字: 值} 映射到与表同序的 col_n 个单元格；每个键最多匹配一列。"""
     n = max(1, int(col_n))
     hdr = list(header_labels or [])
     while len(hdr) < n:
         hdr.append("")
     hdr = hdr[:n]
     vals = [""] * n
-    for j in range(n):
-        hcell = hdr[j]
-        if not (hcell or "").strip():
+    candidates: List[Tuple[float, int, str, str]] = []
+    for ki, vi in row_dict.items():
+        k = str(ki).strip()
+        if not k:
             continue
-        best_v = ""
-        best_sc = 0.48
-        for ki, vi in row_dict.items():
-            k = str(ki).strip()
-            if not k:
+        v = "" if vi is None else str(vi).strip()
+        for j, hcell in enumerate(hdr):
+            if not (hcell or "").strip():
                 continue
             sc = _hdr_key_match_score(hcell, k)
-            if sc > best_sc:
-                best_sc = sc
-                best_v = "" if vi is None else str(vi).strip()
-        if best_sc >= 0.48:
-            vals[j] = best_v
+            min_sc = 0.55 if len(k) >= 3 else 0.92
+            if sc >= min_sc:
+                candidates.append((sc, j, k, v))
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    used_j: set = set()
+    used_k: set = set()
+    for sc, j, k, v in candidates:
+        if j in used_j or k in used_k:
+            continue
+        vals[j] = v
+        used_j.add(j)
+        used_k.add(k)
     return vals
 
 
@@ -626,6 +778,195 @@ def _vals_from_table_row_line(line: str, col_n: int) -> List[str]:
     while len(vals) < cn:
         vals.append("")
     return vals[:cn]
+
+
+def _non_empty_val_count(vals: List[str], col_n: int) -> int:
+    cn = max(1, int(col_n))
+    return sum(
+        1
+        for i in range(min(len(vals or []), cn))
+        if str((vals or [""])[i] or "").strip()
+    )
+
+
+def _table_row_has_usable_headers(header_labels: Optional[List[str]]) -> bool:
+    hdr = list(header_labels or [])
+    return sum(1 for x in hdr if (x or "").strip()) >= 2
+
+
+def _table_row_vals_hard_reject(
+    vals: List[str],
+    col_n: int,
+    *,
+    header_labels: Optional[List[str]] = None,
+) -> Optional[str]:
+    """无表头可校验时，整行写入风险过高则仍拒绝；有表头时改由 partial 写入。"""
+    if _table_row_has_usable_headers(header_labels):
+        return None
+    cn = max(1, int(col_n))
+    if cn < 3:
+        return None
+    ne = _non_empty_val_count(vals, cn)
+    first = str((vals or [""])[0] or "").strip()
+    tail_nonempty = sum(
+        1 for i in range(1, min(len(vals or []), cn)) if str((vals or [""])[i] or "").strip()
+    )
+    if ne <= 1:
+        if ne == 1 and (len(first) > 20 or cn >= 4):
+            return (
+                f"分列不足：{cn} 列表格仅解析出 {ne} 个非空字段且无法识别表头"
+                "（须 row_by_header 或 \\t 分列），已跳过"
+            )
+    elif cn >= 5 and tail_nonempty <= 1 and len(first) > 24:
+        return (
+            f"分列异常：{cn} 列表格首列过长且无法识别表头，已跳过"
+        )
+    elif cn >= 8 and ne <= 3 and len(first) > 12 and not _looks_like_row_id_token(first):
+        return (
+            f"宽表分列不足：{cn} 列仅 {ne} 个非空字段且无法识别表头，已跳过"
+        )
+    return None
+
+
+def _table_row_partial_write_note(
+    vals: List[str],
+    written: List[str],
+    col_n: int,
+    *,
+    header_labels: Optional[List[str]],
+    cells_applied: int,
+    header_warn: str = "",
+) -> str:
+    parts: List[str] = []
+    if header_warn:
+        parts.append(header_warn)
+    if cells_applied == 0:
+        parts.append("无列通过表头类型校验，未写入任何单元格")
+    elif cells_applied < _non_empty_val_count(vals, col_n):
+        parts.append(f"宽表部分写入：{cells_applied} 列通过校验，其余保留原值")
+    return "；".join(parts)
+
+
+def _write_word_table_row_cells(
+    cells: List[Any],
+    vals: List[str],
+    col_n: int,
+    *,
+    track_changes: bool,
+    sparse: bool,
+    header_labels: Optional[List[str]] = None,
+    protect_typed_columns: bool = False,
+    partial_by_header: bool = False,
+) -> Tuple[List[str], int]:
+    """
+    写入 Word 表格一行。
+    partial_by_header=True：仅写入通过表头列类型校验的非空列，其余保留单元格原值。
+    返回 (写入后各列文本, 实际写入列数)。
+    """
+    write_n = min(col_n, len(cells))
+    written: List[str] = []
+    hdr = list(header_labels or [])
+    while len(hdr) < col_n:
+        hdr.append("")
+    hdr = hdr[:col_n]
+    cells_applied = 0
+    typed_roles = ("id", "measure_id", "severity", "probability", "risk_area", "measure_type")
+    for ci in range(col_n):
+        v = str((vals[ci] if ci < len(vals) else "") or "")
+        existing = ""
+        if ci < write_n and cells[ci] is not None:
+            existing = str(cells[ci].text or "")
+        existing_st = existing.strip()
+        should_write = bool(str(v or "").strip())
+        if should_write and (partial_by_header or protect_typed_columns) and (hdr[ci] or "").strip():
+            role = _header_column_role(hdr[ci])
+            if role in typed_roles:
+                if not _value_matches_column_role(role, v):
+                    should_write = False
+                elif (
+                    role in ("id", "measure_id")
+                    and existing_st
+                    and (
+                        _value_matches_column_role(role, existing_st)
+                        or _looks_like_row_id_token(existing_st)
+                    )
+                    and not _value_matches_column_role(role, v)
+                    and not _looks_like_row_id_token(v)
+                ):
+                    should_write = False
+            elif partial_by_header and role == "text" and len(v) <= 3 and v.isdigit():
+                # 短数字误入描述列时不写
+                should_write = False
+        if sparse and not str(v or "").strip():
+            should_write = False
+        if ci < write_n and should_write:
+            before = existing
+            if track_changes:
+                _replace_table_cell_with_track_changes(cells[ci], before, v)
+            else:
+                cells[ci].text = v
+            cells_applied += 1
+            written.append(v)
+        else:
+            written.append(existing if (partial_by_header or protect_typed_columns) else v)
+    return written, cells_applied
+
+
+def _apply_xlsx_row_cells_partial(
+    ws,
+    row_idx: int,
+    vals: List[str],
+    col_n: int,
+    *,
+    header_labels: Optional[List[str]] = None,
+    protect_typed_columns: bool = False,
+    partial_by_header: bool = False,
+) -> Tuple[List[str], int]:
+    """xlsx 行 partial 写入，逻辑与 _write_word_table_row_cells 对齐。"""
+    cn = max(1, int(col_n))
+    written: List[str] = []
+    hdr = list(header_labels or [])
+    while len(hdr) < cn:
+        hdr.append("")
+    hdr = hdr[:cn]
+    cells_applied = 0
+    typed_roles = ("id", "measure_id", "severity", "probability", "risk_area", "measure_type")
+    for ci in range(cn):
+        col = ci + 1
+        v = str((vals[ci] if ci < len(vals) else "") or "")
+        existing = ""
+        try:
+            av = ws.cell(row=row_idx, column=col).value
+            existing = "" if av is None else str(av)
+        except Exception:
+            pass
+        existing_st = existing.strip()
+        should_write = bool(str(v or "").strip())
+        if should_write and (partial_by_header or protect_typed_columns) and (hdr[ci] or "").strip():
+            role = _header_column_role(hdr[ci])
+            if role in typed_roles:
+                if not _value_matches_column_role(role, v):
+                    should_write = False
+                elif (
+                    role in ("id", "measure_id")
+                    and existing_st
+                    and (
+                        _value_matches_column_role(role, existing_st)
+                        or _looks_like_row_id_token(existing_st)
+                    )
+                    and not _value_matches_column_role(role, v)
+                    and not _looks_like_row_id_token(v)
+                ):
+                    should_write = False
+            elif partial_by_header and role == "text" and len(v) <= 3 and v.isdigit():
+                should_write = False
+        if should_write:
+            ws.cell(row=row_idx, column=col, value=v)
+            cells_applied += 1
+            written.append(v)
+        else:
+            written.append(existing if (partial_by_header or protect_typed_columns) else v)
+    return written, cells_applied
 
 
 def _word_row_index_in_table(tbl, row_obj) -> int:
@@ -2997,16 +3338,21 @@ def export_docx_inplace_patch(
                         row_dict = _coerce_row_by_header_from_op(op, new_text or "")
                         hdr_align: Dict[str, Any] = {}
                         pending_vals_list: List[List[str]] = []
+                        table_hdr_labels: List[str] = []
                         if row_dict:
                             _hi, hdr_labels = _word_find_header_row_labels(
                                 tbl, int(r_idx), col_n
                             )
+                            table_hdr_labels = list(hdr_labels or [])
                             if hdr_labels and len(hdr_labels) > col_n:
                                 col_n = len(hdr_labels)
                             if hdr_labels and any((x or "").strip() for x in hdr_labels):
                                 mapped = _map_row_dict_to_vals_by_headers(
                                     hdr_labels, row_dict, col_n
                                 )
+                                header_map_warn = _validate_row_vals_for_headers(
+                                    hdr_labels, mapped, col_n
+                                ) or ""
                                 pending_vals_list = [mapped]
                                 hdr_align = {
                                     "header_row_index": int(_hi),
@@ -3025,6 +3371,19 @@ def export_docx_inplace_patch(
                                 )
                                 continue
                         else:
+                            _hi2, _hl2 = _word_find_header_row_labels(tbl, int(r_idx), col_n)
+                            table_hdr_labels = list(_hl2 or [])
+                            if col_n >= 6 and not any((x or "").strip() for x in table_hdr_labels):
+                                report["skipped"].append(
+                                    {
+                                        "op": op,
+                                        "reason": (
+                                            f"宽表（{col_n} 列）无 row_by_header 且未能识别表头，"
+                                            "已拒绝写入以防错列覆盖 Risk ID"
+                                        ),
+                                    }
+                                )
+                                continue
                             for ln in _split_table_rows_from_new_text(new_text or ""):
                                 pending_vals_list.append(
                                     _vals_from_table_row_line(ln, col_n)
@@ -3040,76 +3399,115 @@ def export_docx_inplace_patch(
                         cur_row = row
                         cur_r_idx = int(r_idx)
                         batch_n = len(pending_vals_list)
+                        header_map_warn = locals().get("header_map_warn") or ""
                         for _row_i, vals in enumerate(pending_vals_list):
                             while len(vals) < col_n:
                                 vals.append("")
                             vals = vals[:col_n]
                             if not vals or not any(str(x).strip() for x in vals):
                                 continue
+                            hard_reject = _table_row_vals_hard_reject(
+                                vals, col_n, header_labels=table_hdr_labels or None
+                            )
+                            if hard_reject:
+                                report["skipped"].append({"op": op, "reason": hard_reject})
+                                continue
+
+                            partial_write = _table_row_has_usable_headers(table_hdr_labels) or col_n >= 5
+                            protect_cols = partial_write
+                            sparse_write = True
 
                             new_joined = "\t".join(
-                            (vals[ci] if ci < len(vals) else "") for ci in range(col_n)
-                        ).strip()
-                        tc_col = 0
-                        parsed = _parse_tc_id_first_cell(vals[0] or "", tc_rules)
-                        if not parsed:
-                            for ii in range(1, min(len(vals), col_n)):
+                                (vals[ci] if ci < len(vals) else "") for ci in range(col_n)
+                            ).strip()
+                            tc_col = 0
+                            parsed = _parse_tc_id_first_cell(vals[0] or "", tc_rules)
+                            if not parsed:
+                                for ii in range(1, min(len(vals), col_n)):
                                     p2 = _parse_tc_id_first_cell(vals[ii] or "", tc_rules)
                                     if p2:
                                         parsed, tc_col = p2, ii
                                         break
-                            if not parsed:
-                                try:
-                                    uc0 = _word_unique_cells(cur_row)
-                                    if uc0:
-                                        parsed = _parse_tc_id_first_cell(
-                                            _word_cell_text_best(uc0[0]) or "", tc_rules
-                                        )
-                                        if parsed:
-                                            tc_col = 0
-                                except Exception:
-                                    parsed = None
+                                if not parsed:
+                                    try:
+                                        uc0 = _word_unique_cells(cur_row)
+                                        if uc0:
+                                            parsed = _parse_tc_id_first_cell(
+                                                _word_cell_text_best(uc0[0]) or "", tc_rules
+                                            )
+                                            if parsed:
+                                                tc_col = 0
+                                    except Exception:
+                                        parsed = None
 
-                            # 无可解析编号时：在锚点附近窗口做强相似去重，避免重复插入“源文档已存在”的行
+                            # 无可解析编号时：有表头则 partial 原地更新；无表头宽表跳过相似行覆盖
                             if not parsed:
-                                ex2 = _word_find_similar_row_idx(
-                                    tbl,
-                                    joined=new_joined,
-                                    col_n=col_n,
-                                    start=max(0, int(cur_r_idx) - 2),
-                                    end=min(
-                                        len(getattr(tbl, "rows", []) or []),
-                                        int(cur_r_idx) + 12,
-                                    ),
-                                )
-                                if ex2 >= 0:
-                                    ex_row2 = tbl.rows[ex2]
-                                    before_joined2 = _word_row_joined(ex_row2, col_n)
-                                    written_cells2: List[str] = []
-                                    ex_cells2 = _word_unique_cells(ex_row2)
-                                    for ci in range(min(col_n, len(ex_cells2))):
-                                        v = vals[ci] if ci < len(vals) else ""
-                                        before = (ex_cells2[ci].text or "") if ci < len(ex_cells2) else ""
-                                        if track_changes:
-                                            _replace_table_cell_with_track_changes(ex_cells2[ci], before, v)
-                                        else:
-                                            ex_cells2[ci].text = v
-                                        written_cells2.append(v)
-                                    ch_dup: Dict[str, Any] = {
-                                        "type": "update_table_row_in_place",
-                                        "anchor": anchor,
-                                        "table_row_index": ex2,
-                                        "before": before_joined2,
-                                        "after": "\t".join(written_cells2),
-                                        "cells_preview": [str(x).strip() for x in written_cells2],
-                                        "note": "检测到源文档附近已存在高度相似行，已原地更新（避免重复插入）",
-                                        **_change_meta(op),
-                                    }
-                                    if hdr_align:
-                                        ch_dup["header_alignment"] = hdr_align
-                                    report["changes"].append(ch_dup)
-                                    insert_ok += 1
-                                    continue
+                                allow_similar = partial_write or col_n < 6
+                                if allow_similar:
+                                    ex2 = _word_find_similar_row_idx(
+                                        tbl,
+                                        joined=new_joined,
+                                        col_n=col_n,
+                                        start=max(0, int(cur_r_idx) - 2),
+                                        end=min(
+                                            len(getattr(tbl, "rows", []) or []),
+                                            int(cur_r_idx) + 12,
+                                        ),
+                                    )
+                                    if ex2 >= 0:
+                                        ex_row2 = tbl.rows[ex2]
+                                        before_joined2 = _word_row_joined(ex_row2, col_n)
+                                        ex_cells2 = _word_unique_cells(ex_row2)
+                                        written_cells2, n_applied2 = _write_word_table_row_cells(
+                                            ex_cells2,
+                                            vals,
+                                            col_n,
+                                            track_changes=track_changes,
+                                            sparse=sparse_write,
+                                            header_labels=table_hdr_labels or None,
+                                            protect_typed_columns=protect_cols,
+                                            partial_by_header=partial_write,
+                                        )
+                                        if n_applied2 <= 0:
+                                            report["skipped"].append(
+                                                {
+                                                    "op": op,
+                                                    "reason": _table_row_partial_write_note(
+                                                        vals,
+                                                        written_cells2,
+                                                        col_n,
+                                                        header_labels=table_hdr_labels,
+                                                        cells_applied=0,
+                                                        header_warn=header_map_warn,
+                                                    ),
+                                                }
+                                            )
+                                            continue
+                                        pnote2 = _table_row_partial_write_note(
+                                            vals,
+                                            written_cells2,
+                                            col_n,
+                                            header_labels=table_hdr_labels,
+                                            cells_applied=n_applied2,
+                                            header_warn=header_map_warn,
+                                        )
+                                        ch_dup: Dict[str, Any] = {
+                                            "type": "update_table_row_in_place",
+                                            "anchor": anchor,
+                                            "table_row_index": ex2,
+                                            "before": before_joined2,
+                                            "after": "\t".join(written_cells2),
+                                            "cells_preview": [str(x).strip() for x in written_cells2],
+                                            "note": "检测到源文档附近已存在高度相似行，已原地更新（避免重复插入）",
+                                            **_change_meta(op),
+                                        }
+                                        if pnote2:
+                                            ch_dup["note"] = f"{ch_dup['note']}；{pnote2}"
+                                        if hdr_align:
+                                            ch_dup["header_alignment"] = hdr_align
+                                        report["changes"].append(ch_dup)
+                                        insert_ok += 1
+                                        continue
 
                             # 首列可解析为用例编号（如 GN3-22）：按表内同前缀最大编号 +1 分配；已存在编号则按整行相似度决定更新或新行
                             if parsed:
@@ -3119,7 +3517,11 @@ def export_docx_inplace_patch(
                                     tbl, prefix, rule, tc_rules, max_n + 1
                                 )
                                 id_cell = (vals[tc_col] or "").strip()
-                                ex_idx = _table_find_row_idx_by_id_any_cell(tbl, id_cell)
+                                ex_idx = (
+                                    _table_find_row_idx_by_id_any_cell(tbl, id_cell)
+                                    if _looks_like_row_id_token(id_cell)
+                                    else -1
+                                )
 
                                 if ex_idx >= 0:
                                     ex_row = tbl.rows[ex_idx]
@@ -3128,19 +3530,41 @@ def export_docx_inplace_patch(
                                         None, new_joined, (before_joined or "").strip()
                                     ).ratio()
                                     if sim >= _TC_ROW_SIMILARITY_UPDATE_THRESHOLD:
-                                        written_cells: List[str] = []
                                         ex_cells = _word_unique_cells(ex_row)
-                                        for ci in range(min(col_n, len(ex_cells))):
-                                            v = vals[ci] if ci < len(vals) else ""
-                                            before = (ex_cells[ci].text or "") if ci < len(ex_cells) else ""
-                                            if track_changes:
-                                                _replace_table_cell_with_track_changes(
-                                                    ex_cells[ci], before, v
-                                                )
-                                            else:
-                                                ex_cells[ci].text = v
-                                            written_cells.append(v)
+                                        written_cells, n_applied = _write_word_table_row_cells(
+                                            ex_cells,
+                                            vals,
+                                            col_n,
+                                            track_changes=track_changes,
+                                            sparse=sparse_write,
+                                            header_labels=table_hdr_labels or None,
+                                            protect_typed_columns=protect_cols,
+                                            partial_by_header=partial_write,
+                                        )
+                                        if n_applied <= 0:
+                                            report["skipped"].append(
+                                                {
+                                                    "op": op,
+                                                    "reason": _table_row_partial_write_note(
+                                                        vals,
+                                                        written_cells,
+                                                        col_n,
+                                                        header_labels=table_hdr_labels,
+                                                        cells_applied=0,
+                                                        header_warn=header_map_warn,
+                                                    ),
+                                                }
+                                            )
+                                            continue
                                         joined = "\t".join(written_cells)
+                                        pnote = _table_row_partial_write_note(
+                                            vals,
+                                            written_cells,
+                                            col_n,
+                                            header_labels=table_hdr_labels,
+                                            cells_applied=n_applied,
+                                            header_warn=header_map_warn,
+                                        )
                                         ch_sim: Dict[str, Any] = {
                                             "type": "update_table_row_in_place",
                                             "anchor": anchor,
@@ -3155,6 +3579,8 @@ def export_docx_inplace_patch(
                                             ),
                                             **_change_meta(op),
                                         }
+                                        if pnote:
+                                            ch_sim["note"] = f"{ch_sim['note']}；{pnote}"
                                         if hdr_align:
                                             ch_sim["header_alignment"] = hdr_align
                                         report["changes"].append(ch_sim)
@@ -3202,16 +3628,40 @@ def export_docx_inplace_patch(
                                         ),
                                     }
                                 )
-                            for ci in range(write_n):
-                                v = vals[ci] if ci < len(vals) else ""
-                                if track_changes:
-                                    _replace_table_cell_with_track_changes(
-                                        new_cells[ci], "", v
-                                    )
-                                else:
-                                    new_cells[ci].text = v
-                            written_cells = [(vals[ci] if ci < len(vals) else "") for ci in range(col_n)]
+                            written_cells, n_applied_ins = _write_word_table_row_cells(
+                                new_cells,
+                                vals,
+                                write_n,
+                                track_changes=track_changes,
+                                sparse=True,
+                                header_labels=table_hdr_labels or None,
+                                protect_typed_columns=protect_cols,
+                                partial_by_header=partial_write,
+                            )
+                            if n_applied_ins <= 0:
+                                report["skipped"].append(
+                                    {
+                                        "op": op,
+                                        "reason": _table_row_partial_write_note(
+                                            vals,
+                                            written_cells,
+                                            col_n,
+                                            header_labels=table_hdr_labels,
+                                            cells_applied=0,
+                                            header_warn=header_map_warn,
+                                        ),
+                                    }
+                                )
+                                continue
                             joined = "\t".join(written_cells)
+                            pnote_ins = _table_row_partial_write_note(
+                                vals,
+                                written_cells,
+                                col_n,
+                                header_labels=table_hdr_labels,
+                                cells_applied=n_applied_ins,
+                                header_warn=header_map_warn,
+                            )
                             ch: Dict[str, Any] = {
                                 "type": t,
                                 "anchor": anchor,
@@ -3224,6 +3674,10 @@ def export_docx_inplace_patch(
                                 ch["tc_id_assigned"] = (vals[tc_col] or "").strip()
                                 ch["note"] = (
                                     "首列已按表内同模块（前缀）最大编号 +1 分配，避免与已有编号冲突"
+                                )
+                            if pnote_ins:
+                                ch["note"] = (
+                                    f"{ch.get('note') or ''}；{pnote_ins}".strip("；")
                                 )
                             if hdr_align:
                                 ch["header_alignment"] = hdr_align
@@ -3295,6 +3749,17 @@ def export_docx_inplace_patch(
                 report["skipped"].append({"reason": "未找到基础文档中的修订记录表，已跳过写入修订记录。"})
     except Exception as e:
         report["errors"].append({"error": f"写入修订记录失败：{e}"})
+
+    immediate_pts = meta.get("immediate_audit_points") or []
+    if isinstance(immediate_pts, list) and immediate_pts:
+        try:
+            from src.core.audit_handoff import build_audit_point_coverage_report
+
+            report["audit_point_coverage"] = build_audit_point_coverage_report(
+                immediate_pts, report
+            )
+        except Exception as _cov_e:
+            report["errors"].append({"error": f"生成审核点覆盖报告失败：{_cov_e}"})
 
     doc.save(str(out))
     return str(out), report
@@ -3492,15 +3957,21 @@ def export_xlsx_inplace_patch(
                 col_n_scan = min(80, max(col_hint, int(ws.max_column or 0), 1))
                 row_dict = _coerce_row_by_header_from_op(op, new_text or "")
                 hdr_align: Dict[str, Any] = {}
+                table_hdr_labels: List[str] = []
+                header_map_warn = ""
                 vals: List[str] = []
                 if row_dict:
                     _hr, hdr_labels = _xlsx_find_header_row_labels(
                         ws, int(r_idx), col_n_scan
                     )
+                    table_hdr_labels = list(hdr_labels or [])
                     if hdr_labels and any((x or "").strip() for x in hdr_labels):
                         vals = _map_row_dict_to_vals_by_headers(
                             hdr_labels, row_dict, col_n_scan
                         )
+                        header_map_warn = _validate_row_vals_for_headers(
+                            hdr_labels, vals, col_n_scan
+                        ) or ""
                         hdr_align = {
                             "header_row_index": int(_hr),
                             "header_labels_preview": [
@@ -3517,6 +3988,8 @@ def export_xlsx_inplace_patch(
                         )
                         continue
                 if not vals:
+                    _hr2, _hl2 = _xlsx_find_header_row_labels(ws, int(r_idx), col_n_scan)
+                    table_hdr_labels = list(_hl2 or [])
                     vals = [x for x in (new_text or "").split("\t")]
                     if len(vals) == 1 and "\t" not in (new_text or "") and not (
                         (new_text or "").strip().startswith("{")
@@ -3526,19 +3999,37 @@ def export_xlsx_inplace_patch(
                         )
                         if len(vals2) > 1:
                             vals = vals2
-                if not vals or not any(str(x).strip() for x in vals):
-                    report["skipped"].append(
-                        {
-                            "op": op,
-                            "reason": "new_text 按制表符分列后无有效单元格内容（仅空白/制表符），未插入行",
-                        }
-                    )
-                    continue
                 try:
                     col_n = min(80, max(len(vals), col_hint, int(ws.max_column or 0), 1))
+                    if col_n >= 6 and not any((x or "").strip() for x in table_hdr_labels):
+                        report["skipped"].append(
+                            {
+                                "op": op,
+                                "reason": (
+                                    f"宽表（{col_n} 列）无 row_by_header 且未能识别表头，"
+                                    "已拒绝写入以防错列覆盖 Risk ID"
+                                ),
+                            }
+                        )
+                        continue
                     while len(vals) < col_n:
                         vals.append("")
                     vals = vals[:col_n]
+                    if not vals or not any(str(x).strip() for x in vals):
+                        report["skipped"].append(
+                            {
+                                "op": op,
+                                "reason": "new_text 按制表符分列后无有效单元格内容（仅空白/制表符），未插入行",
+                            }
+                        )
+                        continue
+                    hard_reject = _table_row_vals_hard_reject(
+                        vals, col_n, header_labels=table_hdr_labels or None
+                    )
+                    if hard_reject:
+                        report["skipped"].append({"op": op, "reason": hard_reject})
+                        continue
+                    partial_write = _table_row_has_usable_headers(table_hdr_labels) or col_n >= 5
                     new_joined = "\t".join(
                         (vals[ci] if ci < len(vals) else "") for ci in range(col_n)
                     ).strip()
@@ -3571,11 +4062,38 @@ def export_xlsx_inplace_patch(
                             ex_r2 = _xlsx_find_row_by_id_any_col(ws, rid)
                             if ex_r2 >= 0:
                                 before_joined2 = _xlsx_row_joined(ws, ex_r2, col_n)
-                                for ci in range(1, col_n + 1):
-                                    v = vals[ci - 1] if ci - 1 < len(vals) else ""
-                                    ws.cell(row=ex_r2, column=ci, value=v)
-                                joined2 = "\t".join(
-                                    (vals[ci] if ci < len(vals) else "") for ci in range(col_n)
+                                written2, n_applied2 = _apply_xlsx_row_cells_partial(
+                                    ws,
+                                    ex_r2,
+                                    vals,
+                                    col_n,
+                                    header_labels=table_hdr_labels or None,
+                                    protect_typed_columns=partial_write,
+                                    partial_by_header=partial_write,
+                                )
+                                if n_applied2 <= 0:
+                                    report["skipped"].append(
+                                        {
+                                            "op": op,
+                                            "reason": _table_row_partial_write_note(
+                                                vals,
+                                                written2,
+                                                col_n,
+                                                header_labels=table_hdr_labels,
+                                                cells_applied=0,
+                                                header_warn=header_map_warn,
+                                            ),
+                                        }
+                                    )
+                                    continue
+                                joined2 = "\t".join(written2)
+                                pnote2 = _table_row_partial_write_note(
+                                    vals,
+                                    written2,
+                                    col_n,
+                                    header_labels=table_hdr_labels,
+                                    cells_applied=n_applied2,
+                                    header_warn=header_map_warn,
                                 )
                                 ch_r2: Dict[str, Any] = {
                                     "type": "update_table_row_in_place",
@@ -3585,10 +4103,12 @@ def export_xlsx_inplace_patch(
                                     "tc_id": rid,
                                     "before": before_joined2,
                                     "after": joined2,
-                                    "cells_preview": [str(x).strip() for x in vals],
+                                    "cells_preview": [str(x).strip() for x in written2],
                                     "note": "首列编号/风险号已存在，已原地更新整行（避免重复插入）",
                                     **_change_meta(op),
                                 }
+                                if pnote2:
+                                    ch_r2["note"] = f"{ch_r2['note']}；{pnote2}"
                                 if hdr_align:
                                     ch_r2["header_alignment"] = hdr_align
                                 report["changes"].append(ch_r2)
@@ -3609,11 +4129,38 @@ def export_xlsx_inplace_patch(
                                 None, new_joined, (before_joined or "").strip()
                             ).ratio()
                             if sim >= _TC_ROW_SIMILARITY_UPDATE_THRESHOLD:
-                                for ci in range(1, col_n + 1):
-                                    v = vals[ci - 1] if ci - 1 < len(vals) else ""
-                                    ws.cell(row=ex_r, column=ci, value=v)
-                                joined = "\t".join(
-                                    (vals[ci] if ci < len(vals) else "") for ci in range(col_n)
+                                written_xu, n_applied_xu = _apply_xlsx_row_cells_partial(
+                                    ws,
+                                    ex_r,
+                                    vals,
+                                    col_n,
+                                    header_labels=table_hdr_labels or None,
+                                    protect_typed_columns=partial_write,
+                                    partial_by_header=partial_write,
+                                )
+                                if n_applied_xu <= 0:
+                                    report["skipped"].append(
+                                        {
+                                            "op": op,
+                                            "reason": _table_row_partial_write_note(
+                                                vals,
+                                                written_xu,
+                                                col_n,
+                                                header_labels=table_hdr_labels,
+                                                cells_applied=0,
+                                                header_warn=header_map_warn,
+                                            ),
+                                        }
+                                    )
+                                    continue
+                                joined = "\t".join(written_xu)
+                                pnote_xu = _table_row_partial_write_note(
+                                    vals,
+                                    written_xu,
+                                    col_n,
+                                    header_labels=table_hdr_labels,
+                                    cells_applied=n_applied_xu,
+                                    header_warn=header_map_warn,
                                 )
                                 ch_xu: Dict[str, Any] = {
                                     "type": "update_table_row_in_place",
@@ -3624,12 +4171,14 @@ def export_xlsx_inplace_patch(
                                     "similarity": round(sim, 4),
                                     "before": before_joined,
                                     "after": joined,
-                                    "cells_preview": [str(x).strip() for x in vals],
+                                    "cells_preview": [str(x).strip() for x in written_xu],
                                     "note": (
                                         f"首列编号已存在且整行相似度≥{_TC_ROW_SIMILARITY_UPDATE_THRESHOLD}，已原地更新该行"
                                     ),
                                     **_change_meta(op),
                                 }
+                                if pnote_xu:
+                                    ch_xu["note"] = f"{ch_xu['note']}；{pnote_xu}"
                                 if hdr_align:
                                     ch_xu["header_alignment"] = hdr_align
                                 report["changes"].append(ch_xu)
@@ -3640,10 +4189,42 @@ def export_xlsx_inplace_patch(
                             vals[tc_col] = next_id
 
                     ws.insert_rows(r_idx + 1)
-                    for ci, v in enumerate(vals, start=1):
-                        ws.cell(row=r_idx + 1, column=ci, value=v)
-                    joined = "\t".join(
-                        (vals[i] if i < len(vals) else "") for i in range(col_n)
+                    written_ins, n_applied_ins = _apply_xlsx_row_cells_partial(
+                        ws,
+                        r_idx + 1,
+                        vals,
+                        col_n,
+                        header_labels=table_hdr_labels or None,
+                        protect_typed_columns=partial_write,
+                        partial_by_header=partial_write,
+                    )
+                    if n_applied_ins <= 0:
+                        try:
+                            ws.delete_rows(r_idx + 1)
+                        except Exception:
+                            pass
+                        report["skipped"].append(
+                            {
+                                "op": op,
+                                "reason": _table_row_partial_write_note(
+                                    vals,
+                                    written_ins,
+                                    col_n,
+                                    header_labels=table_hdr_labels,
+                                    cells_applied=0,
+                                    header_warn=header_map_warn,
+                                ),
+                            }
+                        )
+                        continue
+                    joined = "\t".join(written_ins)
+                    pnote_x = _table_row_partial_write_note(
+                        vals,
+                        written_ins,
+                        col_n,
+                        header_labels=table_hdr_labels,
+                        cells_applied=n_applied_ins,
+                        header_warn=header_map_warn,
                     )
                     chx: Dict[str, Any] = {
                         "type": t,
@@ -3652,11 +4233,13 @@ def export_xlsx_inplace_patch(
                         "row_index": r_idx,
                         "before": "",
                         "after": joined,
-                        "cells_preview": [str(x).strip() for x in vals],
+                        "cells_preview": [str(x).strip() for x in written_ins],
                     }
                     if parsed:
                         chx["tc_id_assigned"] = (vals[tc_col] or "").strip()
                         chx["note"] = "首列已按表内同模块（前缀）最大编号 +1 分配"
+                    if pnote_x:
+                        chx["note"] = f"{chx.get('note') or ''}；{pnote_x}".strip("；")
                     if hdr_align:
                         chx["header_alignment"] = hdr_align
                     chx.update(_change_meta(op))
@@ -3677,6 +4260,17 @@ def export_xlsx_inplace_patch(
                 report["skipped"].append({"reason": "未找到基础文件中的“修订记录”工作表/表格区域，已跳过写入修订记录。"})
     except Exception as e:
         report["errors"].append({"error": f"写入修订记录失败：{e}"})
+
+    immediate_pts = meta.get("immediate_audit_points") or []
+    if isinstance(immediate_pts, list) and immediate_pts:
+        try:
+            from src.core.audit_handoff import build_audit_point_coverage_report
+
+            report["audit_point_coverage"] = build_audit_point_coverage_report(
+                immediate_pts, report
+            )
+        except Exception as _cov_e:
+            report["errors"].append({"error": f"生成审核点覆盖报告失败：{_cov_e}"})
 
     wb.save(str(out))
     try:

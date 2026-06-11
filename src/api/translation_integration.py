@@ -41,7 +41,7 @@ from src.core.db import (
     list_project_cases,
     list_projects,
 )
-from src.core.llm_factory import ClientLlmConfig
+from src.core.llm_factory import ClientLlmConfig, bind_request_client_llm, unbind_request_client_llm
 from src.core.operation_logs_invalidation import invalidate_operation_logs_cache
 from src.translation.models import SUPPORTED_EXTENSIONS
 from src.translation.correction import save_glossary_correction_entries
@@ -260,6 +260,9 @@ def _run_translation_job(job_id: str) -> None:
             job_id, progress=float(frac), message=str(msg or ""), status="running"
         )
 
+    _cl_token = bind_request_client_llm(
+        client_llm if client_llm and client_llm.has_any() else None
+    )
     try:
         start_msg = "开始翻译…"
         prov_note = (spec.get("provider_note") or "").strip()
@@ -425,6 +428,9 @@ def _run_translation_job(job_id: str) -> None:
             traceback=traceback.format_exc(),
             client_llm=None,
         )
+
+    finally:
+        unbind_request_client_llm(_cl_token)
 
 
 def _parse_manual_rules(

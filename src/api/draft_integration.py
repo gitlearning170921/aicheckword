@@ -45,7 +45,12 @@ from src.core.db import (
 from src.core.document_draft_generator import DocumentDraftGenerator
 from src.core.document_loader import SUPPORTED_DOC_EXTENSIONS, extract_archive, is_archive
 from src.core.draft_job_artifacts import export_draft_job_files
-from src.core.llm_factory import ClientLlmConfig, merged_cursor_launch_params
+from src.core.llm_factory import (
+    ClientLlmConfig,
+    bind_request_client_llm,
+    merged_cursor_launch_params,
+    unbind_request_client_llm,
+)
 from src.core.operation_logs_invalidation import invalidate_operation_logs_cache
 
 router = APIRouter(prefix="/api/integration/draft", tags=["integration-draft"])
@@ -152,6 +157,8 @@ class DraftGeneratePayload(BaseModel):
     user_prompt_append: str = ""
     # 参考文件在项目向量库中已存在时：skip=不重复向量化；overwrite=删除后重新向量化
     input_vector_on_duplicate: str = "skip"
+    # 审核后修改：按目标文件传入「立即修改」结构化审核点，用于生成 audit_point_coverage 日志
+    audit_immediate_points_by_target: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
 
 class CheckInputVectorDuplicatesBody(BaseModel):
@@ -160,10 +167,21 @@ class CheckInputVectorDuplicatesBody(BaseModel):
 
 
 def _parse_client_llm(request: Request) -> ClientLlmConfig:
+    from src.core.llm_factory import normalize_api_key_plain, normalize_openai_compatible_base_url
+
     h = request.headers
-    api_key = (h.get("x-client-llm-api-key") or h.get("X-Client-Llm-Api-Key") or "").strip()
-    base_url = (h.get("x-client-llm-base-url") or h.get("X-Client-Llm-Base-Url") or "").strip()
-    model = (h.get("x-client-llm-model") or h.get("X-Client-Llm-Model") or "").strip()
+    hdr_prov = (
+        h.get("x-client-llm-provider") or h.get("X-Client-Llm-Provider") or ""
+    ).strip().lower()
+    api_key = normalize_api_key_plain(
+        h.get("x-client-llm-api-key") or h.get("X-Client-Llm-Api-Key") or ""
+    )
+    # 集成联调：个人 Key 只覆盖 api_key；Base URL / 模型与 aicheckword 系统设置一致（与侧栏直连行为对齐）
+    raw_base = (h.get("x-client-llm-base-url") or h.get("X-Client-Llm-Base-Url") or "").strip()
+    base_url = ""
+    if hdr_prov == "cursor" and raw_base:
+        base_url = normalize_openai_compatible_base_url("cursor", raw_base)
+    model = ""
     cursor_repository = (
         h.get("x-client-cursor-repository") or h.get("X-Client-Cursor-Repository") or ""
     ).strip()
@@ -371,6 +389,9 @@ def _run_draft_job(job_id: str) -> None:
     def _progress(msg: str, frac: float) -> None:
         _update_job(job_id, progress=float(frac), message=str(msg or ""), status="running")
 
+    _cl_token = bind_request_client_llm(
+        client_llm if client_llm and client_llm.has_any() else None
+    )
     try:
         _update_job(job_id, status="running", progress=0.02, message="开始生成…")
         # 与 aicheckword 本机一致：只要有上传的 Base，就提供 manifest，供「按名映射 / 未匹配 leftover」等分支使用。
@@ -435,9 +456,18 @@ def _run_draft_job(job_id: str) -> None:
             inplace_patch=eff_inplace,
             document_language=payload.document_language,
             docx_track_changes=payload.docx_track_changes,
+            audit_immediate_points_by_target=payload.audit_immediate_points_by_target,
         )
         zip_path = Path(spec["job_dir"]) / "artifacts.zip"
         summary_path = Path(spec["job_dir"]) / "draft_artifacts_summary.json"
+        _coverage_by_target: Dict[str, Any] = {}
+        for _s in summaries or []:
+            if not isinstance(_s, dict):
+                continue
+            _fn = str(_s.get("file_name") or "").strip()
+            _cov = _s.get("audit_point_coverage")
+            if _fn and isinstance(_cov, dict):
+                _coverage_by_target[_fn] = _cov
         try:
             _uplen = len((payload.user_prompt_append or "").strip())
             _skip_hist = _patch_skip_reason_histogram(summaries or [])
@@ -466,6 +496,7 @@ def _run_draft_job(job_id: str) -> None:
                 "base_bound_targets": list((base_paths_map or {}).keys())[:32],
                 "generated_file_names": list((res.generated_files or {}).keys()),
                 "per_file_patch_summaries": summaries or [],
+                "audit_point_coverage_by_target": _coverage_by_target or None,
                 "patch_skip_reason_histogram": _skip_hist,
                 "docx_unchanged": bool(_docx_unchanged),
                 "warning": _warn or None,
@@ -575,6 +606,7 @@ def _run_draft_job(job_id: str) -> None:
                 "out_files_by_target": out_by_target,
                 "docx_unchanged": bool(_docx_unchanged_final),
                 "patch_skip_reason_histogram": _skip_hist_final,
+                "audit_point_coverage_by_target": _coverage_by_target or None,
             },
             client_llm=None,
         )
@@ -606,6 +638,9 @@ def _run_draft_job(job_id: str) -> None:
             traceback=traceback.format_exc(),
             client_llm=None,
         )
+
+    finally:
+        unbind_request_client_llm(_cl_token)
 
 
 @router.post("/check-input-vector-duplicates")
@@ -723,6 +758,119 @@ def draft_project_defaults(project_id: int):
 def draft_interop_config():
     """联调策略：与系统配置「初稿集成」入库字段一致；aiword 可定时或进入页面时拉取。"""
     return _interop_config_dict()
+
+
+@router.post("/llm-key-test")
+async def draft_llm_key_test(request: Request):
+    """最小 LLM 鉴权探测：与初稿 job 相同 Header + personal_keys_only 路径。"""
+    from src.core.llm_factory import (
+        invoke_chat_direct,
+        normalize_api_key_plain,
+        resolve_model_for_provider,
+    )
+
+    try:
+        body: dict = {}
+        try:
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+        except Exception:
+            body = {}
+
+        client_llm = _parse_client_llm(request)
+        body_key = normalize_api_key_plain(str(body.get("apiKey") or body.get("api_key") or ""))
+        if body_key:
+            client_llm.api_key = body_key
+        if not bool(getattr(settings, "draft_interop_personal_keys_only", True)):
+            client_llm.personal_keys_only = False
+        else:
+            client_llm.personal_keys_only = True
+        hdr_prov = _header_provider(request)
+        if isinstance(body, dict):
+            bp = str(body.get("provider") or "").strip().lower()
+            if bp:
+                hdr_prov = bp
+        eff_provider = (hdr_prov or settings.provider or "deepseek").strip().lower()
+        wlist = _draft_provider_whitelist_for_jobs()
+        if wlist is not None and eff_provider and eff_provider not in wlist:
+            raise HTTPException(
+                status_code=400,
+                detail=f"当前初稿联调配置不允许 provider={eff_provider!r}，允许：{', '.join(sorted(wlist))}",
+            )
+        if client_llm.personal_keys_only:
+            if eff_provider in ("deepseek", "openai", "lingyi", "tongyi", "cursor"):
+                if not (client_llm.api_key or "").strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="个人 Key 模式下必须提供 X-Client-Llm-Api-Key 或 JSON apiKey",
+                    )
+        if eff_provider == "cursor":
+            return {"ok": True, "message": "Cursor 暂不支持一键探测，请在实际任务中验证（须配 GitHub 仓库）"}
+
+        def _diag() -> dict:
+            key = normalize_api_key_plain(client_llm.api_key or "")
+            try:
+                from config.settings import openai_form_base_url_default_from_settings
+
+                raw_base = openai_form_base_url_default_from_settings(eff_provider).strip()
+            except Exception:
+                from src.core.llm_factory import (
+                    _openai_compatible_base_url,
+                    normalize_openai_compatible_base_url,
+                )
+
+                raw_base = _openai_compatible_base_url(eff_provider).strip()
+                raw_base = normalize_openai_compatible_base_url(eff_provider, raw_base) or raw_base
+            return {
+                "receivedKeyLength": len(key),
+                "receivedKeyPrefixOk": bool(key.startswith("sk-")) if eff_provider == "deepseek" else bool(key),
+                "baseUrlUsed": raw_base,
+                "modelUsed": resolve_model_for_provider(eff_provider, client_llm=None),
+            }
+
+        _cl_token = bind_request_client_llm(client_llm if client_llm.has_any() else None)
+        try:
+            invoke_chat_direct(
+                "ping",
+                temperature=0.0,
+                provider=eff_provider,
+                client_llm=client_llm,
+            )
+        except Exception as e:
+            err = dict(_diag())
+            err["ok"] = False
+            err["message"] = str(e)
+            el = str(e).lower()
+            if "401" in el or "鉴权" in el:
+                try:
+                    invoke_chat_direct(
+                        "ping",
+                        temperature=0.0,
+                        provider=eff_provider,
+                        client_llm=ClientLlmConfig(personal_keys_only=False),
+                    )
+                    err["systemKeyWorks"] = True
+                    err["message"] = (
+                        f"{e} "
+                        "【诊断】aicheckword 系统 Key 可用，侧栏能用的 Key 与你提交的个人 Key 不是同一把，"
+                        "或粘贴时夹带了不可见字符；请从 DeepSeek 控制台重新复制完整 Key（勿含 Bearer）。"
+                    )
+                except Exception:
+                    err["systemKeyWorks"] = False
+            raise HTTPException(status_code=400, detail=err) from e
+        finally:
+            unbind_request_client_llm(_cl_token)
+        labels = {"deepseek": "DeepSeek", "openai": "OpenAI", "lingyi": "零一万物", "tongyi": "通义千问"}
+        label = labels.get(eff_provider, eff_provider)
+        return {"ok": True, "message": f"{label} Key 验证通过（aicheckword 侧栏同路径）"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "message": f"llm-key-test 内部错误：{e}"},
+        ) from e
 
 
 @router.post("/jobs")

@@ -4,8 +4,10 @@
 """
 
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Iterator, Mapping, Optional
 
 import httpx
 
@@ -38,6 +40,132 @@ class ClientLlmConfig:
             or (self.cursor_repository or "").strip()
             or (self.cursor_ref or "").strip()
         )
+
+
+_request_client_llm: ContextVar[Optional["ClientLlmConfig"]] = ContextVar(
+    "request_client_llm", default=None
+)
+
+
+def get_request_client_llm() -> Optional[ClientLlmConfig]:
+    """集成 job 线程内当前请求级 LLM 凭据（由 ``activate_request_client_llm`` 注入）。"""
+    return _request_client_llm.get()
+
+
+@contextmanager
+def activate_request_client_llm(
+    client_llm: Optional[ClientLlmConfig],
+) -> Iterator[None]:
+    """在 integration 后台 job 内激活个人/请求级 Key，供 ``invoke_chat_direct`` 等自动拾取。"""
+    token: Token = _request_client_llm.set(client_llm)
+    try:
+        yield
+    finally:
+        _request_client_llm.reset(token)
+
+
+def bind_request_client_llm(client_llm: Optional[ClientLlmConfig]) -> Token:
+    """非 ``with`` 场景下绑定 job 级凭据；须配对 ``unbind_request_client_llm``。"""
+    return _request_client_llm.set(client_llm)
+
+
+def unbind_request_client_llm(token: Token) -> None:
+    _request_client_llm.reset(token)
+
+
+def normalize_api_key_plain(plain: str) -> str:
+    s = (plain or "").replace("\r", "").replace("\n", "")
+    for zw in ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u00a0"):
+        s = s.replace(zw, "")
+    s = s.strip()
+    while s.lower().startswith("bearer "):
+        s = s[7:].strip()
+    return s
+
+
+def normalize_openai_compatible_base_url(provider: str, base: str) -> str:
+    p = (provider or "").strip().lower()
+    b = (base or "").strip().rstrip("/")
+    if not b:
+        return ""
+    if p == "deepseek" and "api.deepseek.com" in b.lower():
+        rest = b.split("://", 1)[-1].split("/", 1)
+        tail = rest[1] if len(rest) > 1 else ""
+        if not tail.startswith("v1"):
+            return b + "/v1"
+    return b
+
+
+def client_llm_from_mapping(raw: Any) -> Optional[ClientLlmConfig]:
+    if not isinstance(raw, dict):
+        return None
+    prov = str(raw.get("provider") or raw.get("_provider") or "").strip().lower()
+    bu = str(raw.get("base_url") or "").strip()
+    return ClientLlmConfig(
+        api_key=normalize_api_key_plain(str(raw.get("api_key") or "")),
+        base_url=normalize_openai_compatible_base_url(prov or "deepseek", bu) if bu else bu,
+        model=str(raw.get("model") or "").strip(),
+        cursor_repository=str(raw.get("cursor_repository") or "").strip(),
+        cursor_ref=str(raw.get("cursor_ref") or "").strip(),
+        personal_keys_only=bool(raw.get("personal_keys_only")),
+    )
+
+
+def resolve_client_llm(
+    *,
+    explicit: Optional[ClientLlmConfig] = None,
+    review_context: Optional[Mapping[str, Any]] = None,
+) -> Optional[ClientLlmConfig]:
+    """合并显式参数、ContextVar 与 review_context['_client_llm']。"""
+    # personal_keys_only=False 且显式传入时，表示「走系统 settings」，即使 api_key 等字段为空，
+    # 也不应被 ContextVar 中的个人 Key 覆盖（llm-key-test 系统 Key 探测依赖此语义）。
+    if explicit is not None and (explicit.has_any() or not explicit.personal_keys_only):
+        return explicit
+    ctx = get_request_client_llm()
+    if ctx is not None and ctx.has_any():
+        return ctx
+    if review_context:
+        mapped = client_llm_from_mapping(review_context.get("_client_llm"))
+        if mapped is not None and mapped.has_any():
+            return mapped
+    return None
+
+
+def _auth_error_message(*, provider: str, client_llm: Optional[ClientLlmConfig]) -> str:
+    labels = {
+        "deepseek": "DeepSeek",
+        "openai": "OpenAI",
+        "lingyi": "零一万物",
+        "tongyi": "通义千问",
+        "ollama": "Ollama",
+    }
+    label = labels.get((provider or "").strip().lower(), provider or "LLM")
+    msg = f"{label} API Key 鉴权失败（HTTP 401）。"
+    if client_llm and getattr(client_llm, "personal_keys_only", False):
+        msg += (
+            " 当前为个人 Key 模式：Key 无效或与 aicheckword 侧栏配置不一致。"
+            "个人 Key 仅替换 API Key，Base URL/模型沿用 aicheckword 系统设置；"
+            "请在 aiword 初稿页点「测试 Key」验证。"
+        )
+    else:
+        msg += " 请检查 aicheckword 系统配置中的 API Key，或在 aiword 保存个人 Key 后重试。"
+    return msg
+
+
+def _raise_for_llm_http_status(
+    response: httpx.Response,
+    *,
+    provider: str,
+    client_llm: Optional[ClientLlmConfig],
+) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 401:
+            raise RuntimeError(
+                _auth_error_message(provider=provider, client_llm=client_llm)
+            ) from exc
+        raise
 
 
 _DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
@@ -291,15 +419,22 @@ def invoke_chat_direct(
     client_llm: 若传入且含 api_key/base_url/model 等，则对应字段覆盖 settings（用于集成 API / 用户自带 Key）。
     """
     p = (provider or settings.provider or "").strip().lower()
-    cl = client_llm
-    m = resolve_model_for_provider(p, model=model, client_llm=cl)
+    cl = resolve_client_llm(explicit=client_llm)
+    personal_only = bool(cl and getattr(cl, "personal_keys_only", False))
+    m = resolve_model_for_provider(
+        p,
+        model=model,
+        client_llm=None if personal_only else cl,
+    )
 
     if p == "tongyi":
         # 通义走 DashScope 官方域名，与 OpenAI 兼容服务的 Base URL 无关；侧栏也无「通义 Base URL」项。
         if cl and getattr(cl, "personal_keys_only", False):
-            api_key = ((cl.api_key if cl else "") or "").strip()
+            api_key = normalize_api_key_plain((cl.api_key if cl else "") or "")
         else:
-            api_key = ((cl.api_key if cl else "") or (settings.dashscope_api_key or "")).strip()
+            api_key = normalize_api_key_plain(
+                ((cl.api_key if cl else "") or (settings.dashscope_api_key or ""))
+            )
         if not api_key:
             raise RuntimeError("通义模式下请先配置 DASHSCOPE_API_KEY或在请求中传入 X-Client-Llm-Api-Key")
         try:
@@ -333,10 +468,21 @@ def invoke_chat_direct(
     with _openai_http_client() as client:
         if p in ("openai", "deepseek", "lingyi"):
             if cl and getattr(cl, "personal_keys_only", False):
-                api_key = ((cl.api_key if cl else "") or "").strip()
+                api_key = normalize_api_key_plain((cl.api_key if cl else "") or "")
+                try:
+                    from config.settings import openai_form_base_url_default_from_settings
+
+                    raw_base = openai_form_base_url_default_from_settings(p).strip()
+                except Exception:
+                    raw_base = _openai_compatible_base_url(p).strip()
             else:
-                api_key = ((cl.api_key if cl else "") or _openai_compatible_api_key(p)).strip()
-            base_url = ((cl.base_url if cl else "") or _openai_compatible_base_url(p)).strip().rstrip("/")
+                api_key = normalize_api_key_plain(
+                    ((cl.api_key if cl else "") or _openai_compatible_api_key(p))
+                )
+                raw_base = ((cl.base_url if cl else "") or _openai_compatible_base_url(p)).strip()
+            base_url = (
+                normalize_openai_compatible_base_url(p, raw_base) or raw_base
+            ).rstrip("/")
             if not api_key:
                 raise RuntimeError(f"{p} 模式下请先配置 API Key或在请求中传入 X-Client-Llm-Api-Key")
             url = f"{base_url}/chat/completions"
@@ -351,7 +497,7 @@ def invoke_chat_direct(
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 timeout=300,
             )
-            r.raise_for_status()
+            _raise_for_llm_http_status(r, provider=p, client_llm=cl)
             data = r.json()
             choice = (data.get("choices") or [None])[0]
             if not choice:
@@ -369,7 +515,7 @@ def invoke_chat_direct(
                 "stream": False,
             }
             r = client.post(url, json=payload, timeout=300)
-            r.raise_for_status()
+            _raise_for_llm_http_status(r, provider=p, client_llm=cl)
             data = r.json()
             msg = data.get("message") or {}
             return msg.get("content") or ""

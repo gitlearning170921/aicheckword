@@ -178,3 +178,191 @@ def build_immediate_audit_remediation_by_target(
         "text_by_target": text_by_target,
         "all_points": all_points,
     }
+
+
+def build_audit_point_coverage_report(
+    immediate_points: List[Dict[str, Any]],
+    patch_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    对照「立即修改」审核点与 patch.report 中的 changes/skipped，生成逐点覆盖报告。
+    status: modified | not_addressed | partial（有 change 但关联 operation 也被 skip）
+    """
+    changes = list((patch_report or {}).get("changes") or [])
+    skipped = list((patch_report or {}).get("skipped") or [])
+
+    ref_to_changes: Dict[str, List[Dict[str, Any]]] = {}
+    ref_to_skips: Dict[str, List[Dict[str, Any]]] = {}
+
+    for ch in changes:
+        if not isinstance(ch, dict):
+            continue
+        refs = ch.get("audit_point_refs") or []
+        if isinstance(refs, list) and refs:
+            for r in refs:
+                rk = str(r).strip()
+                if rk:
+                    ref_to_changes.setdefault(rk, []).append(ch)
+        else:
+            ref_to_changes.setdefault("__unattributed__", []).append(ch)
+
+    for sk in skipped:
+        if not isinstance(sk, dict):
+            continue
+        op = sk.get("op") if isinstance(sk.get("op"), dict) else {}
+        refs = op.get("audit_point_refs") or []
+        if isinstance(refs, list) and refs:
+            for r in refs:
+                rk = str(r).strip()
+                if rk:
+                    ref_to_skips.setdefault(rk, []).append(sk)
+        else:
+            ref_to_skips.setdefault("__unattributed__", []).append(sk)
+
+    points_out: List[Dict[str, Any]] = []
+    modified_n = 0
+    not_addr_n = 0
+    partial_n = 0
+
+    for pt in immediate_points or []:
+        if not isinstance(pt, dict):
+            continue
+        ref = str(pt.get("audit_point_ref") or "").strip()
+        chs = ref_to_changes.get(ref) or []
+        sks = ref_to_skips.get(ref) or []
+
+        if chs and sks:
+            status = "partial"
+            partial_n += 1
+        elif chs:
+            status = "modified"
+            modified_n += 1
+        else:
+            status = "not_addressed"
+            not_addr_n += 1
+
+        change_details: List[Dict[str, Any]] = []
+        for ch in chs:
+            change_details.append(
+                {
+                    "type": ch.get("type"),
+                    "anchor": str(ch.get("anchor") or "")[:200],
+                    "before": str(ch.get("before") or "")[:2000],
+                    "after": str(ch.get("after") or "")[:2000],
+                    "note": str(ch.get("note") or "")[:500],
+                }
+            )
+
+        skip_reasons: List[str] = []
+        for sk in sks:
+            reason = str(sk.get("reason") or "").strip()
+            if reason:
+                skip_reasons.append(reason)
+
+        not_addressed_reason = ""
+        if not chs:
+            if sks:
+                not_addressed_reason = "；".join(dict.fromkeys(skip_reasons[:8])) or "关联 operation 被跳过"
+            else:
+                not_addressed_reason = (
+                    "模型 PATCH 未生成带本 ref 的可执行 operation，或 operation 未命中文档锚点"
+                )
+
+        points_out.append(
+            {
+                "audit_point_ref": ref,
+                "status": status,
+                "category": pt.get("category"),
+                "location": pt.get("location"),
+                "description": pt.get("description"),
+                "suggestion": pt.get("suggestion"),
+                "changes": change_details,
+                "skip_reasons": skip_reasons,
+                "not_addressed_reason": not_addressed_reason,
+            }
+        )
+
+    unattributed_changes = len(ref_to_changes.get("__unattributed__") or [])
+    unattributed_skips = len(ref_to_skips.get("__unattributed__") or [])
+
+    return {
+        "summary": {
+            "total_immediate_points": len(points_out),
+            "modified": modified_n,
+            "not_addressed": not_addr_n,
+            "partial": partial_n,
+            "unattributed_changes": unattributed_changes,
+            "unattributed_skips": unattributed_skips,
+        },
+        "points": points_out,
+    }
+
+
+def format_audit_point_coverage_markdown(coverage: Dict[str, Any], *, file_name: str = "") -> str:
+    """将 audit_point_coverage 格式化为可读 Markdown（写入 *.audit_modify.log.md）。"""
+    if not isinstance(coverage, dict):
+        return ""
+    sm = coverage.get("summary") or {}
+    lines: List[str] = [
+        "# 审核后修改 — 审核点覆盖日志",
+    ]
+    if file_name:
+        lines.append(f"\n**目标文件**：{file_name}")
+    lines.append(
+        f"\n**汇总**：共 {sm.get('total_immediate_points', 0)} 个立即修改点 · "
+        f"已修改 {sm.get('modified', 0)} · "
+        f"部分 {sm.get('partial', 0)} · "
+        f"未落实 {sm.get('not_addressed', 0)}"
+    )
+    if sm.get("unattributed_changes") or sm.get("unattributed_skips"):
+        lines.append(
+            f"\n（另有 {sm.get('unattributed_changes', 0)} 条变更、"
+            f"{sm.get('unattributed_skips', 0)} 条跳过未绑定 audit_point_ref）"
+        )
+
+    for i, pt in enumerate(coverage.get("points") or [], start=1):
+        if not isinstance(pt, dict):
+            continue
+        ref = pt.get("audit_point_ref") or "?"
+        st = pt.get("status") or "not_addressed"
+        st_zh = {"modified": "已修改", "partial": "部分修改", "not_addressed": "未修改"}.get(
+            str(st), str(st)
+        )
+        lines.append(f"\n## {i}. [{ref}] {st_zh}")
+        if pt.get("category"):
+            lines.append(f"- **类别**：{pt.get('category')}")
+        if pt.get("location"):
+            lines.append(f"- **位置**：{pt.get('location')}")
+        if pt.get("description"):
+            lines.append(f"- **问题**：{pt.get('description')}")
+        if pt.get("suggestion"):
+            lines.append(f"- **建议**：{pt.get('suggestion')}")
+
+        chs = pt.get("changes") or []
+        if chs:
+            lines.append("\n### 已写入的修改")
+            for j, ch in enumerate(chs, start=1):
+                if not isinstance(ch, dict):
+                    continue
+                lines.append(f"\n#### 变更 {j}（{ch.get('type') or 'op'}）")
+                if ch.get("anchor"):
+                    lines.append(f"- 锚点：{ch.get('anchor')}")
+                before = str(ch.get("before") or "").strip()
+                after = str(ch.get("after") or "").strip()
+                if before:
+                    lines.append(f"- **修改前**：\n```\n{before[:1500]}\n```")
+                if after:
+                    lines.append(f"- **修改后**：\n```\n{after[:1500]}\n```")
+                if ch.get("note"):
+                    lines.append(f"- 备注：{ch.get('note')}")
+
+        if st != "modified":
+            reason = pt.get("not_addressed_reason") or ""
+            skips = pt.get("skip_reasons") or []
+            lines.append("\n### 未完全落实原因")
+            if reason:
+                lines.append(f"- {reason}")
+            for sr in skips[:6]:
+                lines.append(f"- 跳过：{sr}")
+
+    return "\n".join(lines).strip() + "\n"

@@ -54,7 +54,7 @@ from src.core.db import (
     list_project_cases,
     save_audit_report,
 )
-from src.core.llm_factory import ClientLlmConfig
+from src.core.llm_factory import ClientLlmConfig, bind_request_client_llm, unbind_request_client_llm
 from src.core.operation_logs_invalidation import invalidate_operation_logs_cache
 
 
@@ -199,6 +199,9 @@ def _run_audit_job(job_id: str) -> None:
             job_id, progress=float(frac), message=str(msg or ""), status="running"
         )
 
+    _cl_token = bind_request_client_llm(
+        client_llm if client_llm and client_llm.has_any() else None
+    )
     try:
         _update_job(job_id, status="running", progress=0.02, message="开始审核…")
         mode = (payload.mode or "single").lower().strip() or "single"
@@ -223,8 +226,6 @@ def _run_audit_job(job_id: str) -> None:
         if client_llm and client_llm.has_any():
             review_ctx["_client_llm"] = {
                 "api_key": client_llm.api_key,
-                "base_url": client_llm.base_url,
-                "model": client_llm.model,
                 "personal_keys_only": bool(client_llm.personal_keys_only),
             }
 
@@ -466,6 +467,9 @@ def _run_audit_job(job_id: str) -> None:
             traceback=traceback.format_exc(),
             client_llm=None,
         )
+
+    finally:
+        unbind_request_client_llm(_cl_token)
 
 
 @router.post("/jobs")
@@ -918,6 +922,12 @@ def prepare_audit_modify_draft_payload(request: Request, body: PrepareAuditModif
     ):
         if str(meta.get(dim_k) or "").strip() and not str(draft_payload.get(dim_k) or "").strip():
             draft_payload[dim_k] = meta.get(dim_k)
+
+    _pts_by_target = imm.get("points_by_target") or {}
+    if isinstance(_pts_by_target, dict) and _pts_by_target:
+        draft_payload["audit_immediate_points_by_target"] = {
+            str(k): v for k, v in _pts_by_target.items() if k in remediation and isinstance(v, list)
+        }
 
     return {
         "ok": True,

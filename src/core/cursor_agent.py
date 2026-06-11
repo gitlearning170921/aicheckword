@@ -157,11 +157,16 @@ def complete_task(
     *,
     client_llm: Optional[Any] = None,
 ) -> str:
-    agent_id = launch_agent(prompt_text, client_llm=client_llm)
-    status = poll_until_finished(agent_id, poll_interval=poll_interval, timeout=timeout, client_llm=client_llm)
+    from src.core.llm_factory import ClientLlmConfig, get_request_client_llm
+
+    cl = client_llm if isinstance(client_llm, ClientLlmConfig) else None
+    if cl is None or not cl.has_any():
+        cl = get_request_client_llm()
+    agent_id = launch_agent(prompt_text, client_llm=cl)
+    status = poll_until_finished(agent_id, poll_interval=poll_interval, timeout=timeout, client_llm=cl)
     if status != "FINISHED":
         raise RuntimeError(f"Cursor Agent 未完成: status={status}, agent_id={agent_id}")
-    reply = get_last_assistant_reply(agent_id, client_llm=client_llm)
+    reply = get_last_assistant_reply(agent_id, client_llm=cl)
     if not reply:
         raise RuntimeError(f"Cursor Agent 未返回对话内容, agent_id={agent_id}")
     return reply

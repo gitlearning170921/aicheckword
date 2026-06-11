@@ -2384,6 +2384,45 @@ class AuditReportPointPatchRequest(BaseModel):
     regulation_ref: Optional[str] = None
     location: Optional[str] = None
     category: Optional[str] = None
+    save_correction: Optional[bool] = None
+    correction_kind: Optional[str] = None
+    feed_to_kb: bool = True
+    false_positive_reason: Optional[str] = None
+    deprecation_note: Optional[str] = None
+    replacement_point: Optional["AuditReportPointReplacementRequest"] = None
+    collection: Optional[str] = None
+
+
+class AuditReportPointReplacementRequest(BaseModel):
+    """弃用时可选插入的替代审核点。"""
+
+    category: Optional[str] = None
+    location: Optional[str] = None
+    description: str = ""
+    regulation_ref: Optional[str] = None
+    suggestion: Optional[str] = None
+    severity: Optional[str] = "low"
+    modify_docs: Optional[List[str]] = None
+    action: Optional[str] = "立即修改"
+
+
+class AuditReportPointCorrectionRequest(BaseModel):
+    """POST 纠正：误报 / 弃用 / 修订，并可写入反馈向量库。"""
+
+    correction_kind: str = "revision"
+    feed_to_kb: bool = True
+    description: Optional[str] = None
+    suggestion: Optional[str] = None
+    action: Optional[str] = None
+    modify_docs: Optional[List[str]] = None
+    severity: Optional[str] = None
+    regulation_ref: Optional[str] = None
+    location: Optional[str] = None
+    category: Optional[str] = None
+    false_positive_reason: Optional[str] = None
+    deprecation_note: Optional[str] = None
+    replacement_point: Optional[AuditReportPointReplacementRequest] = None
+    collection: Optional[str] = None
 
 
 class IntegrationRecordRequest(BaseModel):
@@ -2520,8 +2559,130 @@ def api_get_audit_report(report_id: int):
     return jsonable_encoder(out)
 
 
+_CORRECTION_ONLY_PATCH_KEYS = frozenset(
+    {
+        "save_correction",
+        "correction_kind",
+        "feed_to_kb",
+        "false_positive_reason",
+        "deprecation_note",
+        "replacement_point",
+        "collection",
+        "upload_id",
+    }
+)
+
+
+def _patch_is_correction_request(patch: Dict[str, Any]) -> bool:
+    return bool(patch.get("save_correction")) or bool(
+        str(patch.get("correction_kind") or "").strip()
+    )
+
+
+def _correction_request_from_patch(patch: Dict[str, Any]) -> AuditReportPointCorrectionRequest:
+    fields = set(AuditReportPointCorrectionRequest.model_fields.keys())
+    data = {k: v for k, v in patch.items() if k in fields}
+    if not str(data.get("correction_kind") or "").strip():
+        data["correction_kind"] = "revision"
+    return AuditReportPointCorrectionRequest(**data)
+
+
+def _handle_audit_point_correction(
+    http_req: Request,
+    report_id: int,
+    point_index: int,
+    body: AuditReportPointCorrectionRequest,
+    sub_report_index: int,
+):
+    """纠正审核点（误报/弃用/修订），写入 audit_corrections 并可选入库反馈向量库。"""
+    from src.core.audit_correction import apply_audit_point_correction, persist_audit_point_correction
+    from src.core.audit_report_utils import get_target_report_for_points
+    from src.core.db import get_audit_report_by_id
+
+    kind = (body.correction_kind or "revision").strip().lower()
+    if kind not in ("revision", "false_positive", "deprecated"):
+        raise HTTPException(status_code=400, detail="correction_kind must be revision, false_positive, or deprecated")
+
+    row = get_audit_report_by_id(report_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="report not found")
+    root = row.get("report") or {}
+    target_before = get_target_report_for_points(root, sub_report_index)
+    points_before = target_before.get("audit_points") or []
+    if point_index < 0 or point_index >= len(points_before):
+        raise HTTPException(status_code=404, detail="point index out of range")
+
+    original_snap = dict(points_before[point_index])
+    repl = body.replacement_point.model_dump() if body.replacement_point else None
+
+    try:
+        target, corrected_for_log, inserted = apply_audit_point_correction(
+            root,
+            point_index,
+            correction_kind=kind,
+            sub_report_index=sub_report_index,
+            feed_to_kb=body.feed_to_kb,
+            description=body.description,
+            suggestion=body.suggestion,
+            action=body.action,
+            modify_docs=body.modify_docs,
+            severity=body.severity,
+            regulation_ref=body.regulation_ref,
+            location=body.location,
+            category=body.category,
+            false_positive_reason=body.false_positive_reason,
+            deprecation_note=body.deprecation_note,
+            replacement_point=repl,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    collection = _resolve_request_collection(
+        http_req,
+        (body.collection or row.get("collection") or "").strip() or "regulations",
+    )
+    file_name = (
+        target.get("original_filename")
+        or target.get("file_name")
+        or row.get("file_name")
+        or ""
+    )
+    persist_audit_point_correction(
+        report_id,
+        point_index,
+        collection=collection,
+        file_name=file_name,
+        root_report=root,
+        original_snap=original_snap,
+        corrected_for_log=corrected_for_log,
+        feed_to_kb=body.feed_to_kb,
+    )
+
+    points = target.get("audit_points") or []
+    out_point = points[point_index] if point_index < len(points) else corrected_for_log
+    return jsonable_encoder(
+        {
+            "ok": True,
+            "report_id": report_id,
+            "point_index": point_index,
+            "sub_report_index": sub_report_index,
+            "correction_kind": kind,
+            "fed_to_kb": body.feed_to_kb,
+            "collection": collection,
+            "point": out_point,
+            "inserted_point": inserted,
+            "total_points": target.get("total_points"),
+            "high_count": target.get("high_count"),
+            "medium_count": target.get("medium_count"),
+            "low_count": target.get("low_count"),
+            "info_count": target.get("info_count"),
+        }
+    )
+
+
 @app.patch("/api/reports/{report_id}/points/{point_index}")
 def api_patch_audit_report_point(
+    http_req: Request,
     report_id: int,
     point_index: int,
     body: AuditReportPointPatchRequest,
@@ -2536,6 +2697,18 @@ def api_patch_audit_report_point(
     )
     from src.core.db import get_audit_report_by_id, update_audit_report
 
+    patch = body.model_dump(exclude_unset=True)
+    if not patch:
+        raise HTTPException(status_code=400, detail="no fields to patch")
+    if _patch_is_correction_request(patch):
+        return _handle_audit_point_correction(
+            http_req,
+            report_id,
+            point_index,
+            _correction_request_from_patch(patch),
+            sub_report_index,
+        )
+
     row = get_audit_report_by_id(report_id)
     if not row:
         raise HTTPException(status_code=404, detail="report not found")
@@ -2544,10 +2717,12 @@ def api_patch_audit_report_point(
     points = target.get("audit_points") or []
     if point_index < 0 or point_index >= len(points):
         raise HTTPException(status_code=404, detail="point index out of range")
-    patch = body.model_dump(exclude_unset=True)
-    if not patch:
+    plain_patch = {
+        k: v for k, v in patch.items() if k not in _CORRECTION_ONLY_PATCH_KEYS
+    }
+    if not plain_patch:
         raise HTTPException(status_code=400, detail="no fields to patch")
-    apply_point_field_updates(points[point_index], **patch)
+    apply_point_field_updates(points[point_index], **plain_patch)
     recount_severity(target)
     if root.get("batch") and root.get("reports"):
         aggregate_batch_report_totals(root)
@@ -2565,6 +2740,20 @@ def api_patch_audit_report_point(
             "low_count": target.get("low_count"),
             "info_count": target.get("info_count"),
         }
+    )
+
+
+@app.post("/api/reports/{report_id}/points/{point_index}/correction")
+def api_correct_audit_report_point(
+    http_req: Request,
+    report_id: int,
+    point_index: int,
+    body: AuditReportPointCorrectionRequest,
+    sub_report_index: int = Query(0, ge=0),
+):
+    """纠正审核点（POST 兼容入口；推荐 PATCH + save_correction）。"""
+    return _handle_audit_point_correction(
+        http_req, report_id, point_index, body, sub_report_index
     )
 
 

@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .models import TextBlock, SUPPORTED_EXTENSIONS
-from .parser import _paragraphs_in_hf_container, parse_document
+from .parser import (
+    _paragraphs_in_hf_container,
+    _set_cell_visible_text,
+    _set_paragraph_visible_text,
+    parse_document,
+)
 from .segment import blocks_to_sentences, apply_translations_to_blocks
 from .translator import translate_sentences
 from .correction import correct_text, CorrectionStats, apply_manual_replacements
@@ -64,20 +69,8 @@ def _paragraph_has_drawing(para) -> bool:
 
 
 def _replace_paragraph_text_keep_format(para, new_text: str) -> None:
-    """
-    替换段落文字，尽量保留字体/格式；若段落含图片则只改文字 run，不删图片。
-    """
-    from docx.oxml.ns import qn
-    # 不使用 para.clear()，避免破坏页脚中的 PAGE/NUMPAGES 域、制表位与对齐结构。
-    # 仅改写现有文本 run：首个文本节点写新内容，其余文本节点置空，保留非文本对象（图片/域）与版式。
-    text_runs = [r for r in para.runs if r._element.find(qn("w:drawing")) is None]
-    if text_runs:
-        text_runs[0].text = new_text
-        for r in text_runs[1:]:
-            r.text = ""
-        return
-    if not para.runs:
-        para.add_run(new_text)
+    """保留旧名：revision-aware 写回。"""
+    _set_paragraph_visible_text(para, new_text)
 
 
 def _write_docx(source_path: Path, out_path: Path, blocks: List[TextBlock]) -> None:
@@ -96,17 +89,22 @@ def _write_docx(source_path: Path, out_path: Path, blocks: List[TextBlock]) -> N
     for child in body:
         if isinstance(child, CT_P):
             if block_idx < len(blocks) and blocks[block_idx].block_type == "paragraph":
-                text = blocks[block_idx].translated_text or blocks[block_idx].original_text
                 from docx.text.paragraph import Paragraph
                 para_obj = Paragraph(child, doc)
-                _replace_paragraph_text_keep_format(para_obj, text)
+                _set_paragraph_visible_text(
+                    para_obj,
+                    blocks[block_idx].translated_text or blocks[block_idx].original_text,
+                )
                 block_idx += 1
         elif isinstance(child, CT_Tbl):
             table = Table(child, doc)
             for row in table.rows:
                 for cell in row.cells:
                     if block_idx < len(blocks) and blocks[block_idx].block_type == "table_cell":
-                        cell.text = blocks[block_idx].translated_text or blocks[block_idx].original_text
+                        _set_cell_visible_text(
+                            cell,
+                            blocks[block_idx].translated_text or blocks[block_idx].original_text,
+                        )
                         block_idx += 1
     for section_idx, section in enumerate(doc.sections):
         try:
@@ -117,7 +115,7 @@ def _write_docx(source_path: Path, out_path: Path, blocks: List[TextBlock]) -> N
             header_paras = _paragraphs_in_hf_container(section.header, doc)
             for i, b in enumerate(header_blocks):
                 if i < len(header_paras):
-                    _replace_paragraph_text_keep_format(
+                    _set_paragraph_visible_text(
                         header_paras[i], b.translated_text or b.original_text
                     )
             footer_blocks = sorted(
@@ -127,7 +125,7 @@ def _write_docx(source_path: Path, out_path: Path, blocks: List[TextBlock]) -> N
             footer_paras = _paragraphs_in_hf_container(section.footer, doc)
             for i, b in enumerate(footer_blocks):
                 if i < len(footer_paras):
-                    _replace_paragraph_text_keep_format(
+                    _set_paragraph_visible_text(
                         footer_paras[i], b.translated_text or b.original_text
                     )
         except Exception:
@@ -484,13 +482,40 @@ def correct_file(
 
     if output_path is None:
         base = Path(output_dir) if output_dir else path.parent
-        output_path = base / f"{path.stem}_corrected{path.suffix}"
+        stem_src = path.stem
+        if stem_src.endswith("_corrected"):
+            stem_src = stem_src[: -len("_corrected")]
+        translated_stem = _translate_stem(
+            stem_src,
+            collection_name,
+            use_kb,
+            provider,
+            target_lang=target_lang,
+            kb_query_extra=kb_query_extra,
+            translation_cache=translation_cache,
+            running_glossary=running_glossary,
+        )
+        output_path = base / f"{translated_stem}_corrected{path.suffix}"
     else:
         output_path = Path(output_path)
 
     blocks = parse_document(str(path))
     stats = CorrectionStats(total_blocks=len(blocks))
-    doc_all = "\n".join((b.original_text or "") for b in blocks if getattr(b, "block_type", "") in ("paragraph", "table_cell", "line", "header", "footer"))
+    doc_all = "\n".join(
+        (b.original_text or "")
+        for b in blocks
+        if getattr(b, "block_type", "")
+        in (
+            "paragraph",
+            "table_cell",
+            "line",
+            "header",
+            "footer",
+            "comment",
+            "xlsx_header_footer",
+            "sheet_name",
+        )
+    )
 
     pairs: List[Tuple[str, str]] = []
     if manual_rules:

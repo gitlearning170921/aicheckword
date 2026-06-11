@@ -33,6 +33,74 @@ def parse_document(file_path: str) -> List[TextBlock]:
     raise ValueError(f"未实现解析: {suffix}")
 
 
+def _paragraph_visible_wt_nodes(p_el) -> List:
+    """与 _paragraph_text_as_revised 一致：可见 w:t 节点（不含 w:del / w:moveFrom 内文本）。"""
+    try:
+        from docx.oxml.ns import qn
+
+        nodes: List = []
+        for t in p_el.iter(qn("w:t")):
+            skip = False
+            el = t
+            while el is not None:
+                tag = el.tag
+                if tag in (qn("w:del"), qn("w:moveFrom")):
+                    skip = True
+                    break
+                el = el.getparent()
+            if not skip:
+                nodes.append(t)
+        return nodes
+    except Exception:
+        return []
+
+
+def _set_paragraph_visible_text(para, new_text: str) -> None:
+    """
+    按「接受修订后」视图写回段落：更新全部可见 w:t，并清空 w:del / w:moveFrom 内残留，
+    避免 Track Changes 修订区仍留中文而正文已译英。
+    """
+    try:
+        from docx.oxml.ns import qn
+
+        p = para._element
+        nodes = _paragraph_visible_wt_nodes(p)
+        text = new_text or ""
+        if nodes:
+            nodes[0].text = text
+            for t in nodes[1:]:
+                t.text = ""
+        else:
+            para.add_run(text)
+        for del_el in p.iter(qn("w:del")):
+            for t in del_el.iter(qn("w:t")):
+                t.text = ""
+        for mf in p.iter(qn("w:moveFrom")):
+            for t in mf.iter(qn("w:t")):
+                t.text = ""
+    except Exception:
+        try:
+            para.text = new_text or ""
+        except Exception:
+            pass
+
+
+def _set_cell_visible_text(cell, new_text: str) -> None:
+    """表格单元格 revision-aware 写回（多段落按换行对齐）。"""
+    paras = list(getattr(cell, "paragraphs", None) or [])
+    if not paras:
+        cell.text = new_text or ""
+        return
+    lines = (new_text or "").split("\n")
+    if len(paras) == 1:
+        _set_paragraph_visible_text(paras[0], new_text or "")
+        return
+    for i, para in enumerate(paras):
+        _set_paragraph_visible_text(
+            para, lines[i] if i < len(lines) else ""
+        )
+
+
 def _paragraph_text_as_revised(para) -> str:
     """近似「接受修订后」文本：跳过 w:del / w:moveFrom，保留 w:ins 与普通 run。"""
     try:

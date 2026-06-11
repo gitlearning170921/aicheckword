@@ -35,6 +35,92 @@ def _safe_out_path(*, base_path: str, out_path: Path) -> Path:
     return out_path
 
 
+def _write_audit_coverage_sidecars(
+    *,
+    saved: str,
+    file_name: str,
+    patch_report: Any,
+    out_files_for_log: List[str],
+    downloads: List[str],
+) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """写入 audit_point_coverage.json 与 audit_modify.log.md，返回 (cov_obj, cov_path, log_path)。"""
+    cov_obj = (
+        (patch_report or {}).get("audit_point_coverage")
+        if isinstance(patch_report, dict)
+        else None
+    )
+    cov_path_str = ""
+    log_md_str = ""
+    if not isinstance(cov_obj, dict) or cov_obj.get("points") is None:
+        return cov_obj if isinstance(cov_obj, dict) else None, "", ""
+    try:
+        from src.core.audit_handoff import format_audit_point_coverage_markdown
+
+        cov_path = Path(saved).with_suffix(Path(saved).suffix + ".audit_point_coverage.json")
+        cov_path.write_text(json.dumps(cov_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        log_path = Path(saved).with_suffix(Path(saved).suffix + ".audit_modify.log.md")
+        log_path.write_text(
+            format_audit_point_coverage_markdown(cov_obj, file_name=file_name),
+            encoding="utf-8",
+        )
+        cov_path_str = str(cov_path)
+        log_md_str = str(log_path)
+        out_files_for_log.extend([cov_path_str, log_md_str])
+        downloads.extend([cov_path_str, log_md_str])
+    except Exception:
+        pass
+    return cov_obj, cov_path_str, log_md_str
+
+
+def _patch_summary_entry(
+    *,
+    fn: str,
+    saved: str,
+    base_path: str,
+    base_suffix: str,
+    patch_report: Any,
+    patch_path_str: str,
+    rep_path_str: str,
+    cov_obj: Optional[Dict[str, Any]],
+    cov_path_str: str,
+    log_md_str: str,
+) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "file_name": fn,
+        "out_file": str(saved),
+        "base_file": str(base_path),
+        "suffix": base_suffix,
+        "patch_report_path": rep_path_str,
+        "patch_json_path": patch_path_str,
+        "patch_counts": {
+            "applied": len((patch_report or {}).get("applied") or [])
+            if isinstance(patch_report, dict)
+            else None,
+            "changes": len((patch_report or {}).get("changes") or [])
+            if isinstance(patch_report, dict)
+            else None,
+            "skipped": len((patch_report or {}).get("skipped") or [])
+            if isinstance(patch_report, dict)
+            else None,
+            "errors": len((patch_report or {}).get("errors") or [])
+            if isinstance(patch_report, dict)
+            else None,
+        },
+        "no_change": (
+            isinstance(patch_report, dict)
+            and len((patch_report.get("applied") or [])) == 0
+            and len((patch_report.get("changes") or [])) == 0
+        ),
+    }
+    if cov_path_str:
+        entry["audit_point_coverage_path"] = cov_path_str
+    if log_md_str:
+        entry["audit_modify_log_path"] = log_md_str
+    if isinstance(cov_obj, dict):
+        entry["audit_point_coverage"] = cov_obj
+    return entry
+
+
 def export_draft_job_files(
     *,
     res: GeneratedCaseDocs,
@@ -43,6 +129,7 @@ def export_draft_job_files(
     document_language: str,
     docx_track_changes: bool,
     drafts_subdir: str = "draft_outputs",
+    audit_immediate_points_by_target: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Tuple[List[str], Dict[str, str], List[dict]]:
     """
     返回 (out_files_for_log, out_files_by_target, per_file_patch_summaries)
@@ -62,7 +149,6 @@ def export_draft_job_files(
         downloads: List[str] = []
         patch_path_str = ""
         rep_path_str = ""
-        patch_report_obj = None
 
         base_path = _base_map.get(fn) if isinstance(_base_map, dict) else None
         if not base_path and isinstance(existing_base_files, dict):
@@ -93,6 +179,13 @@ def export_draft_job_files(
                 ),
                 "generated_by": ("aicheckword draft generator" if _is_en_doc else "aicheckword 文档初稿生成"),
             }
+            _imm_pts: List[Dict[str, Any]] = []
+            if isinstance(audit_immediate_points_by_target, dict):
+                raw_pts = audit_immediate_points_by_target.get(fn)
+                if isinstance(raw_pts, list):
+                    _imm_pts = [x for x in raw_pts if isinstance(x, dict)]
+            if _imm_pts:
+                meta["immediate_audit_points"] = _imm_pts
             saved = None
             patch_json = (getattr(res, "generated_patches", {}) or {}).get(fn) if inplace_patch else None
             if inplace_patch and base_suffix == ".docx" and (patch_json or "").strip():
@@ -103,7 +196,6 @@ def export_draft_job_files(
                     meta=meta,
                     track_changes=bool(docx_track_changes),
                 )
-                patch_report_obj = patch_report
                 patch_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.json")
                 patch_path.write_text(patch_json, encoding="utf-8")
                 rep_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.report.json")
@@ -112,35 +204,27 @@ def export_draft_job_files(
                 rep_path_str = str(rep_path)
                 out_files_for_log.extend([str(patch_path), str(rep_path)])
                 downloads.extend([saved, str(patch_path), str(rep_path)])
+                cov_obj, cov_path_str, log_md_str = _write_audit_coverage_sidecars(
+                    saved=str(saved),
+                    file_name=fn,
+                    patch_report=patch_report,
+                    out_files_for_log=out_files_for_log,
+                    downloads=downloads,
+                )
                 try:
                     per_file_patch_summaries.append(
-                        {
-                            "file_name": fn,
-                            "out_file": str(saved),
-                            "base_file": str(base_path),
-                            "suffix": base_suffix,
-                            "patch_report_path": rep_path_str,
-                            "patch_json_path": patch_path_str,
-                            "patch_counts": {
-                                "applied": len((patch_report or {}).get("applied") or [])
-                                if isinstance(patch_report, dict)
-                                else None,
-                                "changes": len((patch_report or {}).get("changes") or [])
-                                if isinstance(patch_report, dict)
-                                else None,
-                                "skipped": len((patch_report or {}).get("skipped") or [])
-                                if isinstance(patch_report, dict)
-                                else None,
-                                "errors": len((patch_report or {}).get("errors") or [])
-                                if isinstance(patch_report, dict)
-                                else None,
-                            },
-                            "no_change": (
-                                isinstance(patch_report, dict)
-                                and len((patch_report.get("applied") or [])) == 0
-                                and len((patch_report.get("changes") or [])) == 0
-                            ),
-                        }
+                        _patch_summary_entry(
+                            fn=fn,
+                            saved=str(saved),
+                            base_path=str(base_path),
+                            base_suffix=base_suffix,
+                            patch_report=patch_report,
+                            patch_path_str=patch_path_str,
+                            rep_path_str=rep_path_str,
+                            cov_obj=cov_obj if isinstance(cov_obj, dict) else None,
+                            cov_path_str=cov_path_str,
+                            log_md_str=log_md_str,
+                        )
                     )
                 except Exception:
                     pass
@@ -151,7 +235,6 @@ def export_draft_job_files(
                     patch_json=patch_json,
                     meta=meta,
                 )
-                patch_report_obj = patch_report
                 patch_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.json")
                 patch_path.write_text(patch_json, encoding="utf-8")
                 rep_path = Path(saved).with_suffix(Path(saved).suffix + ".patch.report.json")
@@ -160,40 +243,31 @@ def export_draft_job_files(
                 rep_path_str = str(rep_path)
                 out_files_for_log.extend([str(patch_path), str(rep_path)])
                 downloads.extend([saved, str(patch_path), str(rep_path)])
+                cov_obj, cov_path_str, log_md_str = _write_audit_coverage_sidecars(
+                    saved=str(saved),
+                    file_name=fn,
+                    patch_report=patch_report,
+                    out_files_for_log=out_files_for_log,
+                    downloads=downloads,
+                )
                 try:
                     per_file_patch_summaries.append(
-                        {
-                            "file_name": fn,
-                            "out_file": str(saved),
-                            "base_file": str(base_path),
-                            "suffix": base_suffix,
-                            "patch_report_path": rep_path_str,
-                            "patch_json_path": patch_path_str,
-                            "patch_counts": {
-                                "applied": len((patch_report or {}).get("applied") or [])
-                                if isinstance(patch_report, dict)
-                                else None,
-                                "changes": len((patch_report or {}).get("changes") or [])
-                                if isinstance(patch_report, dict)
-                                else None,
-                                "skipped": len((patch_report or {}).get("skipped") or [])
-                                if isinstance(patch_report, dict)
-                                else None,
-                                "errors": len((patch_report or {}).get("errors") or [])
-                                if isinstance(patch_report, dict)
-                                else None,
-                            },
-                            "no_change": (
-                                isinstance(patch_report, dict)
-                                and len((patch_report.get("applied") or [])) == 0
-                                and len((patch_report.get("changes") or [])) == 0
-                            ),
-                        }
+                        _patch_summary_entry(
+                            fn=fn,
+                            saved=str(saved),
+                            base_path=str(base_path),
+                            base_suffix=base_suffix,
+                            patch_report=patch_report,
+                            patch_path_str=patch_path_str,
+                            rep_path_str=rep_path_str,
+                            cov_obj=cov_obj if isinstance(cov_obj, dict) else None,
+                            cov_path_str=cov_path_str,
+                            log_md_str=log_md_str,
+                        )
                     )
                 except Exception:
                     pass
             else:
-                # 无 PATCH_JSON 时勿把 UPDATED_TEXT 整段追加进 docx（会破坏表格/版式）
                 saved = export_like_base(
                     base_file_path=base_path,
                     out_path=str(out_path),

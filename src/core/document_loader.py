@@ -1114,6 +1114,164 @@ def _build_docx_tables_plaintext(docx_path: Path, max_total_chars: int = 450_000
     return full
 
 
+def _docx_paragraphs_in_hf_container(container, doc) -> list:
+    """页眉/页脚容器内全部段落（含表格内嵌段落），顺序与 OOXML 一致。"""
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph
+
+    out = []
+    if container is None:
+        return out
+    try:
+        root = container._element
+    except Exception:
+        return out
+    for p_el in root.iter(qn("w:p")):
+        try:
+            out.append(Paragraph(p_el, doc))
+        except Exception:
+            pass
+    return out
+
+
+def _iter_docx_header_footer_containers(doc):
+    """遍历各节页眉/页脚（含首页不同页眉脚）。"""
+    for si, sec in enumerate(doc.sections):
+        for label, attr in (
+            (f"第{si + 1}节页眉", "header"),
+            (f"第{si + 1}节页脚", "footer"),
+        ):
+            try:
+                part = getattr(sec, attr, None)
+            except Exception:
+                part = None
+            if part is not None:
+                yield label, part
+        if getattr(sec, "different_first_page_header_footer", False):
+            for label, attr in (
+                (f"第{si + 1}节首页页眉", "first_page_header"),
+                (f"第{si + 1}节首页页脚", "first_page_footer"),
+            ):
+                try:
+                    part = getattr(sec, attr, None)
+                except Exception:
+                    part = None
+                if part is not None:
+                    yield label, part
+
+
+def _build_docx_headers_footers_plaintext(docx_path: Path, max_total_chars: int = 80_000) -> str:
+    """
+    提取 .docx 各节页眉/页脚段落文字（含首页页眉脚、表格内段落）。
+    Docx2txtLoader 通常不含页眉页脚，受控编号常在此丢失。
+    """
+    docx_path = Path(docx_path)
+    if not docx_path.is_file() or docx_path.suffix.lower() != ".docx":
+        return ""
+    try:
+        from docx import Document as DocxDocument
+    except Exception:
+        return ""
+    try:
+        doc = DocxDocument(str(docx_path))
+    except Exception:
+        return ""
+
+    seen_p_ids = set()
+    lines: List[str] = []
+    for label, container in _iter_docx_header_footer_containers(doc):
+        for para in _docx_paragraphs_in_hf_container(container, doc):
+            try:
+                pid = id(para._p)
+            except Exception:
+                pid = id(para)
+            if pid in seen_p_ids:
+                continue
+            seen_p_ids.add(pid)
+            t = _docx_paragraph_ooxml_text(para)
+            if not t:
+                continue
+            lines.append(f"【{label}】{t}")
+
+    if not lines:
+        return ""
+    intro = (
+        "【Word 页眉页脚摘录（python-docx；受控编号/版本号常在此，与正文一并参与审核检索）】\n"
+    )
+    body = "\n".join(lines)
+    full = intro + body
+    if len(full) > max_total_chars:
+        full = (
+            full[: max_total_chars - 80].rstrip()
+            + "\n……（页眉页脚摘录已达上限，后续已省略）……"
+        )
+    return full
+
+
+def _build_docx_textbox_plaintext(docx_path: Path, max_total_chars: int = 40_000) -> str:
+    """从 document/header/footer 等 XML 中提取文本框（w:txbxContent）内文字，覆盖封面文本框编号。"""
+    import xml.etree.ElementTree as ET
+
+    docx_path = Path(docx_path)
+    if not docx_path.is_file() or docx_path.suffix.lower() != ".docx":
+        return ""
+    w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    w = "{%s}" % w_ns
+    seen: set = set()
+    chunks: List[str] = []
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zf:
+            names = [
+                n
+                for n in zf.namelist()
+                if n.startswith("word/") and n.endswith(".xml")
+                and any(k in n for k in ("document", "header", "footer", "footnotes", "endnotes"))
+            ]
+            for name in names:
+                try:
+                    root = ET.fromstring(zf.read(name))
+                except Exception:
+                    continue
+                for txbx in root.iter(w + "txbxContent"):
+                    parts: List[str] = []
+                    for t_el in txbx.iter(w + "t"):
+                        if t_el.text:
+                            parts.append(t_el.text)
+                    text = "".join(parts).strip()
+                    text = " ".join(text.split())
+                    if not text or text in seen:
+                        continue
+                    seen.add(text)
+                    chunks.append(text)
+    except Exception:
+        return ""
+
+    if not chunks:
+        return ""
+    intro = "【Word 文本框摘录（封面/浮动文本框内受控编号等）】\n"
+    body = "\n".join(chunks)
+    full = intro + body
+    if len(full) > max_total_chars:
+        full = full[: max_total_chars - 60].rstrip() + "\n……（文本框摘录已达上限）……"
+    return full
+
+
+def _append_docx_headers_footers_plaintext(docs: List[Document], docx_path: Path) -> None:
+    """将页眉页脚与文本框摘录拼入首个 Document。"""
+    if not docs:
+        return
+    blocks = [
+        _build_docx_headers_footers_plaintext(docx_path),
+        _build_docx_textbox_plaintext(docx_path),
+    ]
+    extra = "\n\n".join(b.strip() for b in blocks if (b or "").strip())
+    if not extra:
+        return
+    first = docs[0]
+    base = (first.page_content or "").rstrip()
+    first.page_content = f"{base}\n\n{extra}"
+
+
 def _append_docx_tables_plaintext(docs: List[Document], docx_path: Path) -> None:
     """将结构化表格文本拼入首个 Document（与签批补充相同策略）。"""
     if not docs:
@@ -1451,6 +1609,10 @@ def load_single_file(file_path, *, force_ocr_refresh: bool = False, ocr_cache_fi
                     except Exception:
                         pass
                     try:
+                        _append_docx_headers_footers_plaintext(docs, Path(docx_path))
+                    except Exception:
+                        pass
+                    try:
                         _apply_revision_collision_normalize_to_docs(docs)
                     except Exception:
                         pass
@@ -1487,6 +1649,10 @@ def load_single_file(file_path, *, force_ocr_refresh: bool = False, ocr_cache_fi
                 pass
             try:
                 _append_docx_tables_plaintext(docs, path)
+            except Exception:
+                pass
+            try:
+                _append_docx_headers_footers_plaintext(docs, path)
             except Exception:
                 pass
             try:
