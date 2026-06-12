@@ -65,6 +65,7 @@ from src.core.db import (
     list_projects,
     list_project_cases,
     list_companies,
+    create_project,
     create_project_case,
     get_project_case,
     upsert_company_mapping,
@@ -389,6 +390,25 @@ class CompanySyncRequest(BaseModel):
 
 class CollectionRequest(BaseModel):
     collection: str = "regulations"
+
+
+class IntegrationCreateProjectBody(BaseModel):
+    """创建 aicheckword 专属项目（与 Streamlit「项目与专属资料」新建表单一致）。"""
+
+    collection: str = "regulations"
+    name: str = Field(..., description="项目名称")
+    registration_country: str = Field(..., description="注册国家")
+    registration_type: str = Field(..., description="注册类别")
+    registration_component: str = Field(..., description="注册组成")
+    project_form: str = Field(..., description="项目形态")
+    scope_of_application: str = ""
+    product_name: str = ""
+    name_en: str = ""
+    product_name_en: str = ""
+    registration_country_en: str = ""
+    model: str = ""
+    model_en: str = ""
+    project_code: str = ""
 
 
 class ChatReplyOptions(BaseModel):
@@ -2937,6 +2957,54 @@ def integration_list_projects(collection: str = "regulations"):
             for p in projects
         ]
     }
+
+
+@app.post("/api/integration/projects")
+def integration_create_project(request: Request, body: IntegrationCreateProjectBody):
+    """在 aicheckword 创建专属项目（供 aiword 初稿页从页面1 项目映射后写入）。"""
+    from src.core.db import create_project
+
+    collection = _resolve_request_collection(request, body.collection or "regulations")
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="项目名称不能为空")
+    reg_country = (body.registration_country or "").strip()
+    reg_type = (body.registration_type or "").strip()
+    reg_comp = (body.registration_component or "").strip()
+    proj_form = (body.project_form or "").strip()
+    if not reg_country or not reg_type or not reg_comp or not proj_form:
+        raise HTTPException(status_code=400, detail="注册国家/类别/组成/项目形态均为必填")
+    if reg_type not in REGISTRATION_TYPES:
+        raise HTTPException(status_code=400, detail=f"注册类别无效，允许：{', '.join(REGISTRATION_TYPES)}")
+    if reg_comp not in REGISTRATION_COMPONENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"注册组成无效，允许：{', '.join(REGISTRATION_COMPONENTS)}",
+        )
+    dims = get_dimension_options() or {}
+    forms = list(dims.get("project_forms") or ["Web", "APP", "PC"])
+    if proj_form not in forms:
+        raise HTTPException(status_code=400, detail=f"项目形态无效，允许：{', '.join(forms)}")
+    countries = list(dims.get("registration_countries") or ["中国", "美国", "欧盟"])
+    if reg_country not in countries:
+        raise HTTPException(status_code=400, detail=f"注册国家无效，允许：{', '.join(countries)}")
+    pid = create_project(
+        collection,
+        name,
+        reg_country,
+        reg_type,
+        reg_comp,
+        proj_form,
+        scope_of_application=(body.scope_of_application or "").strip(),
+        product_name=(body.product_name or "").strip(),
+        name_en=(body.name_en or "").strip(),
+        product_name_en=(body.product_name_en or "").strip(),
+        registration_country_en=(body.registration_country_en or "").strip(),
+        model=(body.model or "").strip(),
+        model_en=(body.model_en or "").strip(),
+        project_code=(body.project_code or "").strip(),
+    )
+    return {"ok": True, "projectId": int(pid), "id": int(pid)}
 
 
 @app.post("/api/integration/record-review")

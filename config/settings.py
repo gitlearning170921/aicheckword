@@ -1,10 +1,40 @@
 """配置包：应用与 AI 服务配置"""
 import json
+import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 from urllib.parse import urlparse
 
 from pydantic_settings import BaseSettings
+
+
+def _resolve_dotenv_paths() -> Tuple[str, ...]:
+    """测试环境可通过 AICHECKWORD_DOTENV_PATH=.env.test 指定配置文件。"""
+    custom = (os.environ.get("AICHECKWORD_DOTENV_PATH") or "").strip()
+    if custom:
+        p = Path(custom)
+        if not p.is_absolute():
+            p = Path(__file__).resolve().parent.parent / custom
+        return (str(p),)
+    return (".env", ".env.txt")
+
+
+def _bootstrap_dotenv_from_env() -> None:
+    """在 Settings() 之前加载自定义 dotenv，保证子进程环境一致。"""
+    for rel in _resolve_dotenv_paths():
+        p = Path(rel)
+        if not p.is_file():
+            continue
+        try:
+            from dotenv import load_dotenv
+
+            load_dotenv(p, override=False)
+        except ImportError:
+            pass
+        break
+
+
+_bootstrap_dotenv_from_env()
 
 
 class Settings(BaseSettings):
@@ -141,8 +171,11 @@ class Settings(BaseSettings):
     kdocs_app_id: str = ""
     kdocs_app_key: str = ""
 
-    # 兼容历史部署：优先读取 .env；若只有 .env.txt 也可自动加载
-    model_config = {"env_file": (".env", ".env.txt"), "env_file_encoding": "utf-8"}
+    # 兼容历史部署：优先读取 .env；测试环境用 AICHECKWORD_DOTENV_PATH 指向 .env.test
+    model_config = {
+        "env_file": _resolve_dotenv_paths(),
+        "env_file_encoding": "utf-8",
+    }
 
     @property
     def is_ollama(self) -> bool:
