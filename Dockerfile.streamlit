@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # aicheckword Streamlit 运维 UI（按需；基于 API 镜像叠加 UI 栈）
 ARG AICHECKWORD_BASE_TAG=local
 FROM aicheckword:${AICHECKWORD_BASE_TAG}

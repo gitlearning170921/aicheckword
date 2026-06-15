@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # aicheckword FastAPI 集成服务（单 worker；初稿/审核 job 在进程内存）
 FROM python:3.11-slim-bookworm AS builder
 
