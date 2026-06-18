@@ -130,6 +130,8 @@ def export_draft_job_files(
     docx_track_changes: bool,
     drafts_subdir: str = "draft_outputs",
     audit_immediate_points_by_target: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    collection: str = "",
+    base_case_id: Optional[int] = None,
 ) -> Tuple[List[str], Dict[str, str], List[dict]]:
     """
     返回 (out_files_for_log, out_files_by_target, per_file_patch_summaries)
@@ -153,6 +155,17 @@ def export_draft_job_files(
         base_path = _base_map.get(fn) if isinstance(_base_map, dict) else None
         if not base_path and isinstance(existing_base_files, dict):
             base_path = existing_base_files.get(fn)
+        if not base_path and int(base_case_id or 0) > 0:
+            try:
+                from src.core.case_template_files import resolve_case_template_file_path
+
+                base_path = resolve_case_template_file_path(
+                    collection=collection,
+                    case_id=int(base_case_id),
+                    file_name=fn,
+                )
+            except Exception:
+                base_path = None
         if base_path:
             base_suffix = sniff_word_processing_suffix(base_path).lower()
             out_name = fn

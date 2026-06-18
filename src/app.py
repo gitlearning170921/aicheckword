@@ -2108,6 +2108,18 @@ def render_step1_page():
                             update_knowledge_docs_case_id(agent.collection_name, display_name, train_case_id)
                         except Exception:
                             pass
+                    if category == "project_case" and train_case_id is not None:
+                        try:
+                            from src.core.case_template_files import persist_case_template_file
+
+                            persist_case_template_file(
+                                source_path=str(path),
+                                collection=agent.collection_name,
+                                case_id=int(train_case_id),
+                                file_name=display_name,
+                            )
+                        except Exception:
+                            pass
                 else:
                     st.session_state["train_queue_fail"] = st.session_state.get("train_queue_fail", 0) + 1
             except Exception as e:

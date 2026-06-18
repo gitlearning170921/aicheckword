@@ -457,6 +457,8 @@ def _run_draft_job(job_id: str) -> None:
             document_language=payload.document_language,
             docx_track_changes=payload.docx_track_changes,
             audit_immediate_points_by_target=payload.audit_immediate_points_by_target,
+            collection=payload.collection,
+            base_case_id=int(payload.base_case_id or 0) or None,
         )
         zip_path = Path(spec["job_dir"]) / "artifacts.zip"
         summary_path = Path(spec["job_dir"]) / "draft_artifacts_summary.json"
@@ -988,6 +990,18 @@ async def draft_create_job(
             )
         base_paths_map[tg] = pth
 
+    if int(body.base_case_id or 0) > 0:
+        from src.core.case_template_files import enrich_base_paths_from_case_templates
+
+        enrich_base_paths_from_case_templates(
+            collection=body.collection,
+            base_case_id=int(body.base_case_id),
+            template_file_names=body.template_file_names,
+            base_paths_map=base_paths_map,
+            base_name_to_path=base_name_to_path,
+            dest_dir=base_dir,
+        )
+
     with _jobs_lock:
         _jobs[job_id] = {
             "status": "queued",
@@ -1031,10 +1045,11 @@ def draft_job_download(job_id: str):
         j = _jobs.get(job_id)
     if not j:
         raise HTTPException(status_code=404, detail="job not found")
-    if j.get("status") != "succeeded":
-        raise HTTPException(status_code=400, detail="job not completed")
     res = j.get("result") or {}
     zp = (res.get("zip_path") or "").strip()
+    if j.get("status") != "succeeded":
+        if not (zp and Path(zp).is_file()):
+            raise HTTPException(status_code=400, detail="job not completed")
     if not zp or not Path(zp).is_file():
         raise HTTPException(status_code=404, detail="zip not found")
     return FileResponse(zp, filename=f"draft_{job_id}.zip", media_type="application/zip")

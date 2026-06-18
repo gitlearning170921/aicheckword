@@ -2063,6 +2063,20 @@ class DocumentDraftGenerator:
                 _base_path = (rte.get("base_path") or "").strip()
                 if not _base_path and existing_base_files and template_file_name in existing_base_files:
                     _base_path = (existing_base_files.get(template_file_name) or "").strip()
+                if not _base_path and int(base_case_id or 0) > 0:
+                    try:
+                        from src.core.case_template_files import resolve_case_template_file_path
+
+                        _base_path = (
+                            resolve_case_template_file_path(
+                                collection=self.collection,
+                                case_id=int(base_case_id),
+                                file_name=template_file_name,
+                            )
+                            or ""
+                        ).strip()
+                    except Exception:
+                        _base_path = ""
                 existing_text = ""
                 if _base_path:
                     try:
