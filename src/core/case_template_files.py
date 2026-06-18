@@ -85,6 +85,50 @@ def resolve_case_template_file_path(
     return None
 
 
+def template_has_disk_base(
+    *,
+    collection: str,
+    case_id: int,
+    file_name: str,
+) -> bool:
+    """案例模板目录或 training_docs 中是否存在与模板同名的原件。"""
+    return bool(
+        resolve_case_template_file_path(
+            collection=collection,
+            case_id=int(case_id),
+            file_name=file_name,
+        )
+    )
+
+
+def templates_missing_resolved_base(
+    *,
+    template_file_names: Optional[List[str]],
+    base_paths_map: Dict[str, str],
+) -> List[str]:
+    """上传绑定 + 磁盘补全后仍无基底路径的模板文件名。"""
+    missing: List[str] = []
+    for tf in template_file_names or []:
+        name = (tf or "").strip()
+        if not name:
+            continue
+        pth = (base_paths_map.get(name) or "").strip()
+        if pth:
+            continue
+        missing.append(name)
+    return missing
+
+
+def format_missing_disk_base_error(missing: List[str]) -> str:
+    preview = "、".join(missing[:8])
+    suffix = f" 等共 {len(missing)} 个" if len(missing) > 8 else ""
+    return (
+        f"以下目标在服务器上未找到案例/训练目录中的模板原件，且未上传 Base：{preview}{suffix}。"
+        "请上传与模板目标名一致的 Base 文件（docx/xlsx 等）。"
+        "知识库（Chroma）中的训练文本仅用于检索参考，不能替代 Word/Excel 基底。"
+    )
+
+
 def enrich_base_paths_from_case_templates(
     *,
     collection: str,
@@ -94,7 +138,10 @@ def enrich_base_paths_from_case_templates(
     base_name_to_path: Dict[str, str],
     dest_dir: Optional[Path] = None,
 ) -> None:
-    """未上传 Base 时，用案例库模板原件补全 base_paths_map（格式与模板一致）。"""
+    """未上传 Base 时，用案例库模板原件补全 base_paths_map（格式与模板一致）。
+
+    仅搜索磁盘：uploads/case_templates 与 training_docs；不读取 Chroma 向量库。
+    """
     cid = int(base_case_id or 0)
     if cid <= 0:
         return

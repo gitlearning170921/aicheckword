@@ -2077,6 +2077,12 @@ class DocumentDraftGenerator:
                         ).strip()
                     except Exception:
                         _base_path = ""
+                if inplace_patch and not _base_path:
+                    from src.core.case_template_files import format_missing_disk_base_error
+
+                    raise RuntimeError(
+                        format_missing_disk_base_error([template_file_name])
+                    )
                 existing_text = ""
                 if _base_path:
                     try:

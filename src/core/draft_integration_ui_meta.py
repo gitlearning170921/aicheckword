@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from src.core.db import get_project, get_project_case_file_names, list_project_cases, list_projects
+from src.core.case_template_files import template_has_disk_base
 from src.core.integration_ui_meta import project_row_for_integration
 
 DOC_LANG_VALUE_TO_LABEL: Dict[str, str] = {
@@ -455,7 +456,19 @@ def build_draft_page_bootstrap(
         )
 
     template_rows = [
-        {"id": str(name or "").strip(), "label": str(name or "").strip()}
+        {
+            "id": str(name or "").strip(),
+            "label": str(name or "").strip(),
+            "diskBaseAvailable": (
+                template_has_disk_base(
+                    collection=coll,
+                    case_id=bcid,
+                    file_name=str(name or "").strip(),
+                )
+                if bcid > 0 and str(name or "").strip()
+                else False
+            ),
+        }
         for name in templates_raw
         if str(name or "").strip()
     ]

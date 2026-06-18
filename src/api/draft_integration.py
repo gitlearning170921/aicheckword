@@ -43,6 +43,12 @@ from src.core.db import (
     list_projects,
 )
 from src.core.document_draft_generator import DocumentDraftGenerator
+from src.core.case_template_files import (
+    enrich_base_paths_from_case_templates,
+    format_missing_disk_base_error,
+    template_has_disk_base,
+    templates_missing_resolved_base,
+)
 from src.core.document_loader import SUPPORTED_DOC_EXTENSIONS, extract_archive, is_archive
 from src.core.draft_job_artifacts import export_draft_job_files
 from src.core.llm_factory import (
@@ -208,6 +214,17 @@ def _safe_upload_name(name: Optional[str]) -> str:
     if not p or p in (".", ".."):
         return "unnamed.bin"
     return p
+
+
+def _draft_integration_target_templates(body: DraftGeneratePayload) -> List[str]:
+    """提交时用于校验 Base 覆盖的目标模板列表（与 generate 内 chosen 默认一致）。"""
+    explicit = [x for x in (body.template_file_names or []) if (x or "").strip()]
+    if explicit:
+        return explicit
+    cid = int(body.base_case_id or 0)
+    if cid > 0:
+        return list(get_project_case_file_names(body.collection, cid) or [])
+    return []
 
 
 def _integration_match_upload_key_for_template(
@@ -991,8 +1008,6 @@ async def draft_create_job(
         base_paths_map[tg] = pth
 
     if int(body.base_case_id or 0) > 0:
-        from src.core.case_template_files import enrich_base_paths_from_case_templates
-
         enrich_base_paths_from_case_templates(
             collection=body.collection,
             base_case_id=int(body.base_case_id),
@@ -1001,6 +1016,19 @@ async def draft_create_job(
             base_name_to_path=base_name_to_path,
             dest_dir=base_dir,
         )
+
+    if body.inplace_patch:
+        target_names = _draft_integration_target_templates(body)
+        missing_base = templates_missing_resolved_base(
+            template_file_names=target_names,
+            base_paths_map=base_paths_map,
+        )
+        if missing_base and not base_name_to_path:
+            shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(
+                status_code=400,
+                detail=format_missing_disk_base_error(missing_base),
+            )
 
     with _jobs_lock:
         _jobs[job_id] = {
