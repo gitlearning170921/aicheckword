@@ -12,6 +12,12 @@ ENV/
 knowledge_store/
 uploads/
 training_docs/
+# 迁移用压缩包（勿打进镜像，否则 layer 巨大且 load 时占满磁盘）
+uploads.tar.gz
+training_docs.tar.gz
+knowledge_store.tar.gz
+*.tar.gz
+*.tar
 docs/
 tests/
 scripts/

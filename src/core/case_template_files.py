@@ -70,7 +70,7 @@ def resolve_case_template_file_path(
         candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return str(candidates[0].resolve())
 
-    td = settings.training_docs_path
+    td = settings.training_path
     if td.is_dir():
         hits: List[Path] = []
         for p in td.rglob("*"):

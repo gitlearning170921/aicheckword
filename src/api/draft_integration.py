@@ -331,6 +331,56 @@ def _update_job(job_id: str, **kwargs: Any) -> None:
         j.update(kwargs)
 
 
+def _draft_job_zip_on_disk(job_id: str) -> Optional[str]:
+    """容器重启后内存 job 丢失时，仍可从 uploads 卷读取 artifacts.zip。"""
+    jid = (job_id or "").strip()
+    if not jid:
+        return None
+    zp = settings.uploads_path / "draft_api_jobs" / jid / "artifacts.zip"
+    try:
+        if zp.is_file() and zp.stat().st_size > 0:
+            return str(zp.resolve())
+    except OSError:
+        pass
+    return None
+
+
+def _resolve_draft_job_view(job_id: str) -> Optional[Dict[str, Any]]:
+    """内存 job 优先；否则磁盘 zip 存在则视为 succeeded（供 status/download）。"""
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        if j:
+            return dict(j)
+    zp = _draft_job_zip_on_disk(job_id)
+    if not zp:
+        return None
+    summary_path = settings.uploads_path / "draft_api_jobs" / job_id / "draft_artifacts_summary.json"
+    result: Dict[str, Any] = {"zip_path": zp}
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(summary, dict):
+                for k in (
+                    "project_id",
+                    "project_case_id",
+                    "generated_file_names",
+                    "docx_unchanged",
+                    "patch_skip_reason_histogram",
+                    "audit_point_coverage_by_target",
+                ):
+                    if k in summary:
+                        result[k] = summary.get(k)
+        except Exception:
+            pass
+    return {
+        "status": "succeeded",
+        "progress": 1.0,
+        "message": "完成（从磁盘恢复）",
+        "error": "",
+        "result": result,
+    }
+
+
 def _patch_skip_reason_histogram(summaries: List[dict]) -> Dict[str, int]:
     """从 *.patch.report.json 汇总跳过原因，便于判断「有 AI 输出但 Word 未改」。"""
     hist: Dict[str, int] = {}
@@ -1052,8 +1102,7 @@ async def draft_create_job(
 
 @router.get("/jobs/{job_id}")
 def draft_job_status(job_id: str):
-    with _jobs_lock:
-        j = _jobs.get(job_id)
+    j = _resolve_draft_job_view(job_id)
     if not j:
         raise HTTPException(status_code=404, detail="job not found")
     return {
@@ -1069,8 +1118,7 @@ def draft_job_status(job_id: str):
 
 @router.get("/jobs/{job_id}/download")
 def draft_job_download(job_id: str):
-    with _jobs_lock:
-        j = _jobs.get(job_id)
+    j = _resolve_draft_job_view(job_id)
     if not j:
         raise HTTPException(status_code=404, detail="job not found")
     res = j.get("result") or {}
@@ -1078,6 +1126,8 @@ def draft_job_download(job_id: str):
     if j.get("status") != "succeeded":
         if not (zp and Path(zp).is_file()):
             raise HTTPException(status_code=400, detail="job not completed")
+    if not zp or not Path(zp).is_file():
+        zp = _draft_job_zip_on_disk(job_id) or ""
     if not zp or not Path(zp).is_file():
         raise HTTPException(status_code=404, detail="zip not found")
     return FileResponse(zp, filename=f"draft_{job_id}.zip", media_type="application/zip")
