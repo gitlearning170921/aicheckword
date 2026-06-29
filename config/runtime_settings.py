@@ -21,6 +21,7 @@ _API_KEY_FIELD_NAMES = frozenset(
         "google_api_key",
         "deepseek_api_key",
         "lingyi_api_key",
+        "claude_api_key",
         "qianfan_ak",
         "qianfan_sk",
         "cursor_api_key",
@@ -30,6 +31,7 @@ _API_KEY_FIELD_NAMES = frozenset(
 _EXTRA_ENV_NAMES: Dict[str, Tuple[str, ...]] = {
     "gemini_api_key": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     "google_api_key": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+    "claude_api_key": ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY"),
 }
 
 # 库内 JSON 存了空串时，勿覆盖进程已从 .env 读入的非空可选配置（与 _API_KEY_FIELD_NAMES 同理）

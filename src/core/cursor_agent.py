@@ -83,7 +83,18 @@ def launch_agent(prompt_text: str, *, client_llm: Optional[Any] = None) -> str:
         "target": {"autoCreatePr": False},
     }
     with _http_client(timeout=90) as client:
-        r = client.post(url, json=payload, headers=_get_headers(p["api_key"]))
+        try:
+            r = client.post(url, json=payload, headers=_get_headers(p["api_key"]))
+        except (httpx.ConnectError, httpx.ReadError, OSError) as e:
+            el = str(e).lower()
+            if "10054" in str(e) or "connection" in el or "reset" in el or "eof" in el or "ssl" in el:
+                raise RuntimeError(
+                    f"无法连接 Cursor API（{_base_url(p['base_url'])}）：{e}。"
+                    "请检查：1) 本机/代理能否访问 api.cursor.com；"
+                    "2) 侧栏「不使用系统代理」是否与 Clash 规则匹配（Cursor 需走代理时可取消勾选）；"
+                    "3) 证书异常时可试「不校验 SSL」。"
+                ) from e
+            raise
         _raise_for_status_with_body(r, "launch_agent")
         data = r.json()
     return data["id"]

@@ -552,6 +552,8 @@ def _provider_ready() -> bool:
         return bool(settings.dashscope_api_key)
     if p == "baidu":
         return bool(settings.qianfan_ak and settings.qianfan_sk)
+    if p == "claude":
+        return bool(settings.claude_api_key)
     return bool(settings.openai_api_key)
 
 
@@ -572,6 +574,8 @@ def _require_provider() -> bool:
         st.warning("⚠️ 文心模式下请配置 QIANFAN_AK 与 QIANFAN_SK。")
     elif p in ("deepseek", "lingyi"):
         st.warning("⚠️ 请填写 API Key；DeepSeek / 零一为 OpenAI 兼容接口，可同时填写 Base URL。")
+    elif p == "claude":
+        st.warning("⚠️ Claude 模式下请配置 ANTHROPIC_API_KEY 或侧栏 Claude API Key；向量化仍使用 Ollama。")
     else:
         st.warning("⚠️ 请先在左侧边栏填写 OpenAI API Key 或选择其他已配置的提供方。")
     return False
@@ -595,6 +599,7 @@ def _default_llm_for_provider(p: str) -> str:
         "gemini": "gemini-1.5-flash",
         "tongyi": "qwen-plus",
         "baidu": "ERNIE-Bot-4",
+        "claude": "claude-sonnet-4-20250514",
         "cursor": "gpt-4o-mini",
     }.get((p or "").strip().lower(), "qwen2.5")
 
@@ -655,7 +660,7 @@ def _sidebar_hydrate_on_provider_tab_change(provider: str) -> None:
     settings.llm_model = dlm
     settings.embedding_model = dem
 
-    if pdf_ocr_llm_model_field_available() and provider in ("ollama", "openai", "deepseek", "lingyi", "tongyi"):
+    if pdf_ocr_llm_model_field_available() and provider in ("ollama", "openai", "deepseek", "lingyi", "tongyi", "claude"):
         docr = (slot.get("pdf_ocr_llm_model") or "").strip()
         if not docr:
             docr = (get_pdf_ocr_llm_model() or "").strip() or _default_pdf_ocr_for_provider(provider)
@@ -678,6 +683,11 @@ def _sidebar_hydrate_on_provider_tab_change(provider: str) -> None:
         else:
             settings.openai_base_url = bu
 
+    if provider == "claude":
+        bu = (slot.get("claude_base_url") or "").strip() or (settings.claude_base_url or "https://api.anthropic.com").strip()
+        st.session_state[f"sidebar_claude_base_url_{provider}_v2"] = bu
+        settings.claude_base_url = bu
+
 
 def _sidebar_fill_missing_widget_keys(provider: str) -> None:
     """同提供方下热重载等导致 session 丢键时，用预设补全，不覆盖已有输入。"""
@@ -699,7 +709,7 @@ def _sidebar_fill_missing_widget_keys(provider: str) -> None:
     ek = f"sidebar_embed_model_{provider}_v2"
     if ek not in st.session_state:
         st.session_state[ek] = (slot.get("embedding_model") or "").strip() or _default_embed_for_provider(provider)
-    if pdf_ocr_llm_model_field_available() and provider in ("ollama", "openai", "deepseek", "lingyi", "tongyi"):
+    if pdf_ocr_llm_model_field_available() and provider in ("ollama", "openai", "deepseek", "lingyi", "tongyi", "claude"):
         ok = f"sidebar_pdf_ocr_llm_model_{provider}_v2"
         if ok not in st.session_state:
             docr = (slot.get("pdf_ocr_llm_model") or "").strip() or (get_pdf_ocr_llm_model() or "").strip() or _default_pdf_ocr_for_provider(provider)
@@ -713,6 +723,10 @@ def _sidebar_fill_missing_widget_keys(provider: str) -> None:
         if bk not in st.session_state:
             _raw = (slot.get("base_url") or "").strip() or openai_form_base_url_default_from_settings(provider)
             st.session_state[bk] = sanitize_openai_form_base_url(provider, _raw)
+    if provider == "claude":
+        bk = f"sidebar_claude_base_url_{provider}_v2"
+        if bk not in st.session_state:
+            st.session_state[bk] = (slot.get("claude_base_url") or "").strip() or (settings.claude_base_url or "https://api.anthropic.com").strip()
 
 
 def render_sidebar():
@@ -754,6 +768,8 @@ def render_sidebar():
                 settings.dashscope_api_key = db_conf.get("dashscope_api_key") or settings.dashscope_api_key
                 settings.qianfan_ak = db_conf.get("qianfan_ak") or settings.qianfan_ak
                 settings.qianfan_sk = db_conf.get("qianfan_sk") or settings.qianfan_sk
+                settings.claude_api_key = db_conf.get("claude_api_key") or settings.claude_api_key
+                settings.claude_base_url = db_conf.get("claude_base_url") or settings.claude_base_url
                 v = db_conf.get("cursor_verify_ssl")
                 vv = v if isinstance(v, bool) else (v != 0 and v != "0")
                 settings.cursor_verify_ssl = vv
@@ -801,6 +817,7 @@ def render_sidebar():
             ("Google Gemini", "gemini"),
             ("阿里通义千问", "tongyi"),
             ("百度文心一言", "baidu"),
+            ("Claude (Anthropic)", "claude"),
             ("Ollama (本地免费)", "ollama"),
             ("Cursor Agent (Cloud API)", "cursor"),
         ]
@@ -918,7 +935,18 @@ def render_sidebar():
                 key=f"sidebar_base_url_{_provider}_v2",
                 help="DeepSeek 填 https://api.deepseek.com/v1（404 时请确认无误）；零一默认 https://api.lingyiwanwu.com/v1",
             )
-            _model_help = "DeepSeek 填 deepseek-chat 或 deepseek-chat-v2 等（404 多为模型名或 Base URL 错误）；零一如 yi-large 等"
+            openai_embed = (getattr(settings, "openai_embedding", None) or "ollama").strip().lower()
+            if _provider == "openai":
+                openai_embed = st.selectbox(
+                    "向量化使用",
+                    ["ollama", "openai"],
+                    index=0 if openai_embed != "openai" else 1,
+                    key=f"sidebar_openai_embed_{_provider}",
+                    help="审核前检索知识库需要向量。默认 **ollama**（与常见本地知识库一致）；仅当库是用 OpenAI text-embedding 训练时才选 openai。",
+                )
+            _model_help = "OpenAI 填 gpt-4o-mini、gpt-4o 等；DeepSeek 填 deepseek-chat；零一如 yi-large 等"
+            if _provider != "openai":
+                _model_help = "DeepSeek 填 deepseek-chat 或 deepseek-chat-v2 等（404 多为模型名或 Base URL 错误）；零一如 yi-large 等"
             _lm_key = f"sidebar_llm_model_{_provider}_v2"
             llm_model = st.text_input(
                 "审核模型",
@@ -926,15 +954,30 @@ def render_sidebar():
                 help=_model_help,
             )
             _embed_help = "向量化仍用 Ollama 或 OpenAI；选 Cursor 时可在 Cursor 区块选择。"
-            if _provider == "deepseek":
-                _embed_help = "DeepSeek 不提供 embeddings 接口，向量化将使用 **Ollama**；请确保 Ollama 已启动并在此填写向量化模型（如 nomic-embed-text）。"
+            if _provider == "openai":
+                if (openai_embed or "ollama").lower() == "openai":
+                    _embed_help = "向量化走 **OpenAI Embedding API**（须 Key 支持 /embeddings，模型如 text-embedding-3-small）；知识库须用同一向量训练。"
+                else:
+                    _embed_help = "向量化走 **远程 Ollama**（见下方地址），模型如 nomic-embed-text。对话仍用上方 OpenAI Key。"
+            elif _provider == "deepseek":
+                _embed_help = "DeepSeek 不提供 embeddings，向量化走 **远程 Ollama**（见下方地址），模型如 nomic-embed-text。"
             elif _provider == "lingyi":
-                _embed_help = "零一万物向量化将使用 **Ollama**；请确保 Ollama 已启动并在此填写向量化模型（如 nomic-embed-text）。"
+                _embed_help = "零一向量化走 **远程 Ollama**（见下方地址），模型如 nomic-embed-text。"
             embed_model = st.text_input(
                 "向量化模型",
                 key=f"sidebar_embed_model_{_provider}_v2",
                 help=_embed_help,
             )
+            _needs_remote_ollama = _provider in ("deepseek", "lingyi") or (
+                _provider == "openai" and (openai_embed or "ollama").lower() != "openai"
+            )
+            if _needs_remote_ollama:
+                ollama_url = st.text_input(
+                    "Ollama 地址",
+                    value=(settings.ollama_base_url or "http://localhost:11434").strip(),
+                    key="sidebar_ollama_base_url_shared",
+                    help="填服务器上的 Ollama，如 http://10.x.x.x:11434；审核检索向量化走此地址，与 Chroma 无关。",
+                )
         elif _provider == "gemini":
             st.caption("密钥请配置环境变量 GEMINI_API_KEY 或 GOOGLE_API_KEY（.env）。")
             _lm_key = f"sidebar_llm_model_{_provider}_v2"
@@ -974,10 +1017,34 @@ def render_sidebar():
                 help="向量可继续用 Ollama/OpenAI",
                 key=f"sidebar_embed_model_{_provider}_v2",
             )
+        elif _provider == "claude":
+            api_key = st.text_input(
+                "Claude API Key",
+                value=settings.claude_api_key,
+                type="password",
+                key=f"sidebar_api_key_{_provider}",
+                help="Anthropic Console 创建；也可在 .env 配置 ANTHROPIC_API_KEY",
+            )
+            base_url = st.text_input(
+                "Claude API Base",
+                key=f"sidebar_claude_base_url_{_provider}_v2",
+                help="官方 https://api.anthropic.com；使用代理/中转时改为对方提供的 Anthropic 兼容根地址",
+            )
+            _lm_key = f"sidebar_llm_model_{_provider}_v2"
+            llm_model = st.text_input(
+                "审核模型",
+                key=_lm_key,
+                help="如 claude-sonnet-4-20250514、claude-3-5-sonnet-20241022",
+            )
+            embed_model = st.text_input(
+                "向量化模型",
+                key=f"sidebar_embed_model_{_provider}_v2",
+                help="Claude 不提供 embeddings，向量化将使用 **Ollama**（如 nomic-embed-text）；请确保 Ollama 已启动",
+            )
 
         # 扫描件 PDF：OCR 使用独立多模态模型（可与「审核模型」不同）；仅当 Settings 含该字段时展示
         pdf_ocr_llm_model = ""
-        _pdf_ocr_providers = ("ollama", "openai", "deepseek", "lingyi", "tongyi", "cursor")
+        _pdf_ocr_providers = ("ollama", "openai", "deepseek", "lingyi", "tongyi", "claude", "cursor")
         if pdf_ocr_llm_model_field_available() and _provider in _pdf_ocr_providers:
             _ocr_help = (
                 "文本层为空的 PDF 会逐页调用多模态做 OCR；各提供方独立保存（与审核模型可不同，点「保存配置」写入预设）。"
@@ -1026,6 +1093,17 @@ def render_sidebar():
                 else:
                     settings.openai_api_key = api_key
                     settings.openai_base_url = _bu_save
+                    settings.openai_embedding = (openai_embed or "ollama").strip().lower()
+                _ro = _provider in ("deepseek", "lingyi") or (
+                    _provider == "openai" and (openai_embed or "ollama").lower() != "openai"
+                )
+                if _ro:
+                    _ou = st.session_state.get("sidebar_ollama_base_url_shared")
+                    if _ou:
+                        settings.ollama_base_url = str(_ou).strip()
+            elif _provider == "claude":
+                settings.claude_api_key = api_key
+                settings.claude_base_url = (base_url or "https://api.anthropic.com").strip().rstrip("/")
             _preset_updates = {
                 "llm_model": (llm_model or "").strip(),
                 "embedding_model": (embed_model or "").strip(),
@@ -1036,13 +1114,21 @@ def render_sidebar():
                 "deepseek",
                 "lingyi",
                 "tongyi",
+                "claude",
                 "cursor",
             ):
                 _preset_updates["pdf_ocr_llm_model"] = (pdf_ocr_llm_model or "").strip()
             if is_ollama:
                 _preset_updates["ollama_base_url"] = (ollama_url or "").strip()
+            _ou_shared = st.session_state.get("sidebar_ollama_base_url_shared")
+            if _ou_shared:
+                _preset_updates["ollama_base_url"] = str(_ou_shared).strip()
             if is_openai_form:
                 _preset_updates["base_url"] = sanitize_openai_form_base_url(_provider, (base_url or "").strip())
+                if _provider == "openai":
+                    _preset_updates["openai_embedding"] = (openai_embed or "ollama").strip().lower()
+            if _provider == "claude":
+                _preset_updates["claude_base_url"] = (base_url or "https://api.anthropic.com").strip().rstrip("/")
             upsert_provider_sidebar_slot(_provider, _preset_updates)
             save_app_settings(
                 provider=settings.provider,
@@ -1084,6 +1170,8 @@ def render_sidebar():
                 label = "Cursor Agent 模式 ✓"
             elif settings.is_ollama:
                 label = "Ollama 本地模式 ✓"
+            elif (settings.provider or "").strip().lower() == "claude":
+                label = "Claude 模式 ✓"
             else:
                 label = "OpenAI 模式 ✓"
             st.success(label)

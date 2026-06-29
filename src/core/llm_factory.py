@@ -1,6 +1,6 @@
 """
-统一创建 Chat 模型：根据 config.settings.provider 选择 Ollama / OpenAI / Gemini / 通义 / 文心 / 零一万物 / DeepSeek 等。
-零一万物、DeepSeek 使用 OpenAI 兼容接口，走 ChatOpenAI + base_url。
+统一创建 Chat 模型：根据 config.settings.provider 选择 Ollama / OpenAI / Gemini / 通义 / 文心 / 零一万物 / DeepSeek / Claude 等。
+零一万物、DeepSeek 使用 OpenAI 兼容接口，走 ChatOpenAI + base_url；Claude 走 Anthropic Messages API。
 """
 
 import os
@@ -137,6 +137,7 @@ def _auth_error_message(*, provider: str, client_llm: Optional[ClientLlmConfig])
         "openai": "OpenAI",
         "lingyi": "零一万物",
         "tongyi": "通义千问",
+        "claude": "Claude (Anthropic)",
         "ollama": "Ollama",
     }
     label = labels.get((provider or "").strip().lower(), provider or "LLM")
@@ -165,7 +166,24 @@ def _raise_for_llm_http_status(
             raise RuntimeError(
                 _auth_error_message(provider=provider, client_llm=client_llm)
             ) from exc
-        raise
+        body = ""
+        try:
+            body = (exc.response.text or "").strip()[:800]
+        except Exception:
+            pass
+        label = {
+            "deepseek": "DeepSeek",
+            "openai": "OpenAI",
+            "lingyi": "零一万物",
+            "tongyi": "通义千问",
+            "claude": "Claude",
+            "ollama": "Ollama",
+        }.get((provider or "").strip().lower(), provider or "LLM")
+        msg = f"{label} 聊天接口失败（HTTP {exc.response.status_code}）"
+        if body:
+            msg += f"：{body}"
+        msg += "。请核对 API Key、Base URL、模型名；中转服务须支持 /chat/completions。"
+        raise RuntimeError(msg) from exc
 
 
 _DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
@@ -173,6 +191,7 @@ _DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
     "openai": "gpt-4o-mini",
     "lingyi": "yi-lightning",
     "tongyi": "qwen-plus",
+    "claude": "claude-sonnet-4-20250514",
     "ollama": "qwen2.5",
 }
 
@@ -181,7 +200,13 @@ def default_model_for_provider(provider: Optional[str]) -> str:
     """按 provider 取默认模型；仅当与全局 settings.provider 一致时才用 settings.llm_model。"""
     p = (provider or settings.provider or "deepseek").strip().lower()
     if p == (settings.provider or "").strip().lower() and (settings.llm_model or "").strip():
-        return settings.llm_model.strip()
+        cand = settings.llm_model.strip()
+        el = cand.lower()
+        if p == "openai" and any(x in el for x in ("qwen", "deepseek", "yi-", "claude", "gemini", "ernie")) and "gpt" not in el:
+            return _DEFAULT_MODEL_BY_PROVIDER.get("openai", "gpt-4o-mini")
+        if p == "tongyi" and any(x in el for x in ("deepseek", "gpt", "yi-lightning", "claude", "gemini")):
+            return _DEFAULT_MODEL_BY_PROVIDER.get("tongyi", "qwen-plus")
+        return cand
     return _DEFAULT_MODEL_BY_PROVIDER.get(p, settings.llm_model or "qwen-plus")
 
 
@@ -200,6 +225,10 @@ def resolve_model_for_provider(
             return default_model_for_provider("tongyi")
         if p == "deepseek" and "qwen" in el and "deepseek" not in el:
             return default_model_for_provider("deepseek")
+        if p == "openai" and any(x in el for x in ("qwen", "deepseek", "yi-", "claude", "gemini", "ernie")) and "gpt" not in el:
+            return default_model_for_provider("openai")
+        if p == "claude" and any(x in el for x in ("deepseek", "gpt", "qwen", "yi-", "gemini")) and "claude" not in el:
+            return default_model_for_provider("claude")
         return explicit
     return default_model_for_provider(p)
 
@@ -239,6 +268,87 @@ def _openai_http_client(*, timeout: Optional[httpx.Timeout] = None) -> httpx.Cli
     return httpx.Client(verify=get_llm_verify_ssl(), trust_env=get_llm_trust_env(), timeout=t)
 
 
+def _claude_api_key() -> str:
+    return (settings.claude_api_key or "").strip()
+
+
+def _claude_base_url() -> str:
+    return (settings.claude_base_url or "https://api.anthropic.com").strip().rstrip("/")
+
+
+def _claude_http_client(*, timeout: Optional[httpx.Timeout] = None) -> httpx.Client:
+    t = timeout or httpx.Timeout(600.0, connect=45.0)
+    return httpx.Client(verify=get_llm_verify_ssl(), trust_env=get_llm_trust_env(), timeout=t)
+
+
+def _create_claude_chat_llm(temperature: float = 0.1):
+    api_key = _claude_api_key()
+    if not api_key:
+        raise RuntimeError("Claude 模式下请先配置 ANTHROPIC_API_KEY 或 claude_api_key（.env 或侧栏）")
+    try:
+        from langchain_anthropic import ChatAnthropic
+    except ImportError as e:
+        raise RuntimeError("请安装 langchain-anthropic：pip install langchain-anthropic") from e
+    base_url = _claude_base_url()
+    kwargs: dict[str, Any] = {
+        "model": settings.llm_model or "claude-sonnet-4-20250514",
+        "api_key": api_key,
+        "temperature": temperature,
+        "max_tokens": 8192,
+    }
+    if base_url and base_url.rstrip("/") != "https://api.anthropic.com":
+        kwargs["base_url"] = base_url
+    try:
+        kwargs["http_client"] = _claude_http_client(timeout=httpx.Timeout(600.0, connect=45.0))
+        return ChatAnthropic(**kwargs)
+    except TypeError:
+        kwargs.pop("http_client", None)
+        return ChatAnthropic(**kwargs)
+
+
+def _invoke_claude_messages(
+    prompt_text: str,
+    *,
+    temperature: float,
+    model: str,
+    api_key: str,
+    base_url: str,
+    client_llm: Optional[ClientLlmConfig],
+) -> str:
+    if not api_key:
+        raise RuntimeError("Claude 模式下请先配置 API Key 或在请求中传入 X-Client-Llm-Api-Key")
+    url = f"{base_url.rstrip('/')}/v1/messages"
+    payload = {
+        "model": model or "claude-sonnet-4-20250514",
+        "max_tokens": 4096,
+        "temperature": temperature,
+        "messages": [{"role": "user", "content": prompt_text}],
+    }
+    with _claude_http_client(timeout=httpx.Timeout(600.0, connect=45.0)) as client:
+        r = client.post(
+            url,
+            json=payload,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            timeout=600,
+        )
+        _raise_for_llm_http_status(r, provider="claude", client_llm=client_llm)
+        data = r.json()
+    blocks = data.get("content") or []
+    parts = []
+    for block in blocks:
+        if isinstance(block, dict) and block.get("type") == "text":
+            txt = block.get("text")
+            if isinstance(txt, str) and txt.strip():
+                parts.append(txt.strip())
+    if parts:
+        return "\n".join(parts)
+    raise RuntimeError("Claude Messages API 返回无文本 content")
+
+
 def create_chat_llm(temperature: float = 0.1):
     """
     创建 LangChain Chat 实例。Cursor 模式不应调用本函数（由 complete_task 处理）。
@@ -258,6 +368,9 @@ def create_chat_llm(temperature: float = 0.1):
 
     if p == "cursor":
         raise RuntimeError("Cursor 模式下请使用 complete_task，不应调用 create_chat_llm")
+
+    if p == "claude":
+        return _create_claude_chat_llm(temperature)
 
     # OpenAI 兼容：openai / deepseek / lingyi（零一万物）
     if p in ("openai", "deepseek", "lingyi"):
@@ -376,6 +489,7 @@ def provider_display_name(provider: str) -> str:
         "baidu": "百度文心一言",
         "lingyi": "零一万物",
         "deepseek": "DeepSeek",
+        "claude": "Claude (Anthropic)",
     }
     return m.get((provider or "").lower(), provider or "unknown")
 
@@ -414,7 +528,7 @@ def invoke_chat_direct(
     """
     直接调用当前配置的聊天接口，返回助手回复内容。
     用于多文档一致性等场景，避免 LangChain 将 content 当模板解析导致 {\"category\"} 报错。
-    支持：openai / deepseek / lingyi（OpenAI 兼容）、ollama、tongyi（DashScope Generation）。
+    支持：openai / deepseek / lingyi（OpenAI 兼容）、claude（Anthropic Messages）、ollama、tongyi（DashScope Generation）。
     provider: 若传入（如从 Streamlit current_provider），则优先使用，否则用 settings.provider。
     client_llm: 若传入且含 api_key/base_url/model 等，则对应字段覆盖 settings（用于集成 API / 用户自带 Key）。
     """
@@ -465,6 +579,22 @@ def invoke_chat_direct(
             raise
         return _dashscope_generation_text(resp)
 
+    if p == "claude":
+        if cl and getattr(cl, "personal_keys_only", False):
+            api_key = normalize_api_key_plain((cl.api_key if cl else "") or "")
+            raw_base = _claude_base_url()
+        else:
+            api_key = normalize_api_key_plain(((cl.api_key if cl else "") or _claude_api_key()))
+            raw_base = ((cl.base_url if cl else "") or _claude_base_url()).strip().rstrip("/")
+        return _invoke_claude_messages(
+            prompt_text,
+            temperature=temperature,
+            model=m,
+            api_key=api_key,
+            base_url=raw_base or "https://api.anthropic.com",
+            client_llm=cl,
+        )
+
     with _openai_http_client() as client:
         if p in ("openai", "deepseek", "lingyi"):
             if cl and getattr(cl, "personal_keys_only", False):
@@ -491,12 +621,30 @@ def invoke_chat_direct(
                 "messages": [{"role": "user", "content": prompt_text}],
                 "temperature": temperature,
             }
-            r = client.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                timeout=300,
-            )
+            req_timeout = 600.0 if p in ("openai", "deepseek") else 300.0
+            try:
+                r = client.post(
+                    url,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    timeout=req_timeout,
+                )
+            except httpx.TimeoutException as e:
+                _lbl = {"openai": "OpenAI", "deepseek": "DeepSeek", "lingyi": "零一万物"}.get(p, p)
+                raise RuntimeError(
+                    f"{_lbl} 聊天请求超时（{int(req_timeout)}s）。"
+                    "文档过长或网关较慢时可尝试缩短文档、换更快模型，或检查 Base URL 网络。"
+                ) from e
+            except (httpx.ConnectError, httpx.ReadError, OSError) as e:
+                el = str(e).lower()
+                if "10054" in str(e) or "connection" in el or "reset" in el or "eof" in el:
+                    _lbl = {"openai": "OpenAI", "deepseek": "DeepSeek", "lingyi": "零一万物"}.get(p, p)
+                    raise RuntimeError(
+                        f"{_lbl} 无法连接 {base_url}（{e}）。"
+                        "国内/公司网直连 api.openai.com 常被重置；请改用**中转 Base URL**，"
+                        "或在侧栏尝试「不使用系统代理」「不校验 SSL」。"
+                    ) from e
+                raise
             _raise_for_llm_http_status(r, provider=p, client_llm=cl)
             data = r.json()
             choice = (data.get("choices") or [None])[0]
@@ -522,5 +670,5 @@ def invoke_chat_direct(
 
     # 其他 provider 暂不实现，由调用方处理
     raise RuntimeError(
-        f"invoke_chat_direct 暂不支持 provider={p}，请使用 Cursor / OpenAI / DeepSeek / 零一 / Ollama / 通义"
+        f"invoke_chat_direct 暂不支持 provider={p}，请使用 Cursor / OpenAI / DeepSeek / 零一 / Claude / Ollama / 通义"
     )

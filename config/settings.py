@@ -39,7 +39,7 @@ _bootstrap_dotenv_from_env()
 
 class Settings(BaseSettings):
     # AI 服务提供方:
-    # ollama | openai | cursor | gemini | tongyi | baidu | lingyi | deepseek
+    # ollama | openai | cursor | gemini | tongyi | baidu | lingyi | deepseek | claude
     provider: str = "ollama"
 
     # Google Gemini（provider=gemini）
@@ -64,6 +64,12 @@ class Settings(BaseSettings):
     # OpenAI 配置 (provider=openai 或兼容服务)
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
+    # openai | ollama；默认 ollama，与既有知识库（多为 Ollama 向量）及无 embedding 的中转 Key 兼容
+    openai_embedding: str = "ollama"
+
+    # Anthropic Claude（provider=claude；官方 Messages API，非 OpenAI 兼容）
+    claude_api_key: str = ""  # 或环境变量 ANTHROPIC_API_KEY
+    claude_base_url: str = "https://api.anthropic.com"  # 代理/中转可改，须支持 /v1/messages
 
     # Ollama 配置 (provider=ollama 时使用, 本地运行无需 Key)
     ollama_base_url: str = "http://localhost:11434"
@@ -90,7 +96,7 @@ class Settings(BaseSettings):
     provider_sidebar_presets: str = "{}"
 
     # ─── 刷题/题库专用 AI（可在系统配置页单独设置；空=跟随全局 provider/llm_model）───
-    quiz_provider: str = ""  # 例：ollama/openai/deepseek/lingyi/tongyi；空表示跟随 provider
+    quiz_provider: str = ""  # 例：ollama/openai/deepseek/lingyi/tongyi/claude；空表示跟随 provider
     quiz_llm_model: str = ""  # 空表示跟随 llm_model
     quiz_temperature: float = 0.2
 
@@ -357,6 +363,8 @@ def maybe_seed_provider_sidebar_presets_from_legacy() -> None:
     p0 = (settings.provider or "ollama").strip().lower()
     for p in ("openai", "deepseek", "lingyi"):
         sub: Dict[str, Any] = {"base_url": openai_form_base_url_default_from_settings(p)}
+        if p == "openai":
+            sub["openai_embedding"] = (getattr(settings, "openai_embedding", None) or "ollama").strip().lower()
         if p == p0:
             sub["llm_model"] = (settings.llm_model or "").strip()
             sub["embedding_model"] = (settings.embedding_model or "").strip()
@@ -372,11 +380,13 @@ def maybe_seed_provider_sidebar_presets_from_legacy() -> None:
         if pdf_ocr_llm_model_field_available():
             slot_o["pdf_ocr_llm_model"] = (get_pdf_ocr_llm_model() or "").strip()
         upsert_provider_sidebar_slot("ollama", slot_o)
-    elif p0 in ("gemini", "tongyi", "baidu"):
+    elif p0 in ("gemini", "tongyi", "baidu", "claude"):
         slot_g: Dict[str, Any] = {
             "llm_model": (settings.llm_model or "").strip(),
             "embedding_model": (settings.embedding_model or "").strip(),
         }
+        if p0 == "claude":
+            slot_g["claude_base_url"] = (settings.claude_base_url or "https://api.anthropic.com").strip()
         if pdf_ocr_llm_model_field_available():
             slot_g["pdf_ocr_llm_model"] = (get_pdf_ocr_llm_model() or "").strip()
         upsert_provider_sidebar_slot(p0, slot_g)

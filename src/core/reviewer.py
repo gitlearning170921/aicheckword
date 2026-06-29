@@ -1487,6 +1487,15 @@ class DocumentReviewer:
         from .llm_factory import invoke_chat_direct, resolve_client_llm
 
         cl = resolve_client_llm(review_context=review_context)
+        user_body = usr_prompt.format(
+            context=context,
+            file_name=file_name,
+            document_content=text,
+        )
+        prompt_text = user_body
+        if sys_prompt and sys_prompt.strip():
+            prompt_text = f"{sys_prompt.strip()}\n\n{user_body}"
+
         if pv == "cursor":
             from .cursor_agent import complete_task
             template = CURSOR_REVIEW_TASK if not (user_prompt and user_prompt.strip()) else usr_prompt
@@ -1497,24 +1506,7 @@ class DocumentReviewer:
             )
             response_content = complete_task(prompt_text, client_llm=cl)
             audit_points = self._parse_audit_points(response_content)
-        elif cl and cl.has_any():
-            wait_before_llm_call(pv)
-            user_body = usr_prompt.format(
-                context=context,
-                file_name=file_name,
-                document_content=text,
-            )
-            prompt_text = user_body
-            if sys_prompt and sys_prompt.strip():
-                prompt_text = f"{sys_prompt.strip()}\n\n{user_body}"
-            response_content = invoke_chat_direct(
-                prompt_text,
-                temperature=0.1,
-                provider=pv,
-                client_llm=cl,
-            )
-            audit_points = self._parse_audit_points(response_content)
-        elif settings.is_cursor:
+        elif settings.is_cursor and pv not in ("openai", "deepseek", "lingyi", "ollama", "tongyi", "claude", "gemini", "baidu"):
             from .cursor_agent import complete_task
             template = CURSOR_REVIEW_TASK if not (user_prompt and user_prompt.strip()) else usr_prompt
             prompt_text = template.format(
@@ -1523,6 +1515,21 @@ class DocumentReviewer:
                 document_content=text,
             )
             response_content = complete_task(prompt_text)
+            audit_points = self._parse_audit_points(response_content)
+        elif pv in ("openai", "deepseek", "lingyi", "ollama", "tongyi", "claude") or (cl and cl.has_any()):
+            wait_before_llm_call(pv)
+            try:
+                response_content = invoke_chat_direct(
+                    prompt_text,
+                    temperature=0.1,
+                    provider=pv or None,
+                    client_llm=cl if cl and cl.has_any() else None,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"审核 LLM 调用失败（provider={pv or settings.provider}，"
+                    f"model={settings.llm_model}）：{e}"
+                ) from e
             audit_points = self._parse_audit_points(response_content)
         else:
             prompt = ChatPromptTemplate.from_messages([
@@ -1634,9 +1641,9 @@ class DocumentReviewer:
         ctx_prov = (review_context or {}).get("current_provider") if review_context else None
         provider = (ctx_prov or getattr(settings, "provider", "") or "").strip().lower()
         max_workers = 3
-        if provider in ("deepseek",):
-            max_workers = 1  # DeepSeek 串行分块，避免网关/限流抖动（批量多文件本身已是逐份串行）
-        elif provider in ("openai", "lingyi"):
+        if provider in ("deepseek", "openai"):
+            max_workers = 1  # 云端网关限流时并行分块易触发 /chat/completions 重试失败
+        elif provider in ("lingyi",):
             max_workers = 2
         if getattr(settings, "is_cursor", False):
             max_workers = 2  # Cursor Agent 并发过高易超时，保守为 2
@@ -2032,15 +2039,15 @@ class DocumentReviewer:
 
             prompt_text = summary_tpl.format(**inv)
             return complete_task(prompt_text, client_llm=cl).strip()
-        if cl and cl.has_any():
+        if pv in ("openai", "deepseek", "lingyi", "ollama", "tongyi", "claude") or (cl and cl.has_any()):
             wait_before_llm_call(pv)
             prompt_body = summary_tpl.format(**inv)
             return (
                 invoke_chat_direct(
                     prompt_body,
                     temperature=0.1,
-                    provider=pv,
-                    client_llm=cl,
+                    provider=pv or None,
+                    client_llm=cl if cl and cl.has_any() else None,
                 )
                 or ""
             ).strip()

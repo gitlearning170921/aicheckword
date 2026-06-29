@@ -99,6 +99,7 @@ _PROVIDER_OPTION_VALUES = [
     "gemini",
     "tongyi",
     "baidu",
+    "claude",
     "ollama",
     "cursor",
 ]
@@ -165,7 +166,7 @@ def _maybe_rerun_on_sys_cfg_provider_change(wkp: str) -> None:
 def _ai_keys_for_provider(provider: str) -> List[str]:
     p = _coerce_provider_to_valid(provider)
     if p == "openai":
-        return ["openai_api_key", "openai_base_url"]
+        return ["openai_api_key", "openai_base_url", "openai_embedding", "ollama_base_url"]
     if p == "deepseek":
         return ["deepseek_api_key", "deepseek_base_url", "ollama_base_url"]
     if p == "lingyi":
@@ -176,6 +177,8 @@ def _ai_keys_for_provider(provider: str) -> List[str]:
         return ["dashscope_api_key"]
     if p == "baidu":
         return ["qianfan_ak", "qianfan_sk"]
+    if p == "claude":
+        return ["claude_api_key", "claude_base_url", "ollama_base_url"]
     if p == "ollama":
         return ["ollama_base_url"]
     if p == "cursor":
@@ -246,6 +249,7 @@ FIELD_LABELS: Dict[str, str] = {
     "mysql_charset": "字符集",
     "openai_api_key": "OpenAI API Key",
     "openai_base_url": "OpenAI Base URL",
+    "openai_embedding": "OpenAI 侧嵌入后端（ollama=本地向量，openai=官方 Embedding API）",
     "ollama_base_url": "Ollama 地址（本地嵌入/对话）",
     "deepseek_api_key": "DeepSeek API Key",
     "deepseek_base_url": "DeepSeek Base URL",
@@ -256,6 +260,8 @@ FIELD_LABELS: Dict[str, str] = {
     "dashscope_api_key": "通义 DashScope Key",
     "qianfan_ak": "文心 AK",
     "qianfan_sk": "文心 SK",
+    "claude_api_key": "Claude API Key（或 ANTHROPIC_API_KEY）",
+    "claude_base_url": "Claude API Base（官方 https://api.anthropic.com）",
     "cursor_api_key": "Cursor API Key",
     "cursor_api_base": "Cursor API Base",
     "cursor_repository": "GitHub 仓库（owner/repo）",
@@ -318,6 +324,7 @@ _PROVIDER_OPTIONS: List[Tuple[str, str]] = [
     ("Google Gemini", "gemini"),
     ("阿里通义千问", "tongyi"),
     ("百度文心一言", "baidu"),
+    ("Claude (Anthropic)", "claude"),
     ("Ollama (本地免费)", "ollama"),
     ("Cursor Agent (Cloud API)", "cursor"),
 ]
@@ -337,6 +344,7 @@ def _is_secret(name: str) -> bool:
         "google_api_key",
         "dashscope_api_key",
         "qianfan_sk",
+        "claude_api_key",
         "cursor_api_key",
         "kdocs_app_key",
         "chat_api_auth_token",

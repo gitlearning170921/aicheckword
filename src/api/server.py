@@ -475,6 +475,11 @@ class QuizPracticeSetRequest(BaseModel):
     question_count: int = 20
     user_id: str = ""
     project_case_id: Optional[int] = Field(default=None, alias="projectCaseId")
+    author_roles: List[str] = Field(default_factory=list, validation_alias=AliasChoices("author_roles", "authorRoles"))
+    author_role_coverage: str = Field(
+        default="balanced_union",
+        validation_alias=AliasChoices("author_role_coverage", "authorRoleCoverage"),
+    )
 
 
 class QuizIngestByAIRequest(BaseModel):
@@ -1835,6 +1840,8 @@ def quiz_generate_practice_set(http_req: Request, request: QuizPracticeSetReques
             status="published",
             exam_category=request.exam_category,
             project_case_id=request.project_case_id,
+            author_roles=request.author_roles,
+            author_role_coverage=request.author_role_coverage,
         )
         sid = int(data.get("id") or data.get("set_id") or 0) if isinstance(data, dict) else 0
         if sid > 0 and isinstance(data, dict):

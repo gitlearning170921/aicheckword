@@ -141,7 +141,8 @@ def _create_embeddings():
     use_ollama = (
         settings.is_ollama
         or (settings.is_cursor and (settings.cursor_embedding or "").lower() == "ollama")
-        or p in ("deepseek", "lingyi")
+        or (p == "openai" and (getattr(settings, "openai_embedding", None) or "ollama").strip().lower() != "openai")
+        or p in ("deepseek", "lingyi", "claude")
     )
     # 防御：若即将用 OpenAIEmbeddings 且 base_url 为 DeepSeek（会 404），则改用 Ollama；排除 Cursor 以不影响其「向量化=openai」的用法
     if not use_ollama and ("deepseek.com" in (settings.openai_base_url or "")) and p != "cursor":
@@ -167,8 +168,11 @@ def _create_embeddings():
         if not settings.openai_api_key:
             raise RuntimeError("请配置 OpenAI API Key（用于向量化或 OpenAI 模式）")
         http_client = httpx.Client(verify=get_llm_verify_ssl(), trust_env=get_llm_trust_env())
+        emb_model = (settings.embedding_model or "").strip() or "text-embedding-3-small"
+        if not emb_model.lower().startswith("text-embedding-"):
+            emb_model = "text-embedding-3-small"
         return OpenAIEmbeddings(
-            model=settings.embedding_model,
+            model=emb_model,
             openai_api_key=settings.openai_api_key,
             openai_api_base=settings.openai_base_url,
             http_client=http_client,

@@ -26,6 +26,37 @@ TRACK_HINTS = {
     "mdsap": "MDSAP 审核程序与多国监管要求",
 }
 
+# 练习身份（与 aicheckword 初稿 author_role keys 对齐）→ 项目案例文件名关键词范围。
+# 说明：用户要求「项目经理需覆盖研发相关文件与知识库内容」，因此 pm 关键词按研发链路扩充。
+_AUTHOR_ROLE_FILE_KEYWORDS: Dict[str, List[str]] = {
+    "pm": [
+        "需求",
+        "requirement",
+        "srs",
+        "研发",
+        "开发",
+        "设计",
+        "架构",
+        "代码",
+        "测试",
+        "验证",
+        "risk",
+        "风险",
+        "trace",
+        "追溯",
+        "变更",
+        "版本",
+    ],
+    "pjm": ["项目计划", "project plan", "里程碑", "进度", "变更", "需求", "设计", "验证"],
+    "rm": ["风险", "hazard", "fmea", "风险分析", "风险控制", "残余风险"],
+    "rdm": ["研发", "开发", "设计", "架构", "sdd", "设计说明", "需求", "代码", "验证"],
+    "ui": ["ui", "界面", "交互", "可用性", "视觉", "原型"],
+    "qa": ["测试", "test", "验证", "v&v", "缺陷", "验证报告", "测试用例"],
+    "cm": ["配置", "cm", "baseline", "基线", "版本", "发布", "变更", "追溯"],
+    "ra": ["注册", "法规", "标准", "指导原则", "合规", "申报"],
+    "prod": ["生产", "工艺", "制造", "gmp", "批记录", "检验", "放行"],
+}
+
 
 class QuizRequestError(Exception):
     """组卷/录题等入口参数不合法（应由 API 层映射为 HTTP 400）。"""
@@ -215,6 +246,115 @@ def _normalize_exam_category(v: Any) -> str:
     ):
         return "project_case"
     return "daily"
+
+
+def _normalize_author_roles(author_roles: Any) -> List[str]:
+    from src.core.draft_integration_ui_meta import DRAFT_AUTHOR_ROLE_KEYS
+
+    allowed = {str(x).strip() for x in (DRAFT_AUTHOR_ROLE_KEYS or []) if str(x).strip()}
+    raw_list: List[str] = []
+    if isinstance(author_roles, list):
+        raw_list = [str(x).strip().lower() for x in author_roles]
+    elif author_roles is not None:
+        raw = str(author_roles).strip()
+        if raw:
+            raw_list = [seg.strip().lower() for seg in raw.split(",")]
+    out: List[str] = []
+    seen: set[str] = set()
+    for role in raw_list:
+        if not role or role in seen:
+            continue
+        if role not in allowed:
+            continue
+        seen.add(role)
+        out.append(role)
+    return out
+
+
+def _role_file_keyword_scope(author_roles: List[str]) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    for role in author_roles or []:
+        kws = [str(x).strip().lower() for x in (_AUTHOR_ROLE_FILE_KEYWORDS.get(role) or []) if str(x).strip()]
+        if kws:
+            out[role] = kws
+    return out
+
+
+def _question_source_files(question: Dict[str, Any]) -> List[str]:
+    ev = question.get("evidence")
+    if not isinstance(ev, list):
+        return []
+    out: List[str] = []
+    for item in ev:
+        if not isinstance(item, dict):
+            continue
+        sf = str(item.get("source_file") or "").strip()
+        if sf:
+            out.append(sf)
+    return out
+
+
+def _text_hits_any_keyword(text: str, keywords: List[str]) -> bool:
+    low = str(text or "").strip().lower()
+    if not low:
+        return False
+    return any(kw in low for kw in (keywords or []))
+
+
+def _question_matches_role_keywords(question: Dict[str, Any], role_keywords: Dict[str, List[str]], *, strict: bool) -> bool:
+    if not role_keywords:
+        return True
+    sfiles = _question_source_files(question)
+    if not sfiles:
+        return not strict
+    for sf in sfiles:
+        for kws in role_keywords.values():
+            if _text_hits_any_keyword(sf, kws):
+                return True
+    return False
+
+
+def _question_role_hits(question: Dict[str, Any], role_keywords: Dict[str, List[str]]) -> set[str]:
+    hits: set[str] = set()
+    if not role_keywords:
+        return hits
+    sfiles = _question_source_files(question)
+    for sf in sfiles:
+        for role, kws in role_keywords.items():
+            if _text_hits_any_keyword(sf, kws):
+                hits.add(role)
+    return hits
+
+
+def _build_role_coverage_summary(questions: List[Dict[str, Any]], role_keywords: Dict[str, List[str]]) -> Dict[str, int]:
+    out: Dict[str, int] = {k: 0 for k in role_keywords.keys()}
+    for q in questions or []:
+        for role in _question_role_hits(q, role_keywords):
+            out[role] = int(out.get(role, 0)) + 1
+    return out
+
+
+def _promote_role_coverage_questions(
+    questions: List[Dict[str, Any]],
+    role_keywords: Dict[str, List[str]],
+) -> List[Dict[str, Any]]:
+    """将命中不同身份的题优先前置，提升截断后覆盖概率。"""
+    if not questions or not role_keywords:
+        return questions
+    picked: List[Dict[str, Any]] = []
+    used_idx: set[int] = set()
+    for role in role_keywords.keys():
+        for idx, q in enumerate(questions):
+            if idx in used_idx:
+                continue
+            if role in _question_role_hits(q, role_keywords):
+                picked.append(q)
+                used_idx.add(idx)
+                break
+    for idx, q in enumerate(questions):
+        if idx not in used_idx:
+            picked.append(q)
+    return picked
 
 
 def _make_scope_hash(
@@ -618,6 +758,7 @@ def _extract_evidence_project_case(
     top_k: int,
     exam_category: str,
     project_case_id: int,
+    role_keywords: Optional[Dict[str, List[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """项目案例考试：仅从所选案例的 project_case 向量取证（不混入法规 open LLM 摘要）。"""
     ec = _normalize_exam_category(exam_category)
@@ -635,6 +776,21 @@ def _extract_evidence_project_case(
         docs = agent.kb.search_by_category(q, "project_case", top_k=tk, case_id=int(project_case_id))
     except Exception:
         docs = []
+    role_keywords = role_keywords or {}
+    if role_keywords:
+        union_kw: List[str] = []
+        for kws in role_keywords.values():
+            union_kw.extend(kws or [])
+        union_kw = [str(x).strip().lower() for x in union_kw if str(x).strip()]
+        if union_kw:
+            docs = [
+                d
+                for d in docs
+                if _text_hits_any_keyword(
+                    str((getattr(d, "metadata", None) or {}).get("source_file") or ""),
+                    union_kw,
+                )
+            ]
     rows: List[Dict[str, Any]] = []
     for doc in docs:
         md = getattr(doc, "metadata", None) or {}
@@ -1149,12 +1305,18 @@ def generate_set(
     status: str = "draft",
     exam_category: str = "daily",
     project_case_id: Optional[Any] = None,
+    author_roles: Optional[List[str]] = None,
+    author_role_coverage: str = "balanced_union",
 ) -> Dict[str, Any]:
     """组卷：题型占比仅由 difficulty 决定；question_type 参数保留兼容，不参与组卷。"""
     if exam_track not in EXAM_TRACKS:
         raise ValueError(f"不支持的 exam_track: {exam_track}")
     ec = _normalize_exam_category(exam_category)
     pc_id = require_project_case_quiz(collection=collection, exam_category=exam_category, project_case_id=project_case_id)
+    roles = _normalize_author_roles(author_roles or [])
+    role_keywords = _role_file_keyword_scope(roles)
+    strict_role_filter = ec == "project_case" and bool(role_keywords)
+    coverage_mode = "balanced_union" if str(author_role_coverage or "").strip().lower() == "balanced_union" else "union"
     question_count = max(1, int(question_count))
     difficulty = _safe_difficulty(difficulty)
     bank_cat = (category or "").strip() or None
@@ -1179,6 +1341,8 @@ def generate_set(
         "bank_category_filter": bank_cat,
         "exam_category": ec,
         "examCategory": ec,
+        "author_roles": roles,
+        "author_role_coverage": coverage_mode,
     }
     if pc_id is not None:
         set_cfg["project_case_id"] = int(pc_id)
@@ -1249,6 +1413,8 @@ def generate_set(
                         break
                     obj = by_lid.get(int(qid_y))
                     if obj:
+                        if not _question_matches_role_keywords(obj, role_keywords, strict=strict_role_filter):
+                            continue
                         sig0 = _set_diversity_signature(obj)
                         if sig_counts.get(sig0, 0) >= max_sig_rep:
                             continue
@@ -1258,6 +1424,9 @@ def generate_set(
                     if x.get("id"):
                         seen_ids.add(int(x["id"]))
         short_pick = cnt - len(selected)
+        cache_pick_n = short_pick
+        if role_keywords:
+            cache_pick_n = min(max(short_pick * 4, short_pick), 200)
         cached = _pick_cached_questions(
             collection=collection,
             exam_track=exam_track,
@@ -1265,11 +1434,14 @@ def generate_set(
             difficulty=difficulty,
             question_type=qtype,
             scope_hash=scope_hash,
-            count=short_pick,
+            count=cache_pick_n,
             exclude_question_ids=sorted(seen_ids),
             sig_counts=sig_counts,
             question_count_total=question_count,
         )
+        if role_keywords:
+            cached = [q for q in cached if _question_matches_role_keywords(q, role_keywords, strict=strict_role_filter)]
+        cached = cached[:short_pick]
         selected.extend(cached)
         from_cache_total += len(cached)
         for x in selected:
@@ -1279,10 +1451,17 @@ def generate_set(
         if short > 0:
             if ec == "project_case" and pc_id is not None:
                 evidence = _extract_evidence_project_case(
-                    agent, exam_track, top_k=max(8, short), exam_category=ec, project_case_id=int(pc_id)
+                    agent,
+                    exam_track,
+                    top_k=max(8, short),
+                    exam_category=ec,
+                    project_case_id=int(pc_id),
+                    role_keywords=role_keywords if strict_role_filter else None,
                 )
             else:
                 evidence = _extract_evidence(agent, exam_track, top_k=max(8, short), exam_category=ec)
+            if strict_role_filter and not evidence:
+                raise QuizRequestError("所选身份在该项目案例下未匹配到对应文件，请调整身份或更换项目案例")
             stem_cat = (category or "").strip() or exam_track
             try:
                 generated = _generate_questions_by_ai(
@@ -1317,6 +1496,8 @@ def generate_set(
                 created_by=created_by,
             )
             generated_total += len(saved)
+            if role_keywords:
+                saved = [q for q in saved if _question_matches_role_keywords(q, role_keywords, strict=strict_role_filter)]
             for x in saved:
                 if isinstance(x, dict):
                     sg = _set_diversity_signature(x)
@@ -1327,6 +1508,8 @@ def generate_set(
                     seen_ids.add(int(x["id"]))
         selected_all.extend(selected[:cnt])
     random.shuffle(selected_all)
+    if role_keywords and coverage_mode == "balanced_union":
+        selected_all = _promote_role_coverage_questions(selected_all, role_keywords)
     selected_all = selected_all[:question_count]
     repo.touch_bank_questions([int(x.get("id")) for x in selected_all if x.get("id")])
     set_id = repo.create_set(
@@ -1342,6 +1525,13 @@ def generate_set(
     out = repo.load_set(set_id) or {"id": set_id, "items": []}
     out["from_cache_count"] = from_cache_total
     out["generated_count"] = generated_total
+    if role_keywords:
+        cov = _build_role_coverage_summary(selected_all, role_keywords)
+        out["author_roles"] = roles
+        out["role_coverage_summary"] = cov
+        missing = [r for r in roles if int(cov.get(r, 0)) <= 0]
+        if missing and coverage_mode == "balanced_union":
+            out["coverage_warning"] = f"以下身份题目覆盖不足：{', '.join(missing)}。请增加题量、调整身份组合或更换项目案例。"
     return out
 
 
