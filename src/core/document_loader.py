@@ -26,7 +26,7 @@ from langchain_community.document_loaders import (
 
 from config import settings
 from config.settings import get_pdf_ocr_llm_model
-from config.cursor_overrides import get_llm_verify_ssl, get_llm_trust_env
+from config.cursor_overrides import build_llm_httpx_client
 
 LOADER_MAP = {
     ".pdf": PyPDFLoader,
@@ -278,7 +278,7 @@ def _pdf_ocr_with_multimodal_llm(
     docs: List[Document] = []
     timeout = httpx.Timeout(180.0, connect=45.0)
     err_detail = ""
-    with httpx.Client(verify=get_llm_verify_ssl(), trust_env=get_llm_trust_env(), timeout=timeout) as client:
+    with build_llm_httpx_client(timeout=timeout) as client:
         try:
             total = min(len(pdf), max_pages)
             for i in range(total):

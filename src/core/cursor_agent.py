@@ -7,11 +7,26 @@ from __future__ import annotations
 
 import base64
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional, TypeVar
 
 import httpx
 
 from config import settings
+
+_T = TypeVar("_T")
+
+# 代理/弱网下常见的可重试网络错误
+_TRANSIENT_NET_EXC = (
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    httpx.TimeoutException,
+    OSError,
+)
+
+_CURSOR_HTTP_MAX_ATTEMPTS = 4
+_CURSOR_HTTP_RETRY_BASE_SEC = 2.0
 
 
 def _auth_header(api_key: str) -> str:
@@ -31,16 +46,86 @@ def _base_url(base: str) -> str:
 
 
 def _http_client(timeout: float = 60) -> httpx.Client:
-    """统一创建 httpx 客户端。支持：关闭 SSL 校验、绕过系统代理（代理导致 SSL EOF 时）"""
+    """统一创建 httpx 客户端。支持：关闭 SSL 校验、显式/环境变量代理。"""
     try:
-        from config.cursor_overrides import get_cursor_verify_ssl, get_cursor_trust_env
+        from config.cursor_overrides import build_llm_httpx_client
 
-        verify = get_cursor_verify_ssl()
-        trust_env = get_cursor_trust_env()
+        t = timeout if isinstance(timeout, httpx.Timeout) else httpx.Timeout(
+            timeout, connect=min(45.0, max(15.0, timeout * 0.25))
+        )
+        return build_llm_httpx_client(timeout=t)
     except Exception:
-        verify = True
-        trust_env = True
-    return httpx.Client(timeout=timeout, verify=verify, trust_env=trust_env)
+        return httpx.Client(timeout=timeout, verify=True, trust_env=True, http2=False)
+
+
+def _is_transient_network_error(exc: BaseException) -> bool:
+    el = str(exc).lower()
+    return any(
+        x in el
+        for x in (
+            "10054",
+            "connection",
+            "reset",
+            "eof",
+            "ssl",
+            "timeout",
+            "broken pipe",
+            "handshake",
+            "protocol",
+        )
+    )
+
+
+def _cursor_connect_runtime_error(base: str, exc: BaseException) -> RuntimeError:
+    return RuntimeError(
+        f"无法连接 Cursor API（{_base_url(base)}）：{exc}。"
+        "请检查：1) 本机/代理能否稳定访问 api.cursor.com（Clash 建议开 TUN 或固定节点）；"
+        "2) .env 中 HTTP_PROXY/LLM_HTTP_PROXY 是否与 Clash 端口一致；"
+        "3) 证书异常时可试侧栏「不校验 SSL」。"
+        " 若为偶发 SSL EOF，程序已自动重试；仍失败多为代理链路不稳，请换节点或稍后重试。"
+    )
+
+
+def _with_http_retry(
+    op: Callable[[], _T],
+    *,
+    context: str = "cursor_http",
+    max_attempts: int = _CURSOR_HTTP_MAX_ATTEMPTS,
+) -> _T:
+    last: Optional[BaseException] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return op()
+        except _TRANSIENT_NET_EXC as e:
+            last = e
+            if attempt < max_attempts and _is_transient_network_error(e):
+                time.sleep(_CURSOR_HTTP_RETRY_BASE_SEC * attempt)
+                continue
+            raise
+    if last is not None:
+        raise last
+    raise RuntimeError(f"{context}: 请求失败")
+
+
+def _http_request(
+    method: str,
+    url: str,
+    *,
+    headers: dict,
+    json: Optional[dict] = None,
+    timeout: float = 60,
+    context: str = "",
+) -> httpx.Response:
+    def _do() -> httpx.Response:
+        with _http_client(timeout=timeout) as client:
+            if method.upper() == "POST":
+                return client.post(url, json=json, headers=headers)
+            return client.get(url, headers=headers)
+
+    try:
+        return _with_http_retry(_do, context=context or url)
+    except _TRANSIENT_NET_EXC as e:
+        raise _cursor_connect_runtime_error(url, e) from e
 
 
 def _raise_for_status_with_body(r: httpx.Response, context: str = "") -> None:
@@ -60,6 +145,11 @@ def _raise_for_status_with_body(r: httpx.Response, context: str = "") -> None:
     hint = ""
     if r.status_code == 404:
         hint = " 请检查：1) Cursor API 基地址是否为 https://api.cursor.com；2) GitHub 仓库地址与分支/ref 是否正确且可访问；3) API Key 是否有效（Cursor Dashboard → Integrations）。"
+    if r.status_code == 400 and "region" in (msg or "").lower():
+        hint = (
+            " 当前 Cursor 账号/请求来源地区不在 Cloud Agents 支持范围内（与网络是否连通无关）。"
+            " 见 https://cursor.com/docs/account/regions ；可换支持地区的网络/账号，或改用通义/DeepSeek/OpenAI 中转等提供方。"
+        )
     raise RuntimeError(f"Error code: {r.status_code} - {msg}{hint}".strip())
 
 
@@ -82,21 +172,16 @@ def launch_agent(prompt_text: str, *, client_llm: Optional[Any] = None) -> str:
         },
         "target": {"autoCreatePr": False},
     }
-    with _http_client(timeout=90) as client:
-        try:
-            r = client.post(url, json=payload, headers=_get_headers(p["api_key"]))
-        except (httpx.ConnectError, httpx.ReadError, OSError) as e:
-            el = str(e).lower()
-            if "10054" in str(e) or "connection" in el or "reset" in el or "eof" in el or "ssl" in el:
-                raise RuntimeError(
-                    f"无法连接 Cursor API（{_base_url(p['base_url'])}）：{e}。"
-                    "请检查：1) 本机/代理能否访问 api.cursor.com；"
-                    "2) 侧栏「不使用系统代理」是否与 Clash 规则匹配（Cursor 需走代理时可取消勾选）；"
-                    "3) 证书异常时可试「不校验 SSL」。"
-                ) from e
-            raise
-        _raise_for_status_with_body(r, "launch_agent")
-        data = r.json()
+    r = _http_request(
+        "POST",
+        url,
+        json=payload,
+        headers=_get_headers(p["api_key"]),
+        timeout=90,
+        context="launch_agent",
+    )
+    _raise_for_status_with_body(r, "launch_agent")
+    data = r.json()
     return data["id"]
 
 
@@ -112,10 +197,15 @@ def get_agent_status(agent_id: str, *, client_llm: Optional[Any] = None) -> dict
     if not p["api_key"]:
         raise RuntimeError("Cursor 模式下缺少 API Key")
     url = f"{_base_url(p['base_url'])}/v0/agents/{agent_id}"
-    with _http_client(timeout=_POLL_REQUEST_TIMEOUT) as client:
-        r = client.get(url, headers=_get_headers(p["api_key"]))
-        _raise_for_status_with_body(r, "get_agent_status")
-        return r.json()
+    r = _http_request(
+        "GET",
+        url,
+        headers=_get_headers(p["api_key"]),
+        timeout=_POLL_REQUEST_TIMEOUT,
+        context="get_agent_status",
+    )
+    _raise_for_status_with_body(r, "get_agent_status")
+    return r.json()
 
 
 def get_agent_conversation(agent_id: str, *, client_llm: Optional[Any] = None) -> list:
@@ -126,10 +216,15 @@ def get_agent_conversation(agent_id: str, *, client_llm: Optional[Any] = None) -
     if not p["api_key"]:
         raise RuntimeError("Cursor 模式下缺少 API Key")
     url = f"{_base_url(p['base_url'])}/v0/agents/{agent_id}/conversation"
-    with _http_client(timeout=_POLL_REQUEST_TIMEOUT) as client:
-        r = client.get(url, headers=_get_headers(p["api_key"]))
-        _raise_for_status_with_body(r, "get_agent_conversation")
-        data = r.json()
+    r = _http_request(
+        "GET",
+        url,
+        headers=_get_headers(p["api_key"]),
+        timeout=_POLL_REQUEST_TIMEOUT,
+        context="get_agent_conversation",
+    )
+    _raise_for_status_with_body(r, "get_agent_conversation")
+    data = r.json()
     return data.get("messages") or []
 
 

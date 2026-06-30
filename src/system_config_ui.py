@@ -35,6 +35,9 @@ MYSQL_KEYS = [
 NETWORK_KEYS = [
     "llm_verify_ssl",
     "llm_trust_env",
+    "llm_http_proxy",
+    "llm_proxy_foreign_suffixes",
+    "llm_proxy_domestic_suffixes",
 ]
 
 CHROMA_CHUNK_KEYS = [
@@ -174,7 +177,7 @@ def _ai_keys_for_provider(provider: str) -> List[str]:
     if p == "gemini":
         return ["gemini_api_key", "google_api_key"]
     if p == "tongyi":
-        return ["dashscope_api_key"]
+        return ["dashscope_api_key", "ollama_base_url"]
     if p == "baidu":
         return ["qianfan_ak", "qianfan_sk"]
     if p == "claude":
@@ -269,6 +272,9 @@ FIELD_LABELS: Dict[str, str] = {
     "cursor_embedding": "Cursor 侧嵌入后端（如 ollama）",
     "llm_verify_ssl": "校验 HTTPS 证书（关闭=不校验，与侧栏一致）",
     "llm_trust_env": "使用系统代理（关闭=直连，与侧栏一致）",
+    "llm_http_proxy": "显式 HTTP 代理（如 http://127.0.0.1:7897；仅国外 AI 域名走代理，国内/内网直连）",
+    "llm_proxy_foreign_suffixes": "追加走代理的域名后缀（逗号分隔，如 .openai.com）",
+    "llm_proxy_domestic_suffixes": "追加直连的域名后缀（逗号分隔，如 .your-company.cn）",
     "cursor_verify_ssl": "cursor_verify_ssl（兼容项，保存时与上一项同步）",
     "cursor_trust_env": "cursor_trust_env（兼容项，保存时与上一项同步）",
     "llm_model": "对话模型名（须与当前提供方一致，如 qwen2.5 / gpt-4o / deepseek-chat）",
@@ -716,7 +722,7 @@ def render_system_config_body() -> None:
         _render_draft_integration_tab()
     elif section == "网络/SSL":
         _render_static_keys(
-            "网络 / SSL / 代理（与侧栏「不校验 SSL」「不使用系统代理」一致；默认即当前运行配置）",
+            "网络 / SSL / 代理（与侧栏一致；llm_http_proxy 或 .env 中 HTTP_PROXY 会强制注入 Python 请求）",
             NETWORK_KEYS,
         )
     elif section == "向量分块":

@@ -688,6 +688,10 @@ def _sidebar_hydrate_on_provider_tab_change(provider: str) -> None:
         st.session_state[f"sidebar_claude_base_url_{provider}_v2"] = bu
         settings.claude_base_url = bu
 
+    if provider in ("tongyi", "gemini", "baidu", "claude", "deepseek", "lingyi", "openai"):
+        ou = (slot.get("ollama_base_url") or "").strip() or (settings.ollama_base_url or "http://localhost:11434").strip()
+        st.session_state["sidebar_ollama_base_url_shared"] = ou
+
 
 def _sidebar_fill_missing_widget_keys(provider: str) -> None:
     """同提供方下热重载等导致 session 丢键时，用预设补全，不覆盖已有输入。"""
@@ -727,6 +731,12 @@ def _sidebar_fill_missing_widget_keys(provider: str) -> None:
         bk = f"sidebar_claude_base_url_{provider}_v2"
         if bk not in st.session_state:
             st.session_state[bk] = (slot.get("claude_base_url") or "").strip() or (settings.claude_base_url or "https://api.anthropic.com").strip()
+    if provider in ("tongyi", "gemini", "baidu", "claude", "deepseek", "lingyi", "openai"):
+        if "sidebar_ollama_base_url_shared" not in st.session_state:
+            st.session_state["sidebar_ollama_base_url_shared"] = (
+                (slot.get("ollama_base_url") or "").strip()
+                or (settings.ollama_base_url or "http://localhost:11434").strip()
+            )
 
 
 def render_sidebar():
@@ -858,7 +868,7 @@ def render_sidebar():
             "不使用系统代理（所有 AI 服务）",
             value=not get_llm_trust_env(),
             key="llm_no_proxy",
-            help="直连 API、不走系统代理；代理导致 SSL EOF 时可勾选。",
+            help="关闭后 httpx 不再读系统代理；.env 的 HTTP_PROXY 仅用于国外 AI（openai/cursor 等），国内与内网直连。",
         )
         _cursor_overrides["trust_env"] = not llm_no_proxy
 
@@ -1001,8 +1011,14 @@ def render_sidebar():
             )
             embed_model = st.text_input(
                 "向量化模型",
-                help="通义向量可用 text-embedding-v3，需单独接 Embedding API；当前可先 Ollama",
+                help="审核检索走 **远程 Ollama**（见下方），如 nomic-embed-text；与 DashScope 对话 Key 无关",
                 key=f"sidebar_embed_model_{_provider}_v2",
+            )
+            st.text_input(
+                "Ollama 地址",
+                value=(settings.ollama_base_url or "http://localhost:11434").strip(),
+                key="sidebar_ollama_base_url_shared",
+                help="填服务器 Ollama，如 http://10.26.1.221:11434",
             )
         elif _provider == "baidu":
             st.caption("密钥请配置 QIANFAN_AK、QIANFAN_SK（.env）。")
@@ -1123,6 +1139,7 @@ def render_sidebar():
             _ou_shared = st.session_state.get("sidebar_ollama_base_url_shared")
             if _ou_shared:
                 _preset_updates["ollama_base_url"] = str(_ou_shared).strip()
+                settings.ollama_base_url = str(_ou_shared).strip()
             if is_openai_form:
                 _preset_updates["base_url"] = sanitize_openai_form_base_url(_provider, (base_url or "").strip())
                 if _provider == "openai":

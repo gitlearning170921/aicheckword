@@ -142,15 +142,15 @@ def _create_embeddings():
         settings.is_ollama
         or (settings.is_cursor and (settings.cursor_embedding or "").lower() == "ollama")
         or (p == "openai" and (getattr(settings, "openai_embedding", None) or "ollama").strip().lower() != "openai")
-        or p in ("deepseek", "lingyi", "claude")
+        or p in ("deepseek", "lingyi", "claude", "tongyi", "gemini", "baidu")
     )
     # 防御：若即将用 OpenAIEmbeddings 且 base_url 为 DeepSeek（会 404），则改用 Ollama；排除 Cursor 以不影响其「向量化=openai」的用法
     if not use_ollama and ("deepseek.com" in (settings.openai_base_url or "")) and p != "cursor":
         use_ollama = True
     if use_ollama:
         from langchain_ollama import OllamaEmbeddings
-        from config.cursor_overrides import get_llm_verify_ssl, get_llm_trust_env
-        client_kwargs = {"verify": get_llm_verify_ssl(), "trust_env": get_llm_trust_env()}
+        from config.cursor_overrides import llm_httpx_client_kwargs, build_llm_httpx_client
+        client_kwargs = llm_httpx_client_kwargs(for_url=settings.ollama_base_url)
         # 防御：Ollama embedding_model 若误填 OpenAI 的 text-embedding-* 会导致 404（提示 pull it first）。
         # 这里自动回退到本项目默认 embedding（避免 quiz/检索链路直接 500）。
         emb_model = (settings.embedding_model or "").strip() or "nomic-embed-text"
@@ -163,11 +163,11 @@ def _create_embeddings():
         )
     else:
         from langchain_openai import OpenAIEmbeddings
-        from config.cursor_overrides import get_llm_verify_ssl, get_llm_trust_env
+        from config.cursor_overrides import build_llm_httpx_client
         import httpx
         if not settings.openai_api_key:
             raise RuntimeError("请配置 OpenAI API Key（用于向量化或 OpenAI 模式）")
-        http_client = httpx.Client(verify=get_llm_verify_ssl(), trust_env=get_llm_trust_env())
+        http_client = build_llm_httpx_client(for_url=settings.openai_base_url)
         emb_model = (settings.embedding_model or "").strip() or "text-embedding-3-small"
         if not emb_model.lower().startswith("text-embedding-"):
             emb_model = "text-embedding-3-small"

@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     # 所有 AI 服务通用：HTTP 请求行为（侧栏「不校验 SSL」「不使用系统代理」）
     llm_verify_ssl: bool = True  # False 时不校验 SSL（代理/证书异常时可勾选）
     llm_trust_env: bool = True  # False 时不使用系统代理，直连 API（代理导致 SSL EOF 时可勾选）
+    # 显式 HTTP 代理（如 Clash http://127.0.0.1:7897）；空则读 HTTPS_PROXY/HTTP_PROXY
+    llm_http_proxy: str = ""
+    # 追加「走代理」的域名后缀（逗号分隔，如 .your-relay.com）；内置已含 openai.com/cursor.com 等
+    llm_proxy_foreign_suffixes: str = ""
+    # 追加「直连」的域名后缀（逗号分隔）；内置已含 deepseek.com/aliyuncs.com 等
+    llm_proxy_domestic_suffixes: str = ""
 
     # Cursor Cloud Agents API (provider=cursor 时使用)
     cursor_api_key: str = ""
@@ -178,9 +184,11 @@ class Settings(BaseSettings):
     kdocs_app_key: str = ""
 
     # 兼容历史部署：优先读取 .env；测试环境用 AICHECKWORD_DOTENV_PATH 指向 .env.test
+    # extra=ignore：允许 .env 中存在 HTTP_PROXY/HTTPS_PROXY 等标准环境变量名，避免 Settings 校验失败
     model_config = {
         "env_file": _resolve_dotenv_paths(),
         "env_file_encoding": "utf-8",
+        "extra": "ignore",
     }
 
     @property
@@ -220,6 +228,13 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+try:
+    from config.http_proxy_policy import bootstrap_no_proxy_env
+
+    bootstrap_no_proxy_env()
+except Exception:
+    pass
 
 
 def pdf_ocr_llm_model_field_available() -> bool:

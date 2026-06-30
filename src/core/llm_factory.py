@@ -12,7 +12,7 @@ from typing import Any, Iterator, Mapping, Optional
 import httpx
 
 from config import settings
-from config.cursor_overrides import get_llm_verify_ssl, get_llm_trust_env
+from config.cursor_overrides import build_llm_httpx_client, llm_httpx_client_kwargs
 
 
 @dataclass
@@ -265,7 +265,7 @@ def _openai_http_client(*, timeout: Optional[httpx.Timeout] = None) -> httpx.Cli
     """供 ChatOpenAI 使用的 httpx 客户端，应用「不校验 SSL」「不使用系统代理」通用配置。"""
     # 长审核/大上下文时默认超时过短易被误判为 Connection error；DeepSeek 等在工厂内单独加长
     t = timeout or httpx.Timeout(600.0, connect=45.0)
-    return httpx.Client(verify=get_llm_verify_ssl(), trust_env=get_llm_trust_env(), timeout=t)
+    return build_llm_httpx_client(timeout=t)
 
 
 def _claude_api_key() -> str:
@@ -278,7 +278,7 @@ def _claude_base_url() -> str:
 
 def _claude_http_client(*, timeout: Optional[httpx.Timeout] = None) -> httpx.Client:
     t = timeout or httpx.Timeout(600.0, connect=45.0)
-    return httpx.Client(verify=get_llm_verify_ssl(), trust_env=get_llm_trust_env(), timeout=t)
+    return build_llm_httpx_client(timeout=t)
 
 
 def _create_claude_chat_llm(temperature: float = 0.1):
@@ -358,7 +358,7 @@ def create_chat_llm(temperature: float = 0.1):
     if p == "ollama":
         from langchain_ollama import ChatOllama
         # Ollama 使用 client_kwargs 传入 verify/trust_env，与通用「不校验 SSL」「不使用系统代理」一致
-        client_kwargs = {"verify": get_llm_verify_ssl(), "trust_env": get_llm_trust_env()}
+        client_kwargs = llm_httpx_client_kwargs(for_url=settings.ollama_base_url)
         return ChatOllama(
             model=settings.llm_model,
             base_url=settings.ollama_base_url,
