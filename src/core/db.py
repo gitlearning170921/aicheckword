@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pymysql
 from pymysql.cursors import DictCursor
-from pymysql.err import InterfaceError, OperationalError
+from pymysql.err import InterfaceError, IntegrityError, OperationalError
 
 from config import settings
 from config.settings import get_pdf_ocr_llm_model
@@ -1944,6 +1944,75 @@ def company_by_collection(collection: str) -> Optional[dict]:
     return None
 
 
+class CompanyMappingConflictError(Exception):
+    """companies 表唯一约束冲突（HTTP 409）。"""
+
+
+def _find_claimable_seed_company_id(cur, knowledge_collection: str) -> Optional[str]:
+    """认领初始化种子行：aiword_company_id 为空且 collection 一致。"""
+    kc = str(knowledge_collection or "").strip() or "regulations"
+    cur.execute(
+        """
+        SELECT id FROM companies
+        WHERE knowledge_collection = %s
+          AND (aiword_company_id = '' OR aiword_company_id IS NULL)
+        ORDER BY is_default DESC, created_at ASC
+        LIMIT 1
+        """,
+        (kc,),
+    )
+    row = cur.fetchone()
+    if row and row.get("id"):
+        return str(row.get("id"))
+    return None
+
+
+def _company_mapping_conflict_message(exc: IntegrityError) -> str:
+    msg = str(exc)
+    if "uq_companies_name" in msg:
+        return "公司名称已被其他公司映射占用"
+    if "uq_companies_slug" in msg:
+        return "slug 已被其他公司映射占用"
+    if "uq_companies_collection" in msg:
+        return "knowledge_collection 已被其他公司映射占用"
+    return "公司映射与现有记录冲突（唯一约束）"
+
+
+def _apply_company_mapping_update(
+    cur,
+    cid: str,
+    *,
+    name: str,
+    slug: str,
+    knowledge_collection: str,
+    aiword_company_id: str,
+    is_active: bool,
+    is_default: bool,
+) -> None:
+    cur.execute(
+        """
+        UPDATE companies
+        SET name = %s,
+            slug = %s,
+            knowledge_collection = %s,
+            aiword_company_id = %s,
+            is_active = %s,
+            is_default = %s,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        """,
+        (
+            name,
+            slug,
+            knowledge_collection,
+            aiword_company_id,
+            1 if is_active else 0,
+            1 if is_default else 0,
+            cid,
+        ),
+    )
+
+
 def upsert_company_mapping(
     *,
     aiword_company_id: str,
@@ -1978,44 +2047,48 @@ def upsert_company_mapping(
             row = cur.fetchone()
             if row and row.get("id"):
                 cid = str(row.get("id"))
-                cur.execute(
-                    """
-                    UPDATE companies
-                    SET name = %s,
-                        slug = %s,
-                        knowledge_collection = %s,
-                        is_active = %s,
-                        is_default = %s,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                    """,
-                    (
-                        nm,
-                        sg,
-                        kc,
-                        1 if is_active else 0,
-                        1 if is_default else 0,
-                        cid,
-                    ),
+                _apply_company_mapping_update(
+                    cur,
+                    cid,
+                    name=nm,
+                    slug=sg,
+                    knowledge_collection=kc,
+                    aiword_company_id=aid,
+                    is_active=is_active,
+                    is_default=is_default,
                 )
             else:
-                cid = str(uuid.uuid4())
-                cur.execute(
-                    """
-                    INSERT INTO companies
-                    (id, name, slug, knowledge_collection, aiword_company_id, is_active, is_default)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
+                seed_id = _find_claimable_seed_company_id(cur, kc)
+                if seed_id:
+                    cid = seed_id
+                    _apply_company_mapping_update(
+                        cur,
                         cid,
-                        nm,
-                        sg,
-                        kc,
-                        aid,
-                        1 if is_active else 0,
-                        1 if is_default else 0,
-                    ),
-                )
+                        name=nm,
+                        slug=sg,
+                        knowledge_collection=kc,
+                        aiword_company_id=aid,
+                        is_active=is_active,
+                        is_default=is_default,
+                    )
+                else:
+                    cid = str(uuid.uuid4())
+                    cur.execute(
+                        """
+                        INSERT INTO companies
+                        (id, name, slug, knowledge_collection, aiword_company_id, is_active, is_default)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            cid,
+                            nm,
+                            sg,
+                            kc,
+                            aid,
+                            1 if is_active else 0,
+                            1 if is_default else 0,
+                        ),
+                    )
             if is_default:
                 cur.execute(
                     "UPDATE companies SET is_default = CASE WHEN id = %s THEN 1 ELSE 0 END",
@@ -2031,6 +2104,12 @@ def upsert_company_mapping(
             out = dict(cur.fetchone() or {})
         conn.commit()
         return out
+    except IntegrityError as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise CompanyMappingConflictError(_company_mapping_conflict_message(exc)) from exc
     finally:
         conn.close()
 

@@ -16,6 +16,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 FROM python:3.11-slim-bookworm AS runtime
 
+ARG APP_VERSION=dev
+ENV AICHECKWORD_APP_VERSION=${APP_VERSION}
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \

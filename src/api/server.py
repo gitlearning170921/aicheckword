@@ -18,6 +18,7 @@ os.environ["CHROMA_TELEMETRY"] = "False"
 os.environ["POSTHOG_DISABLED"] = "true"
 logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
 logging.getLogger("chromadb").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 
 class _QuietDraftJobStatusPollAccessFilter(logging.Filter):
@@ -70,6 +71,7 @@ from src.core.db import (
     get_project_case,
     upsert_company_mapping,
     delete_company_by_aiword_id,
+    CompanyMappingConflictError,
 )
 from src.core.project_option_label import format_project_option_label
 from src.core.document_loader import load_single_file, split_documents
@@ -961,7 +963,13 @@ def root():
 @app.get("/health")
 def health():
     """兼容上游健康检查：aiword 默认探测 /health。"""
-    return {"status": "ok", "service": "aicheckword"}
+    import os
+
+    ver = (os.environ.get("AICHECKWORD_APP_VERSION") or os.environ.get("APP_VERSION") or "").strip()
+    payload = {"status": "ok", "service": "aicheckword"}
+    if ver:
+        payload["version"] = ver
+    return payload
 
 
 @app.get("/docs", include_in_schema=False)
@@ -998,6 +1006,8 @@ def admin_companies_sync(body: CompanySyncRequest):
         return {"ok": True, "data": row}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    except CompanyMappingConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -2236,6 +2246,53 @@ def quiz_student_unpracticed_bank(
             ),
         }
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/bank/author-role-coverage")
+def quiz_bank_author_role_coverage(
+    req: Request,
+    collection: str = Query("regulations"),
+    exam_track: str = Query(""),
+    author_roles: Optional[str] = Query(None),
+    authorRoles: Optional[str] = Query(None),
+):
+    try:
+        collection = _resolve_request_collection(req, collection)
+        roles_raw: List[str] = []
+        for key in ("author_roles", "authorRoles"):
+            for item in req.query_params.getlist(key):
+                for seg in str(item or "").split(","):
+                    s = seg.strip().lower()
+                    if s:
+                        roles_raw.append(s)
+        for blob in (author_roles, authorRoles):
+            if blob is None:
+                continue
+            for seg in str(blob).split(","):
+                s = seg.strip().lower()
+                if s and s not in roles_raw:
+                    roles_raw.append(s)
+        seen_r: set[str] = set()
+        roles_norm: List[str] = []
+        for r in roles_raw:
+            if r in seen_r:
+                continue
+            seen_r.add(r)
+            roles_norm.append(r)
+        data = quiz_service.bank_author_role_coverage(
+            collection=collection,
+            exam_track=exam_track,
+            author_roles=roles_norm,
+        )
+        return {"ok": True, "data": data}
+    except Exception as e:
+        logger.exception(
+            "quiz_bank_author_role_coverage failed collection=%s exam_track=%s roles=%s",
+            collection,
+            exam_track,
+            author_roles or authorRoles,
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 

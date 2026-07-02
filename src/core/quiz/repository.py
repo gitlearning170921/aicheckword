@@ -34,15 +34,20 @@ def _parse_answer_question_id(raw: Any) -> int:
 
 
 def _normalize_question_stem_in_memory(item: Dict[str, Any]) -> None:
-    """各题型：若题干内嵌了与 evidence 相同的大段摘录，在返回给前端前截断（不改数据库）。"""
+    """读题出库：清理题干内部提示并补全判断题陈述（不改数据库；教师端仍保留 evidence）。"""
     try:
-        from src.core.quiz.service import _trim_embedded_evidence_from_stem as _trim_stem
+        from src.core.quiz.service import _sanitize_question_stem_for_display
+
+        _sanitize_question_stem_for_display(item)
     except Exception:
-        return
-    ev = item.get("evidence")
-    if not isinstance(ev, list):
-        return
-    item["stem"] = _trim_stem(str(item.get("stem") or ""), ev)
+        try:
+            from src.core.quiz.service import _trim_embedded_evidence_from_stem as _trim_stem
+
+            ev = item.get("evidence")
+            if isinstance(ev, list):
+                item["stem"] = _trim_stem(str(item.get("stem") or ""), ev)
+        except Exception:
+            return
 
 
 def _pick_user_answer_blob(x: Dict[str, Any]) -> Any:
@@ -190,6 +195,7 @@ def list_bank_questions(
     difficulty: Optional[str] = None,
     category: Optional[str] = None,
     limit: int = 50,
+    offset: int = 0,
     exclude_question_ids: Optional[Sequence[int]] = None,
 ) -> List[Dict[str, Any]]:
     db.init_db()
@@ -219,13 +225,14 @@ def list_bank_questions(
         where.append(f"q.id NOT IN ({marks})")
         params.extend(int(x) for x in exclude_question_ids)
     params.append(max(1, int(limit)))
+    params.append(max(0, int(offset)))
     sql = f"""
         SELECT q.id, q.question_type, q.difficulty, q.category, q.stem, q.options_json, q.answer_json, q.explanation, q.evidence_json,
                b.knowledge_scope_hash AS knowledge_scope_hash
         FROM quiz_question_bank b, quiz_questions q
         WHERE {' AND '.join(where)}
         ORDER BY b.use_count ASC, b.last_used_at ASC, b.id DESC
-        LIMIT %s
+        LIMIT %s OFFSET %s
     """
     try:
         with conn.cursor() as cur:
@@ -1004,6 +1011,92 @@ def admin_count_bank_questions(
             return int(row.get("n") or 0)
     finally:
         conn.close()
+
+
+def admin_count_bank_questions_role_keywords(
+    *,
+    collection: str,
+    exam_track: Optional[str] = None,
+    keywords: Optional[List[str]] = None,
+    is_active: Optional[bool] = True,
+) -> int:
+    """按身份关键词统计题库命中数：与组卷一致，检索 evidence_json 中的 source_file 及题干 stem。"""
+    kws = [str(k).strip().lower() for k in (keywords or []) if str(k).strip()]
+    if not kws:
+        return 0
+    db.init_db()
+    conn = db._get_conn()  # noqa: SLF001
+    try:
+        with conn.cursor() as cur:
+            where: List[str] = ["b.collection=%s", "q.id=b.question_id"]
+            params: List[Any] = [collection]
+            if exam_track:
+                where.append("b.exam_track=%s")
+                params.append(exam_track)
+            if is_active is not None:
+                where.append("b.is_active=%s")
+                params.append(1 if is_active else 0)
+            hit_parts: List[str] = []
+            for kw in kws:
+                like = f"%{kw}%"
+                hit_parts.append(
+                    "(LOWER(COALESCE(q.evidence_json, '')) LIKE %s OR LOWER(COALESCE(q.stem, '')) LIKE %s)"
+                )
+                params.extend([like, like])
+            where.append("(" + " OR ".join(hit_parts) + ")")
+            sql = f"""
+                SELECT COUNT(DISTINCT q.id) AS n
+                FROM quiz_question_bank b, quiz_questions q
+                WHERE {' AND '.join(where)}
+            """
+            cur.execute(sql, tuple(params))
+            row = cur.fetchone() or {}
+            return int(row.get("n") or 0)
+    finally:
+        conn.close()
+
+
+def admin_list_bank_questions_role_coverage_batch(
+    *,
+    collection: str,
+    exam_track: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+    is_active: Optional[bool] = True,
+) -> List[Dict[str, Any]]:
+    """身份覆盖统计专用：仅拉 id/stem/explanation/evidence，避免解析 options/answer 拖慢扫描。"""
+    limit = max(1, int(limit))
+    offset = max(0, int(offset))
+    db.init_db()
+    conn = db._get_conn()  # noqa: SLF001
+    try:
+        with conn.cursor() as cur:
+            where: List[str] = ["b.collection=%s", "q.id=b.question_id"]
+            params: List[Any] = [collection]
+            if exam_track:
+                where.append("b.exam_track=%s")
+                params.append(exam_track)
+            if is_active is not None:
+                where.append("b.is_active=%s")
+                params.append(1 if is_active else 0)
+            params.extend([limit, offset])
+            sql = f"""
+                SELECT q.id, q.question_type, q.stem, q.explanation, q.evidence_json
+                FROM quiz_question_bank b, quiz_questions q
+                WHERE {' AND '.join(where)}
+                GROUP BY q.id, q.question_type, q.stem, q.explanation, q.evidence_json
+                ORDER BY MAX(b.id) DESC
+                LIMIT %s OFFSET %s
+            """
+            cur.execute(sql, tuple(params))
+            rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        r["evidence"] = _load(r.pop("evidence_json", "[]"), [])
+        out.append(r)
+    return out
 
 
 def admin_list_bank_questions(

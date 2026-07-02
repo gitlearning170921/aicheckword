@@ -119,6 +119,25 @@ def sync_cursor_overrides_from_settings() -> None:
         pass
 
 
+def refresh_runtime_settings_from_db_if_available() -> int:
+    """从 app_settings.runtime_settings_json 热加载到内存 settings（API 与 Streamlit 分进程时必需）。"""
+    try:
+        from src.core.db import load_app_settings
+
+        row = load_app_settings()
+        if not row:
+            return 0
+        raw_json = row.get("runtime_settings_json")
+        if not raw_json:
+            return 0
+        parsed = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+        if not isinstance(parsed, dict) or not parsed:
+            return 0
+        return apply_runtime_config_dict(parsed)
+    except Exception:
+        return 0
+
+
 def export_dotenv_lines() -> str:
     """生成可粘贴到 .env 的文本（字段名大写，便于新机器最小启动）。"""
     lines: List[str] = []

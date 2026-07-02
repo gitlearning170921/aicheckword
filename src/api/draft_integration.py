@@ -69,6 +69,7 @@ _executor = ThreadPoolExecutor(max_workers=2)
 _INTEROP_PROVIDER_LABELS: Dict[str, str] = {
     "deepseek": "DeepSeek (OpenAI 兼容)",
     "openai": "OpenAI",
+    "claude": "Claude (Anthropic)",
     "lingyi": "零一万物 (OpenAI 兼容)",
     "gemini": "Google Gemini",
     "tongyi": "阿里通义千问",
@@ -82,6 +83,9 @@ _DEFAULT_INTEROP_DISPLAY_IDS: tuple[str, ...] = tuple(sorted(_INTEROP_PROVIDER_L
 
 def _draft_provider_whitelist_for_jobs() -> Optional[frozenset[str]]:
     """若管理员配置非空，则初稿任务仅允许列出的 provider；None 表示不限制。"""
+    from config.runtime_settings import refresh_runtime_settings_from_db_if_available
+
+    refresh_runtime_settings_from_db_if_available()
     raw = (getattr(settings, "draft_interop_allowed_providers", None) or "").strip()
     if not raw:
         return None
@@ -868,7 +872,7 @@ async def draft_llm_key_test(request: Request):
                 detail=f"当前初稿联调配置不允许 provider={eff_provider!r}，允许：{', '.join(sorted(wlist))}",
             )
         if client_llm.personal_keys_only:
-            if eff_provider in ("deepseek", "openai", "lingyi", "tongyi", "cursor"):
+            if eff_provider in ("deepseek", "openai", "lingyi", "tongyi", "cursor", "claude"):
                 if not (client_llm.api_key or "").strip():
                     raise HTTPException(
                         status_code=400,
@@ -930,7 +934,13 @@ async def draft_llm_key_test(request: Request):
             raise HTTPException(status_code=400, detail=err) from e
         finally:
             unbind_request_client_llm(_cl_token)
-        labels = {"deepseek": "DeepSeek", "openai": "OpenAI", "lingyi": "零一万物", "tongyi": "通义千问"}
+        labels = {
+            "deepseek": "DeepSeek",
+            "openai": "OpenAI",
+            "claude": "Claude",
+            "lingyi": "零一万物",
+            "tongyi": "通义千问",
+        }
         label = labels.get(eff_provider, eff_provider)
         return {"ok": True, "message": f"{label} Key 验证通过（aicheckword 侧栏同路径）"}
     except HTTPException:
@@ -981,7 +991,7 @@ async def draft_create_job(
             )
     if client_llm.personal_keys_only:
         ep = (eff_provider or "").lower()
-        if ep in ("deepseek", "openai", "lingyi", "tongyi", "cursor"):
+        if ep in ("deepseek", "openai", "lingyi", "tongyi", "cursor", "claude"):
             if not (client_llm.api_key or "").strip():
                 raise HTTPException(
                     status_code=400,
