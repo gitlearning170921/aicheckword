@@ -460,6 +460,11 @@ class QuizGenerateSetRequest(BaseModel):
     created_by: str = "system"
     # exam_category=project_case 时必填：project_cases.id
     project_case_id: Optional[int] = Field(default=None, alias="projectCaseId")
+    author_roles: List[str] = Field(default_factory=list, validation_alias=AliasChoices("author_roles", "authorRoles"))
+    author_role_coverage: str = Field(
+        default="balanced_union",
+        validation_alias=AliasChoices("author_role_coverage", "authorRoleCoverage"),
+    )
 
 
 class QuizPracticeSetRequest(BaseModel):
@@ -1823,6 +1828,8 @@ def quiz_generate_set(http_req: Request, request: QuizGenerateSetRequest):
             status="draft",
             exam_category=request.exam_category,
             project_case_id=request.project_case_id,
+            author_roles=request.author_roles,
+            author_role_coverage=request.author_role_coverage,
         )
         return {"ok": True, "data": data}
     except QuizRequestError as e:
@@ -2245,6 +2252,26 @@ def quiz_student_unpracticed_bank(
                 collection=collection, user_id=user_id, exam_track=exam_track, limit=limit
             ),
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/tools/open-book-reference")
+def quiz_open_book_reference(
+    req: Request,
+    collection: str = Query("regulations"),
+    source_file: str = Query(""),
+    sourceFile: str = Query(""),
+):
+    try:
+        collection = _resolve_request_collection(req, collection)
+        sf = (source_file or sourceFile or "").strip()
+        if not sf:
+            raise HTTPException(status_code=400, detail="缺少 source_file")
+        data = quiz_service.open_book_reference(collection=collection, source_file=sf)
+        return {"ok": True, "data": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

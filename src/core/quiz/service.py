@@ -165,7 +165,22 @@ _AUTHOR_ROLE_FILE_KEYWORDS: Dict[str, List[str]] = {
         "医疗器械软件",
         "独立软件",
     ],
-    "cm": ["配置", "cm", "baseline", "基线", "版本", "发布", "变更", "追溯"],
+    "cm": [
+        "配置管理计划",
+        "配置状态报告",
+        "配置审计",
+        "配置基线",
+        "配置控制",
+        "基线管理",
+        "配置",
+        "cm",
+        "baseline",
+        "版本",
+        "发布",
+        "变更",
+        "追溯",
+        "配置管理",
+    ],
     "ra": [
         "注册", "法规", "标准", "指导原则", "合规", "申报",
         "条例", "办法", "通告", "公告", "mdr", "ivdr", "510k",
@@ -211,10 +226,68 @@ _AUTHOR_ROLE_FILE_KEYWORDS: Dict[str, List[str]] = {
 
 COMMON_AUTHOR_ROLE_KEY = "common"
 COMMON_AUTHOR_ROLE_LABEL = "通用（各身份必考）"
-_FOCUS_EXAM_ROLES = {"pjm", "rdm", "rm", "qa", "prod"}
+_FOCUS_EXAM_ROLES = {"pjm", "rdm", "rm", "qa", "prod", "cm"}
 _LEADERSHIP_CROSS_ROLES = {"pjm", "rdm"}
-_PROD_WEAK_KEYWORDS = {"发布", "软件发布", "上市"}
-_PROD_CONTEXT_HINTS = {
+
+
+def _load_role_focus_config() -> Dict[str, Dict[str, Any]]:
+    try:
+        from src.core.quiz.role_focus_config import ROLE_FOCUS_CONFIG
+
+        if isinstance(ROLE_FOCUS_CONFIG, dict):
+            return ROLE_FOCUS_CONFIG
+    except Exception:
+        pass
+    return {}
+
+
+_ROLE_FOCUS_CONFIG: Dict[str, Dict[str, Any]] = _load_role_focus_config()
+
+
+def _role_common_label_empty() -> bool:
+    try:
+        from src.core.quiz.role_focus_config import COMMON_ROLE_LABEL_EMPTY
+
+        return bool(COMMON_ROLE_LABEL_EMPTY)
+    except Exception:
+        return True
+
+
+_COMMON_ROLE_LABEL_EMPTY = _role_common_label_empty()
+
+
+def _cfg_list(role: str, field: str) -> List[str]:
+    cfg = _ROLE_FOCUS_CONFIG.get(str(role).strip().lower()) or {}
+    vals = cfg.get(field)
+    if not isinstance(vals, list):
+        return []
+    return [str(x).strip() for x in vals if str(x).strip()]
+
+
+# 体考关注度权重（老师端不勾身份时按此自动分配命题岗位；pjm/rdm 更高）
+_ROLE_EXAM_WEIGHT: Dict[str, float] = {}
+for _r, _c in (_ROLE_FOCUS_CONFIG or {}).items():
+    try:
+        _ROLE_EXAM_WEIGHT[str(_r).strip().lower()] = float((_c or {}).get("exam_weight") or 0.0)
+    except (TypeError, ValueError):
+        _ROLE_EXAM_WEIGHT[str(_r).strip().lower()] = 0.0
+
+# 岗位命题口吻/侧重 与 必考文件（来自配置，供提示语使用）
+_ROLE_PROMPT_EMPHASIS: Dict[str, str] = {
+    str(_r).strip().lower(): str((_c or {}).get("prompt_emphasis") or "").strip()
+    for _r, _c in (_ROLE_FOCUS_CONFIG or {}).items()
+}
+_ROLE_MUST_FILES: Dict[str, List[str]] = {
+    str(_r).strip().lower(): _cfg_list(_r, "must_files") for _r in (_ROLE_FOCUS_CONFIG or {}).keys()
+}
+# 易混淆需排除词（仅命中这些词、且无上下文时不计入该岗位）
+_ROLE_EXCLUDE_WORDS: Dict[str, set[str]] = {
+    str(_r).strip().lower(): {w.lower() for w in _cfg_list(_r, "exclude_words")}
+    for _r in (_ROLE_FOCUS_CONFIG or {}).keys()
+}
+
+_PROD_WEAK_KEYWORDS = _ROLE_EXCLUDE_WORDS.get("prod") or {"发布", "软件发布", "上市"}
+_PROD_CONTEXT_HINTS = set(_cfg_list("prod", "must_hints")) | set(_cfg_list("prod", "topics")) | {
     "生产",
     "放行",
     "批放行",
@@ -225,6 +298,34 @@ _PROD_CONTEXT_HINTS = {
     "委托生产",
     "受托生产",
 }
+_CM_WEAK_KEYWORDS = _ROLE_EXCLUDE_WORDS.get("cm") or {"版本", "发布", "变更", "追溯", "baseline"}
+_CM_CONTEXT_HINTS = set(_cfg_list("cm", "must_hints")) | {
+    "配置管理",
+    "配置管理计划",
+    "配置状态报告",
+    "配置审计",
+    "配置项",
+    "配置基线",
+    "基线管理",
+    "配置控制",
+}
+
+# 将配置中的别名并入岗位识别关键词（去重，配置为增量补充，不破坏内置）
+for _r, _c in (_ROLE_FOCUS_CONFIG or {}).items():
+    _rk = str(_r).strip().lower()
+    if not _rk:
+        continue
+    _base = [str(x).strip().lower() for x in (_AUTHOR_ROLE_FILE_KEYWORDS.get(_rk) or []) if str(x).strip()]
+    _extra = [str(x).strip().lower() for x in (_c or {}).get("aliases", []) if str(x).strip()]
+    _extra += [str(x).strip().lower() for x in (_c or {}).get("must_hints", []) if str(x).strip()]
+    _merged: List[str] = []
+    _seen_kw: set[str] = set()
+    for _kw in _base + _extra:
+        if _kw and _kw not in _seen_kw:
+            _seen_kw.add(_kw)
+            _merged.append(_kw)
+    if _merged:
+        _AUTHOR_ROLE_FILE_KEYWORDS[_rk] = _merged
 _REGULATORY_HINTS = {
     "法规",
     "条例",
@@ -243,9 +344,32 @@ _ROLE_REGULATORY_HINTS: Dict[str, set[str]] = {
     "qa": {"设计验证", "设计确认", "确认与验证", "测试", "核查指南", "法规", "指导原则"},
     "prod": {"gmp", "生产质量管理规范", "批放行", "放行", "核查指南", "法规", "指导原则", "转换"},
 }
+# 必考硬性关键词 / 必考主题：优先取配置（role_focus_config.py），配置缺项时用内置默认兜底
+_ROLE_MUST_HINTS_DEFAULT: Dict[str, set[str]] = {
+    "cm": {"配置管理计划", "配置状态报告", "配置审计", "配置基线", "基线管理", "配置控制", "配置项", "版本控制", "变更控制"},
+    "prod": {"gmp", "生产质量管理规范", "批放行", "生产工艺", "批记录", "生产工艺规程", "洁净", "灭菌", "工艺验证"},
+    "pjm": {"项目计划", "里程碑", "进度", "wbs", "设计控制", "设计开发", "资源", "干系人", "结项", "立项"},
+    "rdm": {"详细设计", "架构设计", "软件生命周期", "软件生存周期", "现成软件", "soup", "设计开发", "设计变更", "代码"},
+    "rm": {"风险管理计划", "fmea", "风险分析", "风险控制", "残余风险", "受益风险", "iso 14971", "风险可接受准则"},
+    "qa": {"测试用例", "测试方案", "验证方案", "确认方案", "设计验证", "设计确认", "缺陷管理", "单元测试", "集成测试", "系统测试"},
+    "ra": {"注册申报", "临床评价", "同品种", "分类界定", "现场核查", "质量体系", "iso 13485", "注册变更"},
+    "pm": {"用户需求", "urs", "srs", "产品需求", "功能需求", "非功能需求", "预期用途", "适用范围"},
+    "ui": {"界面设计", "交互设计", "可用性", "人因", "原型", "用户体验"},
+}
+_ROLE_MUST_HINTS: Dict[str, set[str]] = {}
+for _r in set(list(_ROLE_MUST_HINTS_DEFAULT.keys()) + list((_ROLE_FOCUS_CONFIG or {}).keys())):
+    _cfg_must = {w for w in _cfg_list(_r, "must_hints")}
+    _ROLE_MUST_HINTS[_r] = _cfg_must or set(_ROLE_MUST_HINTS_DEFAULT.get(_r) or set())
+
+_ROLE_FOCUS_TOPICS: Dict[str, List[str]] = {}
+for _r in (_ROLE_FOCUS_CONFIG or {}).keys():
+    _tp = _cfg_list(_r, "topics")
+    if _tp:
+        _ROLE_FOCUS_TOPICS[str(_r).strip().lower()] = _tp
+
 
 _ROLE_COVERAGE_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
-_ROLE_COVERAGE_CACHE_TTL_SEC = 90.0
+_ROLE_COVERAGE_CACHE_TTL_SEC = 300.0
 
 
 class QuizRequestError(Exception):
@@ -527,23 +651,128 @@ def _question_source_files(question: Dict[str, Any]) -> List[str]:
     return out
 
 
-def _text_hits_any_keyword(text: str, keywords: List[str]) -> bool:
-    low = str(text or "").strip().lower()
-    if not low:
-        return False
-    return any(kw in low for kw in (keywords or []))
+_AUDIT_CHECKPOINT_FIELD_NAMES: tuple[str, ...] = (
+    "审核点编号",
+    "审核类别",
+    "审核点名称",
+    "详细描述",
+    "法规依据",
+    "检查方法",
+    "严重程度",
+    "适用文档",
+)
 
 
-def _question_role_hits(question: Dict[str, Any], role_keywords: Dict[str, List[str]]) -> set[str]:
-    return _question_role_hits_extended(question, role_keywords)
+def _is_audit_checkpoint_text(text: str) -> bool:
+    s = str(text or "")
+    return "审核点编号" in s or "审核点清单:" in s
 
 
-def _question_role_hits_extended(question: Dict[str, Any], role_keywords: Dict[str, List[str]]) -> set[str]:
+def _parse_audit_checkpoint_fields(text: str) -> Dict[str, str]:
+    """从审核点题干/摘录解析结构化字段（保留详细描述整段，不在分号处截断）。"""
+    s = str(text or "").strip()
+    out: Dict[str, str] = {}
+    if not s:
+        return out
+    pattern = r"(审核点编号|审核类别|审核点名称|详细描述|法规依据|检查方法|严重程度|适用文档)[：:]"
+    parts = re.split(pattern, s)
+    if len(parts) > 2:
+        i = 1
+        while i + 1 < len(parts):
+            key = str(parts[i] or "").strip()
+            val = str(parts[i + 1] or "").strip()
+            if key and val:
+                prev = str(out.get(key) or "").strip()
+                if not prev or len(val) > len(prev):
+                    out[key] = val
+            i += 2
+    for line in re.split(r"[\r\n]+", s):
+        line = line.strip()
+        if not line:
+            continue
+        for fn in _AUDIT_CHECKPOINT_FIELD_NAMES:
+            if line.startswith(fn + "：") or line.startswith(fn + ":"):
+                val = line.split("：", 1)[-1].split(":", 1)[-1].strip()
+                if val:
+                    prev = str(out.get(fn) or "").strip()
+                    if not prev or len(val) > len(prev):
+                        out[fn] = val
+    return out
+
+
+def _audit_checkpoint_fields_from_stem_and_evidence(
+    stem: str,
+    evidence: Optional[List[Any]] = None,
+) -> Dict[str, str]:
+    fields = _parse_audit_checkpoint_fields(stem)
+    if not isinstance(evidence, list):
+        return fields
+    for ev in evidence:
+        if not isinstance(ev, dict):
+            continue
+        sn = str(ev.get("content_snippet") or ev.get("content") or "").strip()
+        if not sn or not _is_audit_checkpoint_text(sn):
+            continue
+        for k, v in _parse_audit_checkpoint_fields(sn).items():
+            if not v:
+                continue
+            prev = str(fields.get(k) or "").strip()
+            if not prev or len(v) > len(prev):
+                fields[k] = v
+    return fields
+
+
+def _format_checklist_point_text(point: Dict[str, Any]) -> str:
+    if not isinstance(point, dict):
+        return ""
+    docs = point.get("applicable_docs") or []
+    if isinstance(docs, list):
+        docs_str = ", ".join(str(x).strip() for x in docs if str(x).strip())
+    else:
+        docs_str = str(docs or "").strip()
+    return (
+        f"审核点编号：{point.get('id', '')}\n"
+        f"审核类别：{point.get('category', '')}\n"
+        f"审核点名称：{point.get('name', '')}\n"
+        f"详细描述：{point.get('description', '')}\n"
+        f"法规依据：{point.get('regulation_ref', '')}\n"
+        f"检查方法：{point.get('check_method', '')}\n"
+        f"严重程度：{point.get('severity', '')}\n"
+        f"适用文档：{docs_str}"
+    ).strip()
+
+
+def _format_audit_checkpoint_true_false_stem(
+    stem: str,
+    evidence: Optional[List[Any]] = None,
+) -> str:
+    """审核点判断题：学生端仅展示待判断陈述（不含编号/法规/检查方法等字段）。"""
+    fields = _audit_checkpoint_fields_from_stem_and_evidence(stem, evidence)
+    if not fields.get("详细描述") and not fields.get("审核点编号"):
+        return str(stem or "").strip()
+    desc = str(fields.get("详细描述") or "").strip()
+    if not desc:
+        name = str(fields.get("审核点名称") or "").strip()
+        method = str(fields.get("检查方法") or "").strip()
+        if name and method:
+            desc = f"{name}。检查要求：{method}"
+        elif name:
+            desc = name
+        elif method:
+            desc = method
+    if not desc:
+        return str(stem or "").strip()
+    return f"判断下列陈述是否正确：\n{desc}".strip()
+
+
+def _match_role_keywords_in_blob(
+    blob: str,
+    sfiles: List[str],
+    role_keywords: Dict[str, List[str]],
+) -> set[str]:
     hits: set[str] = set()
     if not role_keywords:
         return hits
-    blob = _question_search_text(question)
-    sfiles = _question_source_files(question)
     for role, kws in role_keywords.items():
         if not kws:
             continue
@@ -561,7 +790,6 @@ def _question_role_hits_extended(question: Dict[str, Any], role_keywords: Dict[s
                     matched = True
                     break
         if role == "prod" and matched:
-            # 「发布/上市」在测试/配置题中也常出现；对生产专员要求具备生产语境，避免误吸测试题。
             weak_hit = any(kw in _PROD_WEAK_KEYWORDS for kw in kws_set if kw in blob) or any(
                 _text_hits_any_keyword(sf, list(_PROD_WEAK_KEYWORDS)) for sf in sfiles
             )
@@ -572,9 +800,93 @@ def _question_role_hits_extended(question: Dict[str, Any], role_keywords: Dict[s
                 has_strong = any((kw in blob) and (kw not in _PROD_WEAK_KEYWORDS) for kw in kws_set)
                 if not has_strong and not has_prod_context:
                     matched = False
+        if role == "cm" and matched:
+            # 「发布/版本/变更」在多类题中都高频；配置管理员要求明确配置管理语境。
+            weak_hit = any(kw in _CM_WEAK_KEYWORDS for kw in kws_set if kw in blob) or any(
+                _text_hits_any_keyword(sf, list(_CM_WEAK_KEYWORDS)) for sf in sfiles
+            )
+            if weak_hit:
+                has_cm_context = any(ctx in blob for ctx in _CM_CONTEXT_HINTS) or any(
+                    _text_hits_any_keyword(sf, list(_CM_CONTEXT_HINTS)) for sf in sfiles
+                )
+                has_strong = any((kw in blob) and (kw not in _CM_WEAK_KEYWORDS) for kw in kws_set)
+                if not has_strong and not has_cm_context:
+                    matched = False
+        if role == "qa" and matched:
+            # 生产/配置语境下的「检验」不等同于测试工程师职责
+            if any(x in blob for x in ("批记录", "批生产", "生产工艺", "gmp", "生产现场", "物料")):
+                if not any(x in blob for x in ("测试方案", "测试用例", "验证方案", "确认方案", "v&v", "软件测试")):
+                    matched = False
+        if matched and role not in ("prod", "cm"):
+            # 通用「易混淆排除词」门控：若仅因排除词命中、且无必考主题/关键词上下文，则不计入该岗位
+            excl = _ROLE_EXCLUDE_WORDS.get(role) or set()
+            if excl:
+                weak_hit = any((kw in excl) and (kw in blob) for kw in kws_set) or any(
+                    _text_hits_any_keyword(sf, list(excl)) for sf in sfiles
+                )
+                if weak_hit:
+                    ctx_terms = {str(x).lower() for x in (_ROLE_MUST_HINTS.get(role) or set())}
+                    ctx_terms |= {str(x).lower() for x in (_ROLE_FOCUS_TOPICS.get(role) or [])}
+                    has_ctx = any(ct and ct in blob for ct in ctx_terms) or any(
+                        _text_hits_any_keyword(sf, list(ctx_terms)) for sf in sfiles
+                    )
+                    has_strong = any((kw in blob) and (kw not in excl) for kw in kws_set)
+                    if not has_strong and not has_ctx:
+                        matched = False
         if matched:
             hits.add(role)
     return hits
+
+
+def _infer_audit_checkpoint_role_hits(question: Dict[str, Any]) -> set[str]:
+    blob = _question_search_text(question)
+    if not _is_audit_checkpoint_text(blob):
+        return set()
+    fields = _audit_checkpoint_fields_from_stem_and_evidence(
+        blob,
+        _item_evidence_for_display(question),
+    )
+    name = str(fields.get("审核点名称") or "").strip()
+    desc = str(fields.get("详细描述") or "").strip()
+    docs = str(fields.get("适用文档") or "").strip()
+    check_method = str(fields.get("检查方法") or "").strip()
+    primary = f"{name} {desc} {docs} {check_method}".strip().lower()
+    if not primary:
+        return set()
+    sfiles = _question_source_files(question)
+    sfiles.extend([str(fields.get("审核点编号") or "").strip(), docs])
+    hits = _match_role_keywords_in_blob(primary, [x for x in sfiles if x], _all_author_role_keyword_scope())
+    reg = str(fields.get("法规依据") or "").strip().lower()
+    if reg:
+        ra_scope = {"ra": list(_AUTHOR_ROLE_FILE_KEYWORDS.get("ra") or [])}
+        hits.update(_match_role_keywords_in_blob(reg, [], ra_scope))
+    if any(x in name for x in ("配置管理", "配置变更", "配置基线", "配置状态", "配置审计", "配置控制")):
+        hits.add("cm")
+    if any(x in name for x in ("批生产", "批记录", "生产现场", "生产工艺", "gmp", "放行")):
+        hits.add("prod")
+    return hits
+
+
+def _text_hits_any_keyword(text: str, keywords: List[str]) -> bool:
+    low = str(text or "").strip().lower()
+    if not low:
+        return False
+    return any(kw in low for kw in (keywords or []))
+
+
+def _question_role_hits(question: Dict[str, Any], role_keywords: Dict[str, List[str]]) -> set[str]:
+    return _question_role_hits_extended(question, role_keywords)
+
+
+def _question_role_hits_extended(question: Dict[str, Any], role_keywords: Dict[str, List[str]]) -> set[str]:
+    if not role_keywords:
+        return set()
+    blob = _question_search_text(question)
+    if _is_audit_checkpoint_text(blob):
+        # 审核点题仅用结构化字段推断，避免题干「审核点编号」等误命中测试工程师「审核」等泛词
+        return _infer_audit_checkpoint_role_hits(question) & set(role_keywords.keys())
+    sfiles = _question_source_files(question)
+    return _match_role_keywords_in_blob(blob, sfiles, role_keywords)
 
 
 def _question_hits_unselected_focus_roles(
@@ -638,13 +950,77 @@ def _question_hits_role_regulatory(
     return _question_has_regulatory_context(question, role_hints)
 
 
+def _question_hits_role_must_hints(question: Dict[str, Any], role: str) -> bool:
+    hints = _ROLE_MUST_HINTS.get(str(role).strip().lower()) or set()
+    if not hints:
+        return False
+    blob = _question_search_text(question)
+    return any(h in blob for h in hints if h)
+
+
 def _question_is_universal_common(
     question: Dict[str, Any],
     all_role_keywords: Optional[Dict[str, List[str]]] = None,
 ) -> bool:
     """与任一编写身份关键词均不匹配 → 各身份通用必考基线题。"""
     scope = all_role_keywords or _all_author_role_keyword_scope()
+    if _is_audit_checkpoint_text(_question_search_text(question)):
+        return not bool(_infer_audit_checkpoint_role_hits(question))
     return not _question_role_hits_extended(question, scope)
+
+
+_REGULATORY_COMMON_MARKERS: tuple[str, ...] = (
+    "[国内体考]",
+    "[欧盟体考]",
+    "[美国体考]",
+    "[澳大利亚体考]",
+    "[加拿大体考]",
+    "体考",
+    "法规",
+    "标准",
+    "指导原则",
+    "核查指南",
+    "13485",
+    "14971",
+    "条例",
+    "办法",
+    "通告",
+)
+
+
+def _question_is_regulatory_common_baseline(
+    question: Dict[str, Any],
+    selected_role_keywords: Optional[Dict[str, List[str]]] = None,
+) -> bool:
+    """法规/体考类各身份共用考点（可与某一身份专属计数并存）。"""
+    blob = _question_search_text(question)
+    if _is_audit_checkpoint_text(blob):
+        return not bool(_infer_audit_checkpoint_role_hits(question))
+    if not _question_has_regulatory_context(question):
+        return False
+    low = blob.lower()
+    if not any(m.lower() in low or m in blob for m in _REGULATORY_COMMON_MARKERS):
+        return False
+    if selected_role_keywords:
+        hits = _question_role_hits_extended(question, selected_role_keywords)
+        if len(hits) >= 2:
+            return True
+        if any(m in blob for m in ("[国内体考]", "[欧盟体考]", "[美国体考]", "体考")):
+            return True
+        if not hits:
+            return True
+    return True
+
+
+def _question_counts_as_common_baseline(
+    question: Dict[str, Any],
+    selected_role_keywords: Optional[Dict[str, List[str]]] = None,
+    all_role_keywords: Optional[Dict[str, List[str]]] = None,
+) -> bool:
+    scope = all_role_keywords or _all_author_role_keyword_scope()
+    if _question_is_universal_common(question, scope):
+        return True
+    return _question_is_regulatory_common_baseline(question, selected_role_keywords)
 
 
 def _question_eligible_for_selected_roles(
@@ -656,6 +1032,13 @@ def _question_eligible_for_selected_roles(
         return True
     if _question_role_hits_extended(question, selected_role_keywords):
         return True
+    if _is_audit_checkpoint_text(_question_search_text(question)):
+        return False
+    qt = _safe_question_type(str(question.get("question_type") or ""))
+    if qt == "case_analysis":
+        off = _question_hits_unselected_focus_roles(question, selected_role_keywords)
+        if off:
+            return False
     return _question_is_universal_common(question)
 
 
@@ -682,7 +1065,7 @@ def _build_role_coverage_summary(questions: List[Dict[str, Any]], role_keywords:
         if hits:
             for role in hits:
                 out[role] = int(out.get(role, 0)) + 1
-        elif _question_is_universal_common(q, all_scope):
+        if _question_counts_as_common_baseline(q, role_keywords, all_scope):
             common += 1
     out[COMMON_AUTHOR_ROLE_KEY] = common
     return out
@@ -717,7 +1100,7 @@ def _allocate_role_and_common_questions(
                     by_role_preferred.setdefault(r, []).append(q)
                 else:
                     by_role_relaxed.setdefault(r, []).append(q)
-        elif _question_is_universal_common(q, all_scope):
+        elif _question_counts_as_common_baseline(q, role_keywords, all_scope):
             if is_pref:
                 common_preferred.append(q)
             else:
@@ -742,10 +1125,21 @@ def _allocate_role_and_common_questions(
     roles = list(role_keywords.keys())
     min_role_hits = 2 if question_count >= 18 else 1
     max_common = max(1, question_count // 6)
+    if len(roles) == 1:
+        max_common = max(0, min(max_common, max(1, question_count // 12)))
     min_reg_hits = 1 if question_count >= 8 else 0
     for role in roles:
         role_preferred = by_role_preferred.get(role, [])
         role_relaxed = by_role_relaxed.get(role, [])
+        must_hits_min = 0
+        if role in _ROLE_MUST_HINTS:
+            must_hits_min = 2 if (len(roles) == 1 and question_count >= 18) else 1
+        if must_hits_min > 0:
+            must_pool = [q for q in (role_preferred + role_relaxed) if _question_hits_role_must_hints(q, role)]
+            for q in must_pool:
+                if sum(1 for p in picked if _question_hits_role_must_hints(p, role)) >= must_hits_min:
+                    break
+                _take(q)
         reg_pool = [q for q in role_preferred if _question_hits_role_regulatory(q, role, role_keywords)]
         if not reg_pool:
             reg_pool = [q for q in role_relaxed if _question_hits_role_regulatory(q, role, role_keywords)]
@@ -760,7 +1154,7 @@ def _allocate_role_and_common_questions(
             _take(q)
 
     for q in (common_preferred + common_relaxed):
-        if sum(1 for p in picked if _question_is_universal_common(p, all_scope)) >= max_common:
+        if sum(1 for p in picked if _question_counts_as_common_baseline(p, role_keywords, all_scope)) >= max_common:
             break
         _take(q)
 
@@ -832,14 +1226,20 @@ def _author_role_label_map() -> Dict[str, str]:
 
 def _attach_author_roles_to_set_items(
     items: List[Dict[str, Any]],
-    role_keywords: Dict[str, List[str]],
+    role_keywords: Optional[Dict[str, List[str]]] = None,
     *,
     strict_role_filter: bool = False,
 ) -> None:
-    """为套题内每题标注命中的身份（供前端展示「适用于 xx 身份」）。"""
+    """为套题内每题标注命中的身份（供前端展示「适用于 xx 身份」）。
+
+    - 传入所选 role_keywords 时：仅按所选身份标注。
+    - 不传/为空时：按**全部身份**标注（老师不勾身份也让每题关联到岗位，可关联多个）。
+    - 通用题（不命中任何身份）默认标签为空（由 role_focus_config.COMMON_ROLE_LABEL_EMPTY 控制）。
+    """
     del strict_role_filter
-    if not items or not role_keywords:
+    if not items:
         return
+    scope = role_keywords or _all_author_role_keyword_scope()
     labels = _author_role_label_map()
     labels[COMMON_AUTHOR_ROLE_KEY] = COMMON_AUTHOR_ROLE_LABEL
     all_scope = _all_author_role_keyword_scope()
@@ -847,10 +1247,10 @@ def _attach_author_roles_to_set_items(
         if not isinstance(it, dict):
             continue
         q = it.get("question") if isinstance(it.get("question"), dict) else it
-        hits = sorted(_question_role_hits_extended(q, role_keywords))
+        hits = sorted(_question_role_hits_extended(q, scope))
         if hits:
             role_labels = [labels.get(h) or h for h in hits]
-        elif _question_is_universal_common(q, all_scope):
+        elif not _COMMON_ROLE_LABEL_EMPTY and _question_is_universal_common(q, all_scope):
             hits = [COMMON_AUTHOR_ROLE_KEY]
             role_labels = [COMMON_AUTHOR_ROLE_LABEL]
         else:
@@ -1243,37 +1643,188 @@ def _summarize_statement_text(text: str, *, max_sentences: int = 2, max_chars: i
     return out[:max_chars] + ("…" if len(out) > max_chars else "")
 
 
+def _collect_open_book_refs(item: Dict[str, Any]) -> List[Dict[str, str]]:
+    refs: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    stem = str(item.get("stem") or "")
+    for sf in _question_source_files(item):
+        if not sf or sf in seen:
+            continue
+        if "审核点清单" in sf or sf.startswith("审核点"):
+            seen.add(sf)
+            refs.append({"source_file": sf, "kind": "audit_checklist", "title": sf})
+    for m in re.finditer(r"《([^》]{4,260})》", stem):
+        fn = str(m.group(1) or "").strip()
+        if fn and fn not in seen:
+            seen.add(fn)
+            refs.append({"source_file": fn, "kind": "document", "title": fn})
+    for m in re.finditer(r"(审核点清单-[\w.\-]+)", stem):
+        fn = str(m.group(1) or "").strip()
+        if fn and fn not in seen:
+            seen.add(fn)
+            refs.append({"source_file": fn, "kind": "audit_checklist", "title": fn})
+    return refs
+
+
+def _item_evidence_for_display(item: Dict[str, Any]) -> List[Any]:
+    """从题目项或其嵌套 question 中取出 evidence 列表（含 evidence_json）。"""
+    for holder in (item, item.get("question") if isinstance(item.get("question"), dict) else None):
+        if not isinstance(holder, dict):
+            continue
+        ev = holder.get("evidence")
+        if isinstance(ev, list) and ev:
+            return ev
+        ej = holder.get("evidence_json")
+        if ej:
+            try:
+                parsed = json.loads(ej) if isinstance(ej, str) else ej
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception:
+                pass
+    return []
+
+
+def _question_has_audit_checkpoint_context(
+    item: Dict[str, Any],
+    stem: str,
+    evidence: Optional[List[Any]] = None,
+) -> bool:
+    """题干/evidence/已缓存 stem_full 任一含审核点结构即视为审核点判断题。"""
+    if _is_audit_checkpoint_text(stem):
+        return True
+    existing = str(item.get("stem_full") or item.get("stemFull") or "").strip()
+    if _is_audit_checkpoint_text(existing):
+        return True
+    if not isinstance(evidence, list):
+        return False
+    for ev in evidence:
+        if not isinstance(ev, dict):
+            continue
+        sn = str(ev.get("content_snippet") or ev.get("content") or "").strip()
+        if _is_audit_checkpoint_text(sn):
+            return True
+    return False
+
+
+def _audit_checkpoint_raw_stem_for_format(
+    item: Dict[str, Any],
+    stem: str,
+    evidence: Optional[List[Any]] = None,
+) -> str:
+    """取含完整字段的审核点原文（优先 evidence，其次 stem_full，最后当前 stem）。"""
+    if _is_audit_checkpoint_text(stem):
+        return stem
+    if isinstance(evidence, list):
+        best = ""
+        for ev in evidence:
+            if not isinstance(ev, dict):
+                continue
+            sn = str(ev.get("content_snippet") or ev.get("content") or "").strip()
+            if _is_audit_checkpoint_text(sn) and len(sn) > len(best):
+                best = sn
+        if best:
+            return best
+    cached = str(item.get("stem_full") or item.get("stemFull") or "").strip()
+    if _is_audit_checkpoint_text(cached):
+        return cached
+    return stem
+
+
+def _strip_broken_open_book_html(stem: str) -> str:
+    """清理题干中误写入的前端开卷链接 HTML 片段（历史脏数据）。"""
+    s = str(stem or "")
+    s = re.sub(r'" title="开卷查阅：点击展开全文">', "", s)
+    s = re.sub(r'\s*data-open-book-file="[^"]*"', "", s, flags=re.I)
+    s = re.sub(r'\s*class="[^"]*exam-open-book-link[^"]*"', "", s, flags=re.I)
+    s = re.sub(
+        r'<button[^>]*exam-open-book-link[^>]*>(.*?)</button>',
+        lambda m: re.sub(r"</?[^>]+>", "", m.group(1)).strip("《》"),
+        s,
+        flags=re.I | re.S,
+    )
+    s = re.sub(r"</?button[^>]*>", "", s, flags=re.I)
+    return s.strip()
+
+
 def _sanitize_question_stem_for_display(item: Dict[str, Any]) -> None:
     """学生端展示：仅保留/补全题干，不单独输出 reference_excerpt。"""
-    ev = item.get("evidence") if isinstance(item.get("evidence"), list) else []
+    ev = _item_evidence_for_display(item)
     qt = _safe_question_type(str(item.get("question_type") or "single_choice"))
-    stem = str(item.get("stem") or "").strip()
-    stem = _trim_embedded_evidence_from_stem(stem, ev)
+    stem = _strip_broken_open_book_html(str(item.get("stem") or "").strip())
+    if not stem and isinstance(item.get("question"), dict):
+        stem = _strip_broken_open_book_html(str(item["question"].get("stem") or "").strip())
+    is_audit = _is_audit_checkpoint_text(stem)
+    if not is_audit:
+        stem = _trim_embedded_evidence_from_stem(stem, ev)
     stem = _strip_student_stem_meta(stem)
     excerpt = _format_evidence_excerpt_for_student(ev)
+    if qt == "true_false" and _question_has_audit_checkpoint_context(item, stem, ev):
+        raw_stem = _audit_checkpoint_raw_stem_for_format(item, stem, ev)
+        item["stem"] = _format_audit_checkpoint_true_false_stem(raw_stem, ev)
+        item.pop("stem_full", None)
+        item.pop("stemFull", None)
+        item.pop("stem_has_full", None)
+        item.pop("stemHasFull", None)
+        item.pop("reference_excerpt", None)
+        item.pop("referenceExcerpt", None)
+        return
     if qt == "true_false":
         m = re.search(r"(判断下列(?:陈述|说法)是否正确：)(.*)$", stem, flags=re.S)
         if m:
             prefix = m.group(1).strip()
-            tail = _summarize_statement_text(m.group(2))
-            if not tail:
-                tail = _first_claim_from_excerpt(excerpt)
-            if not tail:
-                tail = "（题目材料缺失，请联系管理员补充题库。）"
-            stem = prefix + "\n" + tail
+            tail_raw = m.group(2).strip()
+            if _question_has_audit_checkpoint_context(item, tail_raw, ev):
+                raw_stem = _audit_checkpoint_raw_stem_for_format(item, tail_raw, ev)
+                item["stem"] = _format_audit_checkpoint_true_false_stem(raw_stem, ev)
+                item.pop("stem_full", None)
+                item.pop("stemFull", None)
+                item.pop("stem_has_full", None)
+                item.pop("stemHasFull", None)
+            else:
+                tail = _summarize_statement_text(tail_raw, max_sentences=3, max_chars=420)
+                if not tail:
+                    tail = _first_claim_from_excerpt(excerpt, max_len=320)
+                if not tail:
+                    tail = "（题目材料缺失，请联系管理员补充题库。）"
+                stem = prefix + "\n" + tail
+                item["stem"] = stem.strip()
+                item.pop("stem_full", None)
+                item.pop("stemFull", None)
     if qt in ("single_choice", "multiple_choice") and stem and not re.search(r"[？?]\s*$", stem):
         if re.search(r"(下列哪项|下列哪些|最恰当|哪些说法)", stem):
             stem = stem.rstrip("。．.") + "？"
-    item["stem"] = stem.strip()
+    if "stem" not in item or not str(item.get("stem") or "").strip():
+        item["stem"] = stem.strip()
     item.pop("reference_excerpt", None)
     item.pop("referenceExcerpt", None)
 
 
 def _redact_student_quiz_item(item: Dict[str, Any]) -> None:
-    """练习/考试下发：仅题干+选项，不含 evidence/答案/解析。"""
+    """练习/考试下发：仅题干+选项，不含 evidence/答案/解析；保留开卷查阅引用。"""
     if not isinstance(item, dict):
         return
+    refs = _collect_open_book_refs(item)
+    qobj = item.get("question") if isinstance(item.get("question"), dict) else None
+    if qobj is not None:
+        refs.extend(_collect_open_book_refs(qobj))
+    if refs:
+        dedup: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for r in refs:
+            sf = str(r.get("source_file") or "").strip()
+            if not sf or sf in seen:
+                continue
+            seen.add(sf)
+            dedup.append(r)
+        item["open_book_refs"] = dedup
+        item["openBookRefs"] = dedup
     _sanitize_question_stem_for_display(item)
+    if qobj is not None:
+        _sanitize_question_stem_for_display(qobj)
+        if refs:
+            qobj["open_book_refs"] = item.get("open_book_refs")
+            qobj["openBookRefs"] = item.get("openBookRefs")
     for key in (
         "evidence",
         "evidence_json",
@@ -1282,8 +1833,14 @@ def _redact_student_quiz_item(item: Dict[str, Any]) -> None:
         "explanation",
         "answer",
         "answer_json",
+        "stem_full",
+        "stemFull",
+        "stem_has_full",
+        "stemHasFull",
     ):
         item.pop(key, None)
+        if qobj is not None:
+            qobj.pop(key, None)
 
 
 def _prepare_student_facing_question(item: Dict[str, Any]) -> None:
@@ -1392,6 +1949,159 @@ def _extract_evidence(agent: ReviewAgent, exam_track: str, top_k: int = 8, exam_
             }
         )
     return evidence
+
+
+def _role_focus_meta(role_keywords: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    """为所选身份汇总命题聚焦信息：标签、必考主题、必考关键词、必考文件、命题侧重。"""
+    label_map = _author_role_label_map()
+    out: List[Dict[str, Any]] = []
+    for role in (role_keywords or {}).keys():
+        r = str(role).strip().lower()
+        if not r:
+            continue
+        must = sorted(_ROLE_MUST_HINTS.get(r) or set())
+        topics = list(_ROLE_FOCUS_TOPICS.get(r) or [])
+        kws = [str(x).strip() for x in (_AUTHOR_ROLE_FILE_KEYWORDS.get(r) or []) if str(x).strip()]
+        out.append(
+            {
+                "role": r,
+                "label": str(label_map.get(r) or r),
+                "must_hints": must,
+                "topics": topics,
+                "keywords": kws,
+                "must_files": list(_ROLE_MUST_FILES.get(r) or []),
+                "emphasis": str(_ROLE_PROMPT_EMPHASIS.get(r) or "").strip(),
+            }
+        )
+    return out
+
+
+def _role_focus_prompt_block(role_focus: Optional[List[Dict[str, Any]]]) -> str:
+    """把岗位聚焦信息拼成命题提示块，指导 AI 覆盖各岗位必考主题与命题侧重。"""
+    if not role_focus:
+        return ""
+    lines: List[str] = [
+        "\n【本套题按岗位身份定向命题】所选身份及其必考主题/必考文件/命题侧重如下，"
+        "请让题目**尽量均衡覆盖各身份的必考主题**，每个身份至少 1～2 题落到其必考主题上；"
+        "题目要能关联到对应身份（可同时关联多个身份）；仍须严格依据 evidence，不得脱离摘录编造。",
+    ]
+    for rf in role_focus:
+        topics = "；".join(rf.get("topics") or []) or "（按该岗位职责命题）"
+        must = "、".join(rf.get("must_hints") or [])
+        files = "、".join(rf.get("must_files") or [])
+        emphasis = str(rf.get("emphasis") or "").strip()
+        seg = f"- {rf.get('label')}：{topics}"
+        if files:
+            seg += f"；必考文件：{files}"
+        if must:
+            seg += f"；关键词：{must}"
+        if emphasis:
+            seg += f"；命题侧重：{emphasis}"
+        lines.append(seg)
+    return "\n".join(lines)
+
+
+def _default_exam_weighted_scope(top_n: int = 5) -> Dict[str, List[str]]:
+    """老师端不勾身份时：按体考关注度权重取前若干重点岗位，构造定向取材用的 role scope。"""
+    weighted = [(r, w) for r, w in (_ROLE_EXAM_WEIGHT or {}).items() if w > 0]
+    if not weighted:
+        weighted = [(r, 1.0) for r in _FOCUS_EXAM_ROLES]
+    weighted.sort(key=lambda x: (-x[1], x[0]))
+    picked = [r for r, _w in weighted[: max(1, top_n)]]
+    return _role_file_keyword_scope(picked)
+
+
+def _default_exam_role_focus(top_n: int = 5) -> List[Dict[str, Any]]:
+    return _role_focus_meta(_default_exam_weighted_scope(top_n=top_n))
+
+
+def _extract_evidence_for_roles(
+    agent: ReviewAgent,
+    exam_track: str,
+    top_k: int,
+    exam_category: str,
+    role_keywords: Dict[str, List[str]],
+) -> List[Dict[str, Any]]:
+    """按所选身份**逐一定向检索**命题素材，保证各岗位必考主题（如配置管理计划/配置状态报告）被覆盖。
+
+    策略：对每个所选身份，先用「必考主题 + 必考关键词」做定向检索，再用岗位强关键词补充；
+    命中该岗位关键词的摘录打上 `_role` 标签，最后按岗位轮询取材，避免某一身份被淹没。
+    """
+    tk = max(1, int(top_k))
+    ec = _normalize_exam_category(exam_category)
+    tail = " 修订 新版本 替代 废止 过渡期 专标 指南 变化点" if ec == "new_standard" else ""
+    track_head = f"{EXAM_TRACKS.get(exam_track, exam_track)} {TRACK_HINTS.get(exam_track, '')}".strip()
+
+    role_focus = _role_focus_meta(role_keywords or {})
+    per_role_evidence: Dict[str, List[Dict[str, Any]]] = {}
+    seen_snips: set[str] = set()
+
+    def _keep_from_docs(rows_or_docs: List[Any], role: str, role_kws: List[str], target: int) -> None:
+        bucket = per_role_evidence.setdefault(role, [])
+        for r in rows_or_docs or []:
+            if len(bucket) >= target:
+                break
+            content = str(r.get("content") or "").strip()
+            if not content:
+                continue
+            meta = r.get("metadata") or {}
+            source_file = (
+                str(meta.get("source_file") or "").strip()
+                or str(meta.get("title") or "").strip()
+                or str(r.get("source") or "").strip()
+            )
+            blob = f"{source_file} {content}"
+            if role_kws and not _text_hits_any_keyword(blob, role_kws):
+                continue
+            key = content[:120]
+            if key in seen_snips:
+                continue
+            seen_snips.add(key)
+            bucket.append({"content_snippet": content[:700], "source_file": source_file, "_role": role})
+
+    # 每个岗位期望取材量（至少 2，或按题量均分）
+    per_role_target = max(2, (tk + max(1, len(role_focus)) - 1) // max(1, len(role_focus)))
+    for rf in role_focus:
+        role = rf["role"]
+        role_kws = [str(x).strip().lower() for x in (rf.get("keywords") or []) if str(x).strip()]
+        must = list(rf.get("must_hints") or [])
+        topics = list(rf.get("topics") or [])
+        # 1) 必考主题 / 必考关键词定向检索（保证 cm 的配置管理计划、配置状态报告等被命中）
+        focus_terms = must + topics
+        queries: List[str] = []
+        if focus_terms:
+            queries.append(f"{track_head} {' '.join(focus_terms[:8])} 核查 要点{tail}".strip())
+        # 2) 岗位强关键词补充
+        if role_kws:
+            queries.append(f"{track_head} {' '.join(role_kws[:10])} GMP 法规 核查 指南 典型考题{tail}".strip())
+        for q in queries:
+            if len(per_role_evidence.get(role, [])) >= per_role_target:
+                break
+            try:
+                rows = agent.search_knowledge(q, top_k=max(per_role_target * 3, 10), use_checkpoints=True)
+            except Exception:
+                rows = []
+            _keep_from_docs(rows, role, role_kws, per_role_target)
+
+    # 按岗位轮询汇总，均衡覆盖
+    evidence: List[Dict[str, Any]] = []
+    idx = 0
+    while len(evidence) < tk:
+        progressed = False
+        for rf in role_focus:
+            bucket = per_role_evidence.get(rf["role"], [])
+            if idx < len(bucket):
+                evidence.append(bucket[idx])
+                progressed = True
+                if len(evidence) >= tk:
+                    break
+        if not progressed:
+            break
+        idx += 1
+
+    if evidence:
+        return evidence[:tk]
+    return _extract_evidence(agent, exam_track, top_k=tk, exam_category=exam_category)
 
 
 def _extract_evidence_project_case(
@@ -1579,6 +2289,7 @@ def _generate_questions_by_ai(
     evidence: List[Dict[str, Any]],
     exam_category: str = "daily",
     project_case_id: Optional[int] = None,
+    role_focus: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     min_plausible = 0 if count <= 1 else max(1, (count * 4 + 9) // 10)
     ec = _normalize_exam_category(exam_category)
@@ -1619,6 +2330,7 @@ def _generate_questions_by_ai(
             "禁止「教材式」或与本案无关的标准答案套话。"
             f"{project_case_anchor}"
         )
+    role_focus_block = _role_focus_prompt_block(role_focus)
     prompt = f"""
 你是医疗器械法规考试命题助手。请只输出 JSON，不要额外说明。
 
@@ -1642,7 +2354,7 @@ def _generate_questions_by_ai(
 11) 约 **60%** 题目可为 `easy`：允许轻度否定或排除语气，但**不要**让四个错误项共用同一种开头模板；**不得**出现「明显三项都错、只剩一项像真命题」的凑数结构。
 12) 正确答案在命制时不要刻意总落在同一字母位；落库前系统会打乱选项顺序并重写 `answer`，你仍须保证**每个错误选项本身像合理结论**而非「反着说就对了」的口号。
 13) 同批各题题干须围绕不同角度设问，避免只改一两处用词、结构高度雷同的「换皮题」；系统还会与历史题库做相似度过滤，雷同过多会被丢弃。
-{new_std_rules}{project_case_rules}
+{new_std_rules}{project_case_rules}{role_focus_block}
 
 evidence:
 {json.dumps(evidence, ensure_ascii=False)}
@@ -1724,6 +2436,7 @@ def _pick_cached_questions(
     sig_counts: Dict[str, int],
     question_count_total: int,
     role_keywords: Optional[Dict[str, List[str]]] = None,
+    shuffle_seed: str = "",
 ) -> List[Dict[str, Any]]:
     cat_f = (category or "").strip() or None
     excl = list(exclude_question_ids or [])
@@ -1763,9 +2476,21 @@ def _pick_cached_questions(
             exclude_question_ids=sorted(ex_set),
         )
 
-    pool_limit = min(600, max(count * 24, 96)) if role_filter else min(220, max(count * 14, 48))
+    if role_filter:
+        pool_limit = min(280, max(count * 8, 64))
+        max_scan_rows = 900
+        max_extra_pages = 4
+    else:
+        pool_limit = min(220, max(count * 14, 48))
+        max_scan_rows = 0
+        max_extra_pages = 8
     pool = _fetch_pool(limit=pool_limit, offset=0)
-    random.shuffle(pool)
+    rows_scanned = len(pool)
+    if shuffle_seed:
+        rng = random.Random(int(_hash_text(shuffle_seed, str(pool_limit), "0")[:12], 16))
+        rng.shuffle(pool)
+    else:
+        random.shuffle(pool)
     out: List[Dict[str, Any]] = []
 
     def _try_append(cand: Dict[str, Any], *, enforce_sig: bool) -> bool:
@@ -1805,17 +2530,26 @@ def _pick_cached_questions(
 
     if len(out) < count and role_filter:
         offset = len(pool)
-        for _page in range(20):
-            batch = _fetch_pool(limit=200, offset=offset)
+        page_limit = 160
+        for _page in range(max_extra_pages):
+            if len(out) >= count:
+                break
+            if max_scan_rows > 0 and rows_scanned >= max_scan_rows:
+                break
+            batch = _fetch_pool(limit=page_limit, offset=offset)
             if not batch:
                 break
-            random.shuffle(batch)
+            rows_scanned += len(batch)
+            if shuffle_seed:
+                rng.shuffle(batch)
+            else:
+                random.shuffle(batch)
             for cand in batch:
                 if len(out) >= count:
                     break
                 _try_append(cand, enforce_sig=True)
             offset += len(batch)
-            if len(batch) < 200:
+            if len(batch) < page_limit:
                 break
 
     return out[:count]
@@ -1970,7 +2704,8 @@ def generate_set(
     pc_id = require_project_case_quiz(collection=collection, exam_category=exam_category, project_case_id=project_case_id)
     roles = _normalize_author_roles(author_roles or [])
     role_keywords = _role_file_keyword_scope(roles)
-    strict_role_filter = False
+    strict_role_filter = bool(roles) and not _selection_has_leadership_cross_need(role_keywords)
+    role_shuffle_key = ",".join(sorted(roles)) if roles else ""
     coverage_mode = "balanced_union" if str(author_role_coverage or "").strip().lower() == "balanced_union" else "union"
     question_count = max(1, int(question_count))
     difficulty = _safe_difficulty(difficulty)
@@ -1987,6 +2722,7 @@ def generate_set(
             str(question_count),
             ec,
             str(pc_id or ""),
+            ",".join(sorted(roles)),
         )[:32],
         "question_type_mix": mix_map,
         "question_type": "mixed",
@@ -2012,7 +2748,7 @@ def generate_set(
     practice_wrong: Dict[str, deque] = {}
     practice_unpr: Dict[str, deque] = {}
     uid_pr = ""
-    if set_type == "practice":
+    if set_type == "practice" and not role_keywords:
         uid_pr = (created_by or "").strip()
         if uid_pr:
             for row in repo.list_wrong_questions_for_student(collection=collection, user_id=uid_pr, limit=260):
@@ -2094,6 +2830,7 @@ def generate_set(
             sig_counts=sig_counts,
             question_count_total=question_count,
             role_keywords=role_keywords or None,
+            shuffle_seed=role_shuffle_key,
         )
         if role_keywords:
             cached = [q for q in cached if _question_matches_role_keywords(q, role_keywords, strict=strict_role_filter)]
@@ -2114,8 +2851,23 @@ def generate_set(
                     project_case_id=int(pc_id),
                     role_keywords=role_keywords if role_keywords else None,
                 )
+            elif role_keywords:
+                evidence = _extract_evidence_for_roles(
+                    agent,
+                    exam_track,
+                    top_k=max(12, short),
+                    exam_category=ec,
+                    role_keywords=role_keywords,
+                )
             else:
-                evidence = _extract_evidence(agent, exam_track, top_k=max(12, short), exam_category=ec)
+                # 未勾选身份：按体考关注度权重定向取材，使生成题库自然偏向重点岗位
+                evidence = _extract_evidence_for_roles(
+                    agent,
+                    exam_track,
+                    top_k=max(12, short),
+                    exam_category=ec,
+                    role_keywords=_default_exam_weighted_scope(),
+                )
             if role_keywords and ec == "project_case" and pc_id is not None and not evidence:
                 evidence = _extract_evidence_project_case(
                     agent,
@@ -2126,18 +2878,32 @@ def generate_set(
                     role_keywords=None,
                 )
             stem_cat = (category or "").strip() or exam_track
-            try:
-                generated = _generate_questions_by_ai(
-                    exam_track=exam_track,
-                    category=stem_cat,
-                    difficulty=difficulty,
-                    question_type=qtype,
-                    count=short,
-                    evidence=evidence,
-                    exam_category=ec,
-                    project_case_id=int(pc_id) if ec == "project_case" and pc_id is not None else None,
-                )
-            except Exception:
+            role_focus_meta = _role_focus_meta(role_keywords) if role_keywords else _default_exam_role_focus()
+            use_ai_gap = short > 6 and not (role_keywords and short <= 8)
+            if use_ai_gap:
+                try:
+                    generated = _generate_questions_by_ai(
+                        exam_track=exam_track,
+                        category=stem_cat,
+                        difficulty=difficulty,
+                        question_type=qtype,
+                        count=short,
+                        evidence=evidence,
+                        exam_category=ec,
+                        project_case_id=int(pc_id) if ec == "project_case" and pc_id is not None else None,
+                        role_focus=role_focus_meta,
+                    )
+                except Exception:
+                    generated = _fallback_questions(
+                        exam_track,
+                        stem_cat,
+                        short,
+                        evidence,
+                        question_type=qtype,
+                        difficulty=difficulty,
+                        exam_category=ec,
+                    )
+            else:
                 generated = _fallback_questions(
                     exam_track,
                     stem_cat,
@@ -2160,7 +2926,32 @@ def generate_set(
             )
             generated_total += len(saved)
             if role_keywords:
-                saved = [q for q in saved if _question_matches_role_keywords(q, role_keywords, strict=strict_role_filter)]
+                saved_matched = [q for q in saved if _question_matches_role_keywords(q, role_keywords, strict=strict_role_filter)]
+                remain = short - len(saved_matched)
+                if remain > 0:
+                    fb_extra = _fallback_questions(
+                        exam_track,
+                        stem_cat,
+                        remain,
+                        evidence,
+                        question_type=qtype,
+                        difficulty=difficulty,
+                        exam_category=ec,
+                    )
+                    saved_matched.extend(
+                        _save_questions_to_bank(
+                            collection=collection,
+                            exam_track=exam_track,
+                            category=stem_cat,
+                            difficulty=difficulty,
+                            question_type=qtype,
+                            scope_hash=scope_hash,
+                            questions=fb_extra,
+                            origin=("exam_teacher_generated" if set_type == "exam" else "practice_runtime_generated"),
+                            created_by=created_by,
+                        )
+                    )
+                saved = saved_matched
             for x in saved:
                 if isinstance(x, dict):
                     sg = _set_diversity_signature(x)
@@ -2170,14 +2961,120 @@ def generate_set(
                 if x.get("id"):
                     seen_ids.add(int(x["id"]))
         selected_all.extend(selected[:cnt])
+    if len(selected_all) < question_count:
+        used_fill = {int(q.get("id") or 0) for q in selected_all if int(q.get("id") or 0) > 0}
+        for qtype, cnt in plan:
+            if len(selected_all) >= question_count:
+                break
+            have = sum(
+                1
+                for q in selected_all
+                if _safe_question_type(str(q.get("question_type") or "")) == qtype
+            )
+            need_t = cnt - have
+            if need_t <= 0:
+                continue
+            extras = _pick_cached_questions(
+                collection=collection,
+                exam_track=exam_track,
+                category=bank_cat,
+                difficulty=difficulty,
+                question_type=qtype,
+                scope_hash=_make_scope_hash(exam_track, hash_cat, difficulty, qtype, ec, project_case_id=pc_id),
+                count=need_t,
+                exclude_question_ids=sorted(used_fill),
+                sig_counts=sig_counts,
+                question_count_total=question_count,
+                role_keywords=role_keywords or None,
+                shuffle_seed=role_shuffle_key,
+            )
+            for q in extras:
+                qid = int(q.get("id") or 0)
+                if not qid or qid in used_fill:
+                    continue
+                selected_all.append(q)
+                used_fill.add(qid)
+                from_cache_total += 1
+                if len(selected_all) >= question_count:
+                    break
+    pre_alloc = list(selected_all)
     random.shuffle(selected_all)
     if role_keywords and coverage_mode == "balanced_union":
-        selected_all = _promote_role_coverage_questions(selected_all, role_keywords, question_count)
+        allocated = _promote_role_coverage_questions(selected_all, role_keywords, question_count)
+        if len(allocated) < question_count:
+            used_ids = {int(q.get("id") or 0) for q in allocated if int(q.get("id") or 0) > 0}
+            for q in pre_alloc:
+                if len(allocated) >= question_count:
+                    break
+                qid = int(q.get("id") or 0)
+                if qid and qid not in used_ids:
+                    allocated.append(q)
+                    used_ids.add(qid)
+        selected_all = allocated
     elif role_keywords:
         eligible_only = [q for q in selected_all if _question_eligible_for_selected_roles(q, role_keywords)]
         if eligible_only:
             selected_all = eligible_only
     selected_all = selected_all[:question_count]
+    if len(selected_all) < question_count:
+        stem_cat = (category or "").strip() or exam_track
+        if role_keywords:
+            gap_evidence = _extract_evidence_for_roles(
+                agent,
+                exam_track,
+                top_k=12,
+                exam_category=ec,
+                role_keywords=role_keywords,
+            )
+        else:
+            gap_evidence = _extract_evidence_for_roles(
+                agent,
+                exam_track,
+                top_k=12,
+                exam_category=ec,
+                role_keywords=_default_exam_weighted_scope(),
+            )
+        for qtype, cnt in plan:
+            if len(selected_all) >= question_count:
+                break
+            have = sum(
+                1
+                for q in selected_all
+                if _safe_question_type(str(q.get("question_type") or "")) == qtype
+            )
+            need_t = min(cnt - have, question_count - len(selected_all))
+            if need_t <= 0:
+                continue
+            fb = _fallback_questions(
+                exam_track,
+                stem_cat,
+                need_t,
+                gap_evidence,
+                question_type=qtype,
+                difficulty=difficulty,
+                exam_category=ec,
+            )
+            saved_gap = _save_questions_to_bank(
+                collection=collection,
+                exam_track=exam_track,
+                category=stem_cat,
+                difficulty=difficulty,
+                question_type=qtype,
+                scope_hash=_make_scope_hash(exam_track, hash_cat, difficulty, qtype, ec, project_case_id=pc_id),
+                questions=fb,
+                origin=("exam_teacher_generated" if set_type == "exam" else "practice_runtime_generated"),
+                created_by=created_by,
+            )
+            generated_total += len(saved_gap)
+            for q in saved_gap:
+                qid = int(q.get("id") or 0)
+                if not qid or qid in seen_ids:
+                    continue
+                selected_all.append(q)
+                seen_ids.add(qid)
+                if len(selected_all) >= question_count:
+                    break
+        selected_all = selected_all[:question_count]
     repo.touch_bank_questions([int(x.get("id")) for x in selected_all if x.get("id")])
     set_id = repo.create_set(
         collection=collection,
@@ -2211,6 +3108,9 @@ def generate_set(
                 f"通用基线题 {int(cov.get(COMMON_AUTHOR_ROLE_KEY, 0))} 道；"
                 "请增加题量、调整身份组合或补充录题。"
             )
+    else:
+        # 未勾选身份：仍为每题标注其关联岗位（可多个），通用题标签为空
+        _attach_author_roles_to_set_items(out.get("items") or [])
     if set_type in ("practice", "exam"):
         for it in out.get("items") or []:
             if isinstance(it, dict):
@@ -3301,6 +4201,169 @@ def admin_list_bank_questions(
     return {"items": items, "total": int(total), "limit": int(limit), "offset": int(offset)}
 
 
+def _resolve_audit_checklist_open_book(*, collection: str, source_file: str) -> Dict[str, Any]:
+    """从 audit_checklists / checkpoint 向量库解析审核点清单开卷内容。"""
+    from src.core import db
+
+    sf = str(source_file or "").strip()
+    if not sf:
+        return {"content": "", "title": "", "kind": "audit_checklist", "chunk_count": 0}
+
+    point_id = ""
+    if sf.startswith("审核点清单:"):
+        point_id = sf.split(":", 1)[-1].strip()
+
+    row = db.get_audit_checklist_by_name(sf, collection=collection or None)
+    if not row:
+        for cand in db.search_audit_checklists_by_name(sf, collection=collection or None, limit=3):
+            row = cand
+            break
+
+    if row:
+        checklist = row.get("checklist") or []
+        title = str(row.get("name") or sf).strip()
+        if point_id:
+            for point in checklist:
+                if str(point.get("id") or "").strip() == point_id:
+                    content = _format_checklist_point_text(point)
+                    return {
+                        "content": content,
+                        "title": f"{title} · {point_id}",
+                        "kind": "audit_checkpoint_point",
+                        "chunk_count": 1,
+                    }
+        parts = [_format_checklist_point_text(p) for p in checklist if isinstance(p, dict)]
+        content = "\n\n---\n\n".join(x for x in parts if x).strip()
+        return {
+            "content": content,
+            "title": title,
+            "kind": "audit_checklist",
+            "chunk_count": len(parts),
+        }
+
+    if point_id:
+        found = db.find_audit_checkpoint_in_checklists(point_id, collection=collection or None, limit=50)
+        if found and isinstance(found.get("point"), dict):
+            content = _format_checklist_point_text(found["point"])
+            cl_name = str(found.get("checklist_name") or "").strip()
+            title = f"{cl_name} · {point_id}" if cl_name else sf
+            return {
+                "content": content,
+                "title": title,
+                "kind": "audit_checkpoint_point",
+                "chunk_count": 1,
+            }
+        try:
+            agent = ReviewAgent(collection)
+            docs = agent.checkpoint_kb.search(f"审核点编号：{point_id}", top_k=8)
+            for doc in docs:
+                md = getattr(doc, "metadata", None) or {}
+                if str(md.get("point_id") or "").strip() == point_id:
+                    content = str(getattr(doc, "page_content", "") or "").strip()
+                    if content:
+                        return {
+                            "content": content,
+                            "title": sf,
+                            "kind": "audit_checkpoint_point",
+                            "chunk_count": 1,
+                        }
+        except Exception:
+            pass
+
+    return {"content": "", "title": sf, "kind": "audit_checklist", "chunk_count": 0}
+
+
+def open_book_reference(*, collection: str, source_file: str) -> Dict[str, Any]:
+    """开卷查阅：按来源文件名返回知识库全文摘录（审核点清单 / 项目文档等）。"""
+    from src.core import db
+
+    sf = str(source_file or "").strip()
+    if not sf:
+        raise ValueError("缺少 source_file")
+
+    if "审核点清单" in sf or sf.startswith("审核点"):
+        audit_res = _resolve_audit_checklist_open_book(collection=collection, source_file=sf)
+        if str(audit_res.get("content") or "").strip():
+            return {
+                "source_file": sf,
+                "title": audit_res.get("title") or sf,
+                "content": audit_res["content"],
+                "kind": audit_res.get("kind") or "audit_checklist",
+                "chunk_count": int(audit_res.get("chunk_count") or 0),
+                "open_book": True,
+            }
+
+    def _norm_name(x: str) -> str:
+        t = str(x or "").strip()
+        t = t.replace("《", "").replace("》", "").replace("\\", "/")
+        if "/" in t:
+            t = t.rsplit("/", 1)[-1]
+        return t.strip()
+
+    sf_norm = _norm_name(sf)
+    sf_stem = sf_norm.rsplit(".", 1)[0] if "." in sf_norm else sf_norm
+    name_candidates = [x for x in {sf, sf_norm, sf_stem} if x]
+
+    rows: List[Dict[str, Any]] = []
+    for cand in name_candidates:
+        rows = db.get_knowledge_docs(collection=collection, file_name=cand, limit=80)
+        if rows:
+            break
+    if not rows:
+        db.init_db()
+        conn = db._get_conn()  # noqa: SLF001
+        try:
+            with conn.cursor() as cur:
+                like_tail = sf_norm[-64:] if len(sf_norm) > 64 else sf_norm
+                like_stem = sf_stem[-64:] if len(sf_stem) > 64 else sf_stem
+                cur.execute(
+                    """
+                    SELECT file_name, content, category, metadata_json
+                    FROM knowledge_docs
+                    WHERE collection=%s
+                      AND (
+                        file_name IN (%s, %s, %s)
+                        OR file_name LIKE %s
+                        OR file_name LIKE %s
+                        OR content LIKE %s
+                        OR metadata_json LIKE %s
+                        OR metadata_json LIKE %s
+                      )
+                    ORDER BY id DESC
+                    LIMIT 120
+                    """,
+                    (
+                        collection,
+                        sf,
+                        sf_norm,
+                        sf_stem,
+                        f"%{like_tail}",
+                        f"%{like_stem}%",
+                        f"%{sf_stem[:120]}%",
+                        f"%{sf_norm[:120]}%",
+                        f"%{sf[:120]}%",
+                    ),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    chunks: List[str] = []
+    for r in rows or []:
+        c = str(r.get("content") or "").strip()
+        if c:
+            chunks.append(c)
+    content = "\n\n".join(chunks).strip()
+    kind = "audit_checklist" if ("审核点清单" in sf or sf.startswith("审核点")) else "document"
+    return {
+        "source_file": sf,
+        "title": sf,
+        "content": content,
+        "kind": kind,
+        "chunk_count": len(chunks),
+        "open_book": True,
+    }
+
+
 def bank_author_role_coverage(
     *,
     collection: str,
@@ -3369,7 +4432,7 @@ def bank_author_role_coverage(
                 diagnostics["selected_primary_count"] = int(diagnostics["selected_primary_count"]) + 1
             for r in hits:
                 role_counts[r] = int(role_counts.get(r, 0)) + 1
-        elif _question_is_universal_common(q, all_scope):
+        elif _question_counts_as_common_baseline(q, selected_scope, all_scope):
             common_count += 1
             diagnostics["common_count"] = int(diagnostics["common_count"]) + 1
 

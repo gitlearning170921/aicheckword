@@ -21,6 +21,7 @@ LLM 凭据（禁止写入日志与 operation_logs）：HTTP Header
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import threading
 import traceback
@@ -80,6 +81,78 @@ _INTEROP_PROVIDER_LABELS: Dict[str, str] = {
 
 _DEFAULT_INTEROP_DISPLAY_IDS: tuple[str, ...] = tuple(sorted(_INTEROP_PROVIDER_LABELS.keys()))
 
+# 与 aiword 初稿页已端到端联调的 provider（见 aiword draft_generation_routes.AIWORD_DRAFT_LLM_PROVIDERS）
+_AIWORD_E2E_DRAFT_PROVIDERS: tuple[str, ...] = (
+    "deepseek",
+    "cursor",
+    "tongyi",
+    "openai",
+    "claude",
+)
+_PROVIDER_API_KEY_ATTR: Dict[str, str] = {
+    "deepseek": "deepseek_api_key",
+    "openai": "openai_api_key",
+    "claude": "claude_api_key",
+    "tongyi": "dashscope_api_key",
+    "cursor": "cursor_api_key",
+}
+_PROVIDER_ID_ALIASES: Dict[str, str] = {
+    "chatgpt": "openai",
+    "gpt": "openai",
+    "anthropic": "claude",
+    "dashscope": "tongyi",
+    "qwen": "tongyi",
+    "通义": "tongyi",
+    "通义千问": "tongyi",
+}
+
+
+def _normalize_provider_id(raw: Any) -> str:
+    pid = str(raw or "").strip().lower()
+    if not pid:
+        return ""
+    return _PROVIDER_ID_ALIASES.get(pid, pid)
+
+
+def _parse_draft_interop_provider_csv(raw: Any) -> set[str]:
+    """解析初稿联调白名单（兼容中英文逗号/分号/空白分隔）。"""
+    s = str(raw or "").strip()
+    if not s:
+        return set()
+    out: set[str] = set()
+    for part in re.split(r"[,，;；\s]+", s):
+        pid = _normalize_provider_id(part)
+        if pid:
+            out.add(pid)
+    return out
+
+
+def _providers_with_configured_api_keys() -> set[str]:
+    """侧栏/系统配置已填写 Key 的 aiword 端到端 provider，自动纳入联调展示与白名单。"""
+    out: set[str] = set()
+    for pid in _AIWORD_E2E_DRAFT_PROVIDERS:
+        attr = _PROVIDER_API_KEY_ATTR.get(pid)
+        if not attr:
+            continue
+        if str(getattr(settings, attr, "") or "").strip():
+            out.add(pid)
+    return out
+
+
+def _effective_draft_interop_provider_ids() -> tuple[list[str], bool]:
+    """
+    返回 (有序 id 列表, restrictProviders)。
+    显式白名单 + 已配置系统 Key 的端到端 provider 并集；留空白名单则不限制（展示全量）。
+    """
+    raw = (getattr(settings, "draft_interop_allowed_providers", None) or "").strip()
+    parsed = _parse_draft_interop_provider_csv(raw)
+    key_backed = _providers_with_configured_api_keys()
+    if not raw:
+        ids = set(_DEFAULT_INTEROP_DISPLAY_IDS) | key_backed
+        return sorted(ids), False
+    ids = parsed | key_backed
+    return sorted(ids), True
+
 
 def _draft_provider_whitelist_for_jobs() -> Optional[frozenset[str]]:
     """若管理员配置非空，则初稿任务仅允许列出的 provider；None 表示不限制。"""
@@ -89,18 +162,14 @@ def _draft_provider_whitelist_for_jobs() -> Optional[frozenset[str]]:
     raw = (getattr(settings, "draft_interop_allowed_providers", None) or "").strip()
     if not raw:
         return None
-    s = {x.strip().lower() for x in raw.split(",") if x.strip()}
-    return frozenset(s) if s else None
+    ids = _parse_draft_interop_provider_csv(raw) | _providers_with_configured_api_keys()
+    return frozenset(ids) if ids else None
 
 
 def _interop_config_dict() -> Dict[str, Any]:
-    w = _draft_provider_whitelist_for_jobs()
+    ids, restrict = _effective_draft_interop_provider_ids()
     notes = (getattr(settings, "draft_interop_notes", None) or "").strip()
     pko = bool(getattr(settings, "draft_interop_personal_keys_only", True))
-    if w is None:
-        ids = list(_DEFAULT_INTEROP_DISPLAY_IDS)
-    else:
-        ids = sorted(w)
     providers: List[Dict[str, Any]] = [
         {
             "id": i,
@@ -111,8 +180,9 @@ def _interop_config_dict() -> Dict[str, Any]:
     ]
     return {
         "ok": True,
-        "restrictProviders": w is not None,
+        "restrictProviders": restrict,
         "allowedProviders": providers,
+        "allowedProviderIds": ids,
         "personalKeysOnly": pko,
         "adminNotes": notes,
     }
@@ -830,6 +900,9 @@ def draft_project_defaults(project_id: int):
 @router.get("/interop-config")
 def draft_interop_config():
     """联调策略：与系统配置「初稿集成」入库字段一致；aiword 可定时或进入页面时拉取。"""
+    from config.runtime_settings import refresh_runtime_settings_from_db_if_available
+
+    refresh_runtime_settings_from_db_if_available()
     return _interop_config_dict()
 
 

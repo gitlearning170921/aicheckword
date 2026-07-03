@@ -1764,6 +1764,97 @@ def get_audit_checklist_by_id(checklist_id: int) -> Optional[Dict[str, Any]]:
         conn.close()
 
 
+def _audit_checklist_row_to_dict(row: Any) -> Dict[str, Any]:
+    r = dict(row)
+    if r.get("checklist_json"):
+        try:
+            r["checklist"] = json.loads(r["checklist_json"])
+        except Exception:
+            r["checklist"] = []
+    else:
+        r["checklist"] = []
+    return r
+
+
+def get_audit_checklist_by_name(
+    name: str,
+    collection: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """按清单名称精确匹配（如 审核点清单-regulations-20260310_143754）。"""
+    nm = str(name or "").strip()
+    if not nm:
+        return None
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = "SELECT * FROM audit_checklists WHERE name = %s"
+            params: List[Any] = [nm]
+            if collection:
+                sql += " AND collection = %s"
+                params.append(collection)
+            sql += " ORDER BY id DESC LIMIT 1"
+            cur.execute(sql, params)
+            row = cur.fetchone()
+        if not row:
+            return None
+        return _audit_checklist_row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def search_audit_checklists_by_name(
+    name: str,
+    collection: Optional[str] = None,
+    limit: int = 5,
+) -> list:
+    """按清单名称模糊匹配（尾部时间戳或部分名称）。"""
+    nm = str(name or "").strip()
+    if not nm:
+        return []
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            like_tail = nm[-72:] if len(nm) > 72 else nm
+            sql = """
+                SELECT * FROM audit_checklists
+                WHERE (name = %s OR name LIKE %s OR name LIKE %s)
+            """
+            params: List[Any] = [nm, f"%{like_tail}", f"%{nm}%"]
+            if collection:
+                sql += " AND collection = %s"
+                params.append(collection)
+            sql += " ORDER BY id DESC LIMIT %s"
+            params.append(max(1, int(limit)))
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [_audit_checklist_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def find_audit_checkpoint_in_checklists(
+    point_id: str,
+    collection: Optional[str] = None,
+    limit: int = 40,
+) -> Optional[Dict[str, Any]]:
+    """在已保存审核点清单中查找单个审核点（CP-xxx）。"""
+    pid = str(point_id or "").strip()
+    if not pid:
+        return None
+    for row in get_audit_checklists(collection=collection, limit=limit, offset=0):
+        for point in row.get("checklist") or []:
+            if str(point.get("id") or "").strip() == pid:
+                return {
+                    "point": point,
+                    "checklist_name": row.get("name") or "",
+                    "checklist_id": row.get("id"),
+                    "collection": row.get("collection") or "",
+                }
+    return None
+
+
 def update_audit_checklist(checklist_id: int, checklist: list, name: str = None, status: str = None) -> None:
     init_db()
     conn = _get_conn()

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Set, Tuple
 
 import streamlit as st
@@ -340,6 +341,101 @@ def _widget_key(name: str) -> str:
     return f"sys_cfg__{name}"
 
 
+def _persist_key(name: str) -> str:
+    """初稿集成等分区：保存时优先读此备份，避免未渲染 Tab 的 widget 值丢失。"""
+    return f"sys_cfg_persist__{name}"
+
+
+def _normalize_draft_allowed_providers(raw: Any) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for part in re.split(r"[,，;；\s]+", s):
+        pid = str(part or "").strip().lower()
+        if pid and pid not in seen:
+            seen.add(pid)
+            out.append(pid)
+    return ",".join(out)
+
+
+def _seed_draft_integration_widgets_from_settings() -> None:
+    """初稿集成分区：表单为空但内存/库有值时回填，避免陈旧 session 显示空白。"""
+    for key in _DRAFT_INTEGRATION_SETTING_KEYS:
+        if key not in settings.model_fields:
+            continue
+        wk = _widget_key(key)
+        val = getattr(settings, key)
+        if key == "draft_interop_allowed_providers":
+            cur = str(st.session_state.get(wk) or "").strip()
+            saved = str(val or "").strip()
+            if not cur and saved:
+                st.session_state[wk] = saved
+            continue
+        if wk not in st.session_state:
+            st.session_state[wk] = val
+
+
+def _show_save_feedback_banner() -> None:
+    err = st.session_state.pop("_sys_cfg_save_error", None)
+    msg = st.session_state.pop("_sys_cfg_save_feedback", None)
+    if err:
+        st.error(str(err))
+    elif msg:
+        st.success(str(msg))
+
+
+def _format_save_feedback_message(
+    *,
+    source: str,
+    n: int,
+    patch: Dict[str, Any],
+    parsed: Dict[str, Any],
+) -> str:
+    draft_form = patch.get("draft_interop_allowed_providers")
+    draft_db = parsed.get("draft_interop_allowed_providers") if isinstance(parsed, dict) else None
+    return (
+        "已写入 MySQL（%s，更新 %s 项）。"
+        " draft_interop_allowed_providers：提交=%s，DB回读=%s。"
+        "（Streamlit 保存为服务端直写数据库，浏览器网络面板通常看不到独立 REST 接口。）"
+    ) % (source, n, repr(draft_form), repr(draft_db))
+
+
+def _save_system_config_patch(patch: Dict[str, Any], *, source: str) -> None:
+    """将 patch 写入内存 settings 并双写数据库；结果写入 session 供下一轮展示。"""
+    try:
+        n = apply_runtime_config_dict(patch)
+        sync_cursor_overrides_from_settings()
+        persist_settings_dual_write()
+        for dk in _DRAFT_INTEGRATION_SETTING_KEYS:
+            if dk in settings.model_fields:
+                st.session_state[_widget_key(dk)] = getattr(settings, dk)
+        st.session_state["_sys_cfg_in_page"] = False
+        st.session_state.pop("_sys_cfg_provider_form_snap", None)
+        st.session_state["current_provider"] = (settings.provider or "ollama").strip().lower()
+        row = load_app_settings() or {}
+        raw = row.get("runtime_settings_json") or ""
+        parsed: Dict[str, Any] = {}
+        if isinstance(raw, str) and raw.strip():
+            try:
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    parsed = loaded
+            except Exception:
+                parsed = {}
+        st.session_state["_sys_cfg_save_feedback"] = _format_save_feedback_message(
+            source=source,
+            n=n,
+            patch=patch,
+            parsed=parsed,
+        )
+        streamlit_rerun()
+    except Exception as e:
+        st.session_state["_sys_cfg_save_error"] = f"保存失败（{source}）：{type(e).__name__}: {e}"
+        streamlit_rerun()
+
+
 def _is_secret(name: str) -> bool:
     return name in {
         "mysql_password",
@@ -384,12 +480,34 @@ def _widget_effective_value(key: str, wk: str) -> Any:
     return getattr(settings, key)
 
 
+def _read_collected_widget_value(key: str) -> Any:
+    """收集单字段：widget 优先；初稿白名单空表单不覆盖已入库值。"""
+    wk = _widget_key(key)
+    settings_val = getattr(settings, key)
+    if wk in st.session_state:
+        wval = st.session_state[wk]
+        if key == "draft_interop_allowed_providers":
+            if str(wval or "").strip():
+                return wval
+            saved = _normalize_draft_allowed_providers(settings_val)
+            if saved:
+                return settings_val
+            return wval
+        return wval
+    return settings_val
+
+
 def _collect_from_widgets() -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for key in FLAT_KEYS:
-        wk = _widget_key(key)
-        out[key] = st.session_state.get(wk, getattr(settings, key))
+        out[key] = _read_collected_widget_value(key)
     out["provider"] = _coerce_provider_to_valid(out.get("provider"))
+    if "draft_interop_allowed_providers" in out:
+        normalized = _normalize_draft_allowed_providers(out.get("draft_interop_allowed_providers"))
+        saved = _normalize_draft_allowed_providers(getattr(settings, "draft_interop_allowed_providers", ""))
+        if not normalized and saved:
+            normalized = saved
+        out["draft_interop_allowed_providers"] = normalized
     # Cursor 等：不在此编辑模型，避免误用其它服务的模型名；入库仍以当前 settings 为准
     if not _show_llm_embedding_fields(out["provider"]):
         out["llm_model"] = getattr(settings, "llm_model")
@@ -468,12 +586,9 @@ def _render_field(key: str) -> None:
         return
 
     if ann is bool:
-        bval = bool(_widget_effective_value(key, wk))
-        try:
-            st.checkbox(label, value=bval, key=wk)
-        except TypeError:
-            st.session_state[wk] = bval
-            st.checkbox(label, key=wk)
+        if wk not in st.session_state:
+            st.session_state[wk] = bool(_widget_effective_value(key, wk))
+        st.checkbox(label, key=wk)
         return
 
     if ann is int:
@@ -519,15 +634,10 @@ def _render_field(key: str) -> None:
             st.session_state[wk] = sval
             st.text_input(label, key=wk)
         return
-    sval = _widget_effective_value(key, wk)
-    if sval is None:
-        sval = ""
-    sval = str(sval)
-    try:
-        st.text_input(label, value=sval, key=wk)
-    except TypeError:
-        st.session_state[wk] = sval
-        st.text_input(label, key=wk)
+    if wk not in st.session_state:
+        sval = _widget_effective_value(key, wk)
+        st.session_state[wk] = "" if sval is None else str(sval)
+    st.text_input(label, key=wk)
 
 
 def _render_static_keys(title: str, keys: List[str]) -> None:
@@ -559,7 +669,56 @@ def _render_draft_integration_tab() -> None:
             f"（{', '.join(_missing)}）。请确认已更新 **`config/settings.py`** 并**重启** Streamlit / 应用后再打开本页。"
         )
     if _present:
-        _render_static_keys("联调策略（入库后 aiword 可拉取 interop-config）", list(_present))
+        try:
+            from config.runtime_settings import refresh_runtime_settings_from_db_if_available
+
+            refresh_runtime_settings_from_db_if_available()
+        except Exception:
+            pass
+        st.markdown("**联调策略（入库后 aiword 可拉取 interop-config）**")
+        st.caption(
+            "请使用下方 **「保存初稿集成到数据库」** 按钮提交本分区。"
+            "保存由 Streamlit **服务端直写 MySQL**，浏览器开发者工具里一般不会出现单独的 REST 保存请求，属正常现象。"
+        )
+        allowed_def = str(getattr(settings, "draft_interop_allowed_providers", "") or "")
+        personal_def = bool(getattr(settings, "draft_interop_personal_keys_only", True))
+        notes_def = str(getattr(settings, "draft_interop_notes", "") or "")
+        with st.form("sys_cfg_draft_interop_form", clear_on_submit=False):
+            allowed = st.text_input(
+                FIELD_LABELS.get(
+                    "draft_interop_allowed_providers",
+                    "draft_interop_allowed_providers",
+                ),
+                value=allowed_def,
+            )
+            personal = st.checkbox(
+                FIELD_LABELS.get(
+                    "draft_interop_personal_keys_only",
+                    "draft_interop_personal_keys_only",
+                ),
+                value=personal_def,
+            )
+            notes = st.text_area(
+                FIELD_LABELS.get("draft_interop_notes", "draft_interop_notes"),
+                value=notes_def,
+                height=80,
+            )
+            try:
+                submitted = st.form_submit_button(
+                    "保存初稿集成到数据库",
+                    type="primary",
+                )
+            except TypeError:
+                submitted = st.form_submit_button("保存初稿集成到数据库")
+        if submitted:
+            _save_system_config_patch(
+                {
+                    "draft_interop_allowed_providers": _normalize_draft_allowed_providers(allowed),
+                    "draft_interop_personal_keys_only": bool(personal),
+                    "draft_interop_notes": str(notes or ""),
+                },
+                source="初稿集成表单",
+            )
 
 
 def _render_ai_tab() -> None:
@@ -599,6 +758,7 @@ def _render_ai_tab() -> None:
 
 def render_system_config_body() -> None:
     """渲染配置表单主体。"""
+    _show_save_feedback_banner()
     st.caption(
         "保存后写入数据库 `runtime_settings_json`（全量）并同步兼容列。"
         "迁机时新电脑只需 .env 配好 MySQL，启动后会自动从库恢复其余项。"
@@ -625,6 +785,25 @@ def render_system_config_body() -> None:
         ),
         language="json",
     )
+    if any(k in settings.model_fields for k in _DRAFT_INTEGRATION_SETTING_KEYS):
+        st.markdown("**当前生效（内存）— 初稿集成**")
+        st.code(
+            json.dumps(
+                {
+                    "draft_interop_allowed_providers": getattr(
+                        settings, "draft_interop_allowed_providers", ""
+                    )
+                    or "",
+                    "draft_interop_personal_keys_only": bool(
+                        getattr(settings, "draft_interop_personal_keys_only", True)
+                    ),
+                    "draft_interop_notes": getattr(settings, "draft_interop_notes", "") or "",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            language="json",
+        )
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -638,6 +817,7 @@ def render_system_config_body() -> None:
         if st.button("重置表单为内存值", key="sys_cfg_reset_widgets"):
             for k in FLAT_KEYS:
                 st.session_state.pop(_widget_key(k), None)
+                st.session_state.pop(_persist_key(k), None)
             _push_settings_to_widgets()
             st.session_state.pop("_sys_cfg_provider_form_snap", None)
             streamlit_rerun()
@@ -759,7 +939,7 @@ def render_system_config_body() -> None:
                     _push_settings_to_widgets()
                     st.session_state.pop("_sys_cfg_provider_form_snap", None)
                     st.session_state["current_provider"] = (settings.provider or "ollama").strip().lower()
-                    st.success(f"已应用 {n} 个字段并保存到数据库。")
+                    st.session_state["_sys_cfg_save_feedback"] = f"已应用 JSON 并保存到 MySQL（更新 {n} 项）。"
                     streamlit_rerun()
             except json.JSONDecodeError as e:
                 st.error(f"JSON 解析失败：{e}")
@@ -772,31 +952,7 @@ def render_system_config_body() -> None:
     with b1:
         if st.button("保存到数据库", key="sys_cfg_save_db"):
             data = _collect_from_widgets()
-            n = apply_runtime_config_dict(data)
-            sync_cursor_overrides_from_settings()
-            persist_settings_dual_write()
-            st.session_state.pop("_sys_cfg_provider_form_snap", None)
-            st.session_state["current_provider"] = (settings.provider or "ollama").strip().lower()
-            # 保存后立即从库回读关键字段，便于确认是否真的写入 runtime_settings_json
-            try:
-                row = load_app_settings() or {}
-                raw = row.get("runtime_settings_json") or ""
-                parsed = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
-                if isinstance(parsed, dict):
-                    st.success(
-                        "已保存（应用 %s 项配置）。DB 回读：quiz_provider=%s quiz_llm_model=%s quiz_temperature=%s"
-                        % (
-                            n,
-                            repr(parsed.get("quiz_provider")),
-                            repr(parsed.get("quiz_llm_model")),
-                            repr(parsed.get("quiz_temperature")),
-                        )
-                    )
-                else:
-                    st.success(f"已保存（应用 {n} 项配置）。")
-            except Exception:
-                st.success(f"已保存（应用 {n} 项配置）。")
-            streamlit_rerun()
+            _save_system_config_patch(data, source="全量表单")
     with b2:
         blob = json.dumps(serialize_settings_to_flat_dict(), ensure_ascii=False, indent=2)
         st.download_button(
@@ -817,6 +973,12 @@ def render_system_config_page() -> None:
     st.header("⚙️ 系统配置")
     # 每次从其他页进入本页时由 main() 将 _sys_cfg_in_page 置 False，此处把 settings 全量灌入表单
     if not st.session_state.get("_sys_cfg_in_page", False):
+        try:
+            from config.runtime_settings import refresh_runtime_settings_from_db_if_available
+
+            refresh_runtime_settings_from_db_if_available()
+        except Exception:
+            pass
         _push_settings_to_widgets()
         st.session_state["_sys_cfg_in_page"] = True
         st.session_state.pop("_sys_cfg_provider_form_snap", None)
