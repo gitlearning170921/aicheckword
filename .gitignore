@@ -5,7 +5,9 @@
 __pycache__/
 *.pyc
 knowledge_store/
+knowledge_store.tar.gz
 uploads/
+uploads.tar.gz
 *.egg-info/
 dist/
 build/
