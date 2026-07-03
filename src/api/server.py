@@ -167,6 +167,27 @@ def _configure_api_service_console_timestamps() -> None:
             h.setFormatter(default_fmt)
 
 
+def _configure_application_logging() -> None:
+    """让 src.* 业务日志输出到 API 进程控制台（与 uvicorn 同一窗口）。"""
+    level_name = (os.environ.get("AICHECKWORD_LOG_LEVEL") or "INFO").strip().upper()
+    level = getattr(logging, level_name, None)
+    if not isinstance(level, int):
+        level = logging.INFO
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt=datefmt,
+    )
+    root = logging.getLogger()
+    root.setLevel(level)
+    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(fmt)
+        root.addHandler(handler)
+    for name in ("src", "src.core", "src.core.quiz", "src.core.quiz.service"):
+        logging.getLogger(name).setLevel(level)
+
+
 def _build_uvicorn_log_config_with_time() -> dict:
     """供 `start_server()` 传入 uvicorn：在默认格式前增加 asctime。"""
     import copy
@@ -207,6 +228,7 @@ def _load_runtime_settings_from_db_on_startup() -> None:
     否则系统配置页保存的 quiz_provider/quiz_llm_model 等不会影响 /quiz/* 调用。
     """
     _configure_api_service_console_timestamps()
+    _configure_application_logging()
     try:
         db_conf = load_app_settings()
         if not db_conf:
@@ -539,6 +561,8 @@ class QuizBankQuestionPatchRequest(BaseModel):
     question_type: Optional[str] = None
     difficulty: Optional[str] = None
     is_active: Optional[bool] = None
+    author_roles_present: bool = False
+    author_roles: Optional[List[str]] = None
 
 
 class QuizAttemptStartRequest(BaseModel):
@@ -2378,6 +2402,8 @@ def quiz_bank_question_patch(
             question_type=request.question_type,
             difficulty=request.difficulty,
             is_active=request.is_active,
+            author_roles_present=bool(request.author_roles_present),
+            author_roles=request.author_roles,
         )
         return {"ok": True, "data": data}
     except Exception as e:

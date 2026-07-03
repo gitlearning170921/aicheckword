@@ -515,6 +515,12 @@ def _init_db_schema_locked() -> None:
                 _add_column_if_missing(cur, "knowledge_docs", "category", "VARCHAR(32) DEFAULT 'regulation'")
                 _add_column_if_missing(cur, "knowledge_docs", "case_id", "BIGINT DEFAULT NULL COMMENT '关联 project_cases.id，仅 category=project_case 时有值'")
                 _add_column_if_missing(cur, "quiz_bank_ingest_jobs", "set_id", "BIGINT DEFAULT NULL COMMENT 'AI 录题生成的套题 id（draft）'")
+                _add_column_if_missing(
+                    cur,
+                    "quiz_questions",
+                    "author_roles_json",
+                    "LONGTEXT NULL COMMENT '手动关联身份 JSON 数组；NULL=按题干自动推断，[]=通用题无身份'",
+                )
                 _add_column_if_missing(cur, "app_settings", "cursor_verify_ssl", "TINYINT(1) DEFAULT 1")
                 _add_column_if_missing(cur, "app_settings", "cursor_trust_env", "TINYINT(1) DEFAULT 1")
                 _add_column_if_missing(cur, "app_settings", "deepseek_api_key", "VARCHAR(1024) DEFAULT ''")

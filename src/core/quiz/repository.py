@@ -228,6 +228,7 @@ def list_bank_questions(
     params.append(max(0, int(offset)))
     sql = f"""
         SELECT q.id, q.question_type, q.difficulty, q.category, q.stem, q.options_json, q.answer_json, q.explanation, q.evidence_json,
+               q.author_roles_json,
                b.knowledge_scope_hash AS knowledge_scope_hash
         FROM quiz_question_bank b, quiz_questions q
         WHERE {' AND '.join(where)}
@@ -245,6 +246,7 @@ def list_bank_questions(
         r["options"] = _load(r.pop("options_json", "[]"), [])
         r["answer"] = _load(r.pop("answer_json", "null"), None)
         r["evidence"] = _load(r.pop("evidence_json", "[]"), [])
+        _attach_parsed_author_roles_stored(r)
         out.append(r)
     return out
 
@@ -298,6 +300,7 @@ def list_questions_by_ids(*, collection: str, question_ids: Sequence[int]) -> Li
                 f"""
                 SELECT q.id, q.question_type, q.difficulty, q.category, q.stem,
                        q.options_json, q.answer_json, q.explanation, q.evidence_json,
+                       q.author_roles_json,
                        q.knowledge_scope_hash AS knowledge_scope_hash
                 FROM quiz_questions q
                 WHERE q.collection=%s AND q.id IN ({marks})
@@ -318,6 +321,7 @@ def list_questions_by_ids(*, collection: str, question_ids: Sequence[int]) -> Li
         r["options"] = _load(r.pop("options_json", "[]"), [])
         r["answer"] = _load(r.pop("answer_json", "null"), None)
         r["evidence"] = _load(r.pop("evidence_json", "[]"), [])
+        _attach_parsed_author_roles_stored(r)
         _normalize_question_stem_in_memory(r)
         out.append(r)
     return out
@@ -511,7 +515,7 @@ def load_set(set_id: int) -> Optional[Dict[str, Any]]:
             cur.execute(
                 """
                 SELECT i.order_no, i.score, q.id AS question_id, q.question_type, q.difficulty, q.category, q.stem,
-                       q.options_json, q.answer_json, q.explanation, q.evidence_json
+                       q.options_json, q.answer_json, q.explanation, q.evidence_json, q.author_roles_json
                 FROM quiz_set_items i, quiz_questions q
                 WHERE i.set_id=%s AND q.id=i.question_id
                 ORDER BY i.order_no ASC
@@ -526,6 +530,7 @@ def load_set(set_id: int) -> Optional[Dict[str, Any]]:
         r["options"] = _load(r.pop("options_json", "[]"), [])
         r["answer"] = _load(r.pop("answer_json", "null"), None)
         r["evidence"] = _load(r.pop("evidence_json", "[]"), [])
+        _attach_parsed_author_roles_stored(r)
         _normalize_question_stem_in_memory(r)
         out_items.append(r)
     d = dict(root)
@@ -1081,10 +1086,10 @@ def admin_list_bank_questions_role_coverage_batch(
                 params.append(1 if is_active else 0)
             params.extend([limit, offset])
             sql = f"""
-                SELECT q.id, q.question_type, q.stem, q.explanation, q.evidence_json
+                SELECT q.id, q.question_type, q.stem, q.explanation, q.evidence_json, q.author_roles_json
                 FROM quiz_question_bank b, quiz_questions q
                 WHERE {' AND '.join(where)}
-                GROUP BY q.id, q.question_type, q.stem, q.explanation, q.evidence_json
+                GROUP BY q.id, q.question_type, q.stem, q.explanation, q.evidence_json, q.author_roles_json
                 ORDER BY MAX(b.id) DESC
                 LIMIT %s OFFSET %s
             """
@@ -1095,8 +1100,15 @@ def admin_list_bank_questions_role_coverage_batch(
     out: List[Dict[str, Any]] = []
     for r in rows:
         r["evidence"] = _load(r.pop("evidence_json", "[]"), [])
+        _attach_parsed_author_roles_stored(r)
         out.append(r)
     return out
+
+
+def _attach_parsed_author_roles_stored(row: Dict[str, Any]) -> None:
+    raw = row.pop("author_roles_json", None)
+    if raw is not None:
+        row["author_roles_stored"] = _load(raw, [])
 
 
 def admin_list_bank_questions(
@@ -1150,6 +1162,7 @@ def admin_list_bank_questions(
                     MAX(b.use_count) AS use_count,
                     MAX(b.last_used_at) AS last_used_at,
                     q.stem, q.options_json, q.answer_json, q.explanation, q.evidence_json,
+                    q.author_roles_json,
                     q.origin, q.status, q.created_by, q.created_at, q.updated_at
                 FROM quiz_question_bank b, quiz_questions q
                 WHERE {' AND '.join(where)}
@@ -1167,8 +1180,39 @@ def admin_list_bank_questions(
         r["answer"] = _load(r.pop("answer_json", "null"), None)
         r["evidence"] = _load(r.pop("evidence_json", "[]"), [])
         r["is_active"] = bool(int(r.get("is_active") or 0))
+        _attach_parsed_author_roles_stored(r)
         out.append(r)
     return out
+
+
+def admin_update_question_author_roles(
+    *,
+    collection: str,
+    question_id: int,
+    author_roles_present: bool,
+    author_roles: Optional[List[str]] = None,
+) -> None:
+    if not author_roles_present:
+        return
+    db.init_db()
+    conn = db._get_conn()  # noqa: SLF001
+    try:
+        with conn.cursor() as cur:
+            if author_roles is None:
+                cur.execute(
+                    "UPDATE quiz_questions SET author_roles_json=NULL, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE collection=%s AND id=%s",
+                    (collection, int(question_id)),
+                )
+            else:
+                cur.execute(
+                    "UPDATE quiz_questions SET author_roles_json=%s, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE collection=%s AND id=%s",
+                    (_dump(author_roles), collection, int(question_id)),
+                )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def admin_update_question(

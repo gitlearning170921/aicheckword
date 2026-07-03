@@ -588,6 +588,30 @@ def _normalize_author_roles(author_roles: Any) -> List[str]:
     return out
 
 
+def _question_manual_author_roles(question: Dict[str, Any]) -> Optional[List[str]]:
+    """None=未手动指定（自动推断）；[] 或 非空列表=手动指定。"""
+    if "author_roles_stored" not in question:
+        return None
+    return _normalize_author_roles(question.get("author_roles_stored") or [])
+
+
+def _question_resolved_role_hits(question: Dict[str, Any], role_keywords: Dict[str, List[str]]) -> set[str]:
+    manual = _question_manual_author_roles(question)
+    if manual is not None:
+        allowed = set(role_keywords.keys())
+        return {r for r in manual if r in allowed}
+    return _question_role_hits_extended(question, role_keywords)
+
+
+def _enrich_bank_question_author_roles(question: Dict[str, Any]) -> None:
+    label_map = _author_role_label_map()
+    manual = _question_manual_author_roles(question) is not None
+    hits = sorted(_question_resolved_role_hits(question, _all_author_role_keyword_scope()))
+    question["author_role_hits"] = hits
+    question["author_role_labels"] = [label_map.get(h) or h for h in hits]
+    question["author_roles_manual"] = manual
+
+
 def _role_file_keyword_scope(author_roles: List[str]) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
     for role in author_roles or []:
@@ -875,7 +899,7 @@ def _text_hits_any_keyword(text: str, keywords: List[str]) -> bool:
 
 
 def _question_role_hits(question: Dict[str, Any], role_keywords: Dict[str, List[str]]) -> set[str]:
-    return _question_role_hits_extended(question, role_keywords)
+    return _question_resolved_role_hits(question, role_keywords)
 
 
 def _question_role_hits_extended(question: Dict[str, Any], role_keywords: Dict[str, List[str]]) -> set[str]:
@@ -896,7 +920,7 @@ def _question_hits_unselected_focus_roles(
     selected = {str(k).strip().lower() for k in selected_role_keywords.keys() if str(k).strip()}
     if not selected:
         return set()
-    all_hits = _question_role_hits_extended(question, _all_author_role_keyword_scope())
+    all_hits = _question_resolved_role_hits(question, _all_author_role_keyword_scope())
     return {r for r in all_hits if r in _FOCUS_EXAM_ROLES and r not in selected}
 
 
@@ -907,7 +931,7 @@ def _question_focus_primary_for_selection(
     """优先选择命中所选重点身份、且不强命中未选重点身份的题。"""
     if not selected_role_keywords:
         return True
-    sel_hits = _question_role_hits_extended(question, selected_role_keywords)
+    sel_hits = _question_resolved_role_hits(question, selected_role_keywords)
     if not sel_hits:
         return _question_is_universal_common(question)
     return not _question_hits_unselected_focus_roles(question, selected_role_keywords)
@@ -924,7 +948,7 @@ def _question_is_leadership_cross_candidate(
 ) -> bool:
     if not _selection_has_leadership_cross_need(selected_role_keywords):
         return False
-    if _question_role_hits_extended(question, selected_role_keywords):
+    if _question_resolved_role_hits(question, selected_role_keywords):
         return False
     if _question_is_universal_common(question):
         return False
@@ -944,7 +968,7 @@ def _question_hits_role_regulatory(
     role: str,
     role_keywords: Dict[str, List[str]],
 ) -> bool:
-    if role not in _question_role_hits_extended(question, role_keywords):
+    if role not in _question_resolved_role_hits(question, role_keywords):
         return False
     role_hints = _ROLE_REGULATORY_HINTS.get(str(role).strip().lower()) or set()
     return _question_has_regulatory_context(question, role_hints)
@@ -963,6 +987,9 @@ def _question_is_universal_common(
     all_role_keywords: Optional[Dict[str, List[str]]] = None,
 ) -> bool:
     """与任一编写身份关键词均不匹配 → 各身份通用必考基线题。"""
+    manual = _question_manual_author_roles(question)
+    if manual is not None:
+        return len(manual) == 0
     scope = all_role_keywords or _all_author_role_keyword_scope()
     if _is_audit_checkpoint_text(_question_search_text(question)):
         return not bool(_infer_audit_checkpoint_role_hits(question))
@@ -1002,7 +1029,7 @@ def _question_is_regulatory_common_baseline(
     if not any(m.lower() in low or m in blob for m in _REGULATORY_COMMON_MARKERS):
         return False
     if selected_role_keywords:
-        hits = _question_role_hits_extended(question, selected_role_keywords)
+        hits = _question_role_hits(question, selected_role_keywords)
         if len(hits) >= 2:
             return True
         if any(m in blob for m in ("[国内体考]", "[欧盟体考]", "[美国体考]", "体考")):
@@ -1030,7 +1057,7 @@ def _question_eligible_for_selected_roles(
     """出题池：命中所选身份之一，或为通用基线题（不含其它身份专属）。"""
     if not selected_role_keywords:
         return True
-    if _question_role_hits_extended(question, selected_role_keywords):
+    if _question_resolved_role_hits(question, selected_role_keywords):
         return True
     if _is_audit_checkpoint_text(_question_search_text(question)):
         return False
@@ -1061,7 +1088,7 @@ def _build_role_coverage_summary(questions: List[Dict[str, Any]], role_keywords:
     all_scope = _all_author_role_keyword_scope()
     common = 0
     for q in questions or []:
-        hits = _question_role_hits_extended(q, role_keywords)
+        hits = _question_role_hits(q, role_keywords)
         if hits:
             for role in hits:
                 out[role] = int(out.get(role, 0)) + 1
@@ -1092,7 +1119,7 @@ def _allocate_role_and_common_questions(
     cross_preferred: List[Dict[str, Any]] = []
     cross_relaxed: List[Dict[str, Any]] = []
     for q in eligible:
-        hits = _question_role_hits_extended(q, role_keywords)
+        hits = _question_role_hits(q, role_keywords)
         is_pref = _question_focus_primary_for_selection(q, role_keywords)
         if hits:
             for r in hits:
@@ -1149,7 +1176,7 @@ def _allocate_role_and_common_questions(
             _take(q)
         base_pool = role_preferred + ([] if role == "prod" else role_relaxed)
         for q in base_pool:
-            if sum(1 for p in picked if role in _question_role_hits_extended(p, role_keywords)) >= min_role_hits:
+            if sum(1 for p in picked if role in _question_role_hits(p, role_keywords)) >= min_role_hits:
                 break
             _take(q)
 
@@ -1247,7 +1274,7 @@ def _attach_author_roles_to_set_items(
         if not isinstance(it, dict):
             continue
         q = it.get("question") if isinstance(it.get("question"), dict) else it
-        hits = sorted(_question_role_hits_extended(q, scope))
+        hits = sorted(_question_resolved_role_hits(q, scope))
         if hits:
             role_labels = [labels.get(h) or h for h in hits]
         elif not _COMMON_ROLE_LABEL_EMPTY and _question_is_universal_common(q, all_scope):
@@ -1732,18 +1759,32 @@ def _audit_checkpoint_raw_stem_for_format(
 
 
 def _strip_broken_open_book_html(stem: str) -> str:
-    """清理题干中误写入的前端开卷链接 HTML 片段（历史脏数据）。"""
+    """清理题干中误写入的前端开卷链接 HTML 片段（历史脏数据）。
+
+    兼容多种破损形态：完整/半截 <button> 标签、游离的属性碎片
+    （data-open-book-file / class / type / title），以及去链接后残留的
+    「裸文件名《同名》」重复。
+    """
     s = str(stem or "")
-    s = re.sub(r'" title="开卷查阅：点击展开全文">', "", s)
-    s = re.sub(r'\s*data-open-book-file="[^"]*"', "", s, flags=re.I)
-    s = re.sub(r'\s*class="[^"]*exam-open-book-link[^"]*"', "", s, flags=re.I)
+    # 1) 完整 button 标签对：保留内部纯文本（去掉包裹的书名号避免二次注入）
     s = re.sub(
-        r'<button[^>]*exam-open-book-link[^>]*>(.*?)</button>',
+        r"<button[^>]*exam-open-book-link[^>]*>(.*?)</button>",
         lambda m: re.sub(r"</?[^>]+>", "", m.group(1)).strip("《》"),
         s,
         flags=re.I | re.S,
     )
-    s = re.sub(r"</?button[^>]*>", "", s, flags=re.I)
+    # 2) 残留的起始/结束标签
+    s = re.sub(r"<button\b[^>]*>", "", s, flags=re.I)
+    s = re.sub(r"</button\s*>", "", s, flags=re.I)
+    # 3) 游离属性碎片（含前缀被截断只剩属性值的情况）
+    s = re.sub(r'\s*data-open-book-file\s*=\s*"[^"]*"', "", s, flags=re.I)
+    s = re.sub(r'\s*class\s*=\s*"[^"]*exam-open-book-link[^"]*"', "", s, flags=re.I)
+    s = re.sub(r'\s*type\s*=\s*"button"', "", s, flags=re.I)
+    # title 文案：允许前面残留引号、后面残留 '>' 或 '》'
+    s = re.sub(r'"?\s*title\s*=\s*"开卷查阅[:：]点击展开全文"\s*[>》]?', "", s, flags=re.I)
+    # 4) 折叠去链接后残留的「裸名《同名》」重复（仅限审核点清单文件名，较安全）
+    s = re.sub(r"(审核点清单[-:][\w.\-]+)\s*《\1》", r"《\1》", s)
+    s = re.sub(r"《(审核点清单[-:][\w.\-]+)》\s*\1(?![\w.\-])", r"《\1》", s)
     return s.strip()
 
 
@@ -2704,7 +2745,7 @@ def generate_set(
     pc_id = require_project_case_quiz(collection=collection, exam_category=exam_category, project_case_id=project_case_id)
     roles = _normalize_author_roles(author_roles or [])
     role_keywords = _role_file_keyword_scope(roles)
-    strict_role_filter = bool(roles) and not _selection_has_leadership_cross_need(role_keywords)
+    strict_role_filter = bool(roles)
     role_shuffle_key = ",".join(sorted(roles)) if roles else ""
     coverage_mode = "balanced_union" if str(author_role_coverage or "").strip().lower() == "balanced_union" else "union"
     question_count = max(1, int(question_count))
@@ -2748,7 +2789,8 @@ def generate_set(
     practice_wrong: Dict[str, deque] = {}
     practice_unpr: Dict[str, deque] = {}
     uid_pr = ""
-    if set_type == "practice" and not role_keywords:
+    # 练习卷：错题/未练优先；有身份时在下方加载阶段再过滤，而非整段禁用
+    if set_type == "practice":
         uid_pr = (created_by or "").strip()
         if uid_pr:
             for row in repo.list_wrong_questions_for_student(collection=collection, user_id=uid_pr, limit=260):
@@ -3199,8 +3241,29 @@ def ingest_bank_by_ai(
             agent = ReviewAgent(collection)
             hash_cat = exam_track
             all_saved: List[Dict[str, Any]] = []
+            ai_segments_ok = 0
+            fallback_segments = 0
+            last_ai_error = ""
             bank_stems_for_dedupe = repo.list_recent_question_stems(
                 collection=collection, exam_track=exam_track, limit=260
+            )
+            repo.update_ingest_job(
+                job_id,
+                generated_count=0,
+                status="running",
+                message="正在从知识库取证并调用 AI 生成题目（在文档服务后台执行）…",
+                set_id=draft_set_id,
+            )
+            prov = (settings.quiz_provider or settings.provider or "").strip().lower()
+            model = (settings.quiz_llm_model or settings.llm_model or "").strip()
+            logger.info(
+                "bank ingest job_id=%s start target=%s provider=%r model=%r exam_track=%s ec=%s",
+                job_id,
+                target_count,
+                prov or "",
+                model or "",
+                exam_track,
+                ec,
             )
             if ec == "project_case":
                 scope_plan: List[tuple[str, str, int]] = [("project_case", "项目案例", target_count)]
@@ -3236,6 +3299,14 @@ def ingest_bank_by_ai(
                             project_case_id=pc_id,
                         )
                     try:
+                        logger.info(
+                            "bank ingest job_id=%s calling LLM scope=%s type=%s gen_n=%s evidence=%s",
+                            job_id,
+                            scope_key,
+                            qt,
+                            gen_n,
+                            len(evidence or []),
+                        )
                         generated = _generate_questions_by_ai(
                             exam_track=exam_track,
                             category=cat_label,
@@ -3246,7 +3317,17 @@ def ingest_bank_by_ai(
                             exam_category=ec,
                             project_case_id=int(pc_id) if ec == "project_case" and pc_id is not None else None,
                         )
-                    except Exception:
+                        ai_segments_ok += 1
+                    except Exception as ai_exc:
+                        last_ai_error = str(ai_exc)[:500]
+                        fallback_segments += 1
+                        logger.warning(
+                            "bank ingest AI failed scope=%s type=%s: %s",
+                            scope_key,
+                            qt,
+                            ai_exc,
+                            exc_info=True,
+                        )
                         generated = _fallback_questions(
                             exam_track,
                             cat_label,
@@ -3256,6 +3337,16 @@ def ingest_bank_by_ai(
                             difficulty=difficulty,
                             exam_category=ec,
                         )
+                    repo.update_ingest_job(
+                        job_id,
+                        generated_count=len(all_saved),
+                        status="running",
+                        message=(
+                            f"正在生成 {cat_label}/{qt}…"
+                            f"（已入库 {len(all_saved)} 题；AI 成功 {ai_segments_ok} 段，离线补题 {fallback_segments} 段）"
+                        ),
+                        set_id=draft_set_id,
+                    )
                     prior_stems = [str(x.get("stem") or "") for x in all_saved]
                     prior_stems.extend(bank_stems_for_dedupe)
                     generated = _dedupe_questions_for_ingest(
@@ -3296,11 +3387,24 @@ def ingest_bank_by_ai(
                 [(int(x["id"]), 1.0) for x in all_saved if x.get("id")],
                 replace=True,
             )
+            done_msg = f"ok: saved {len(all_saved)}"
+            if ai_segments_ok or fallback_segments:
+                done_msg += f"; ai_ok={ai_segments_ok}; fallback={fallback_segments}"
+            if fallback_segments and last_ai_error:
+                done_msg += f"; last_ai_error={last_ai_error[:200]}"
+            logger.info(
+                "bank ingest job_id=%s done saved=%s ai_ok=%s fallback=%s err=%s",
+                job_id,
+                len(all_saved),
+                ai_segments_ok,
+                fallback_segments,
+                (last_ai_error[:200] if last_ai_error else ""),
+            )
             repo.update_ingest_job(
                 job_id,
                 generated_count=len(all_saved),
                 status="done",
-                message="ok",
+                message=done_msg,
                 set_id=draft_set_id,
             )
         except Exception as e:
@@ -4198,6 +4302,9 @@ def admin_list_bank_questions(
         limit=limit,
         offset=offset,
     )
+    for item in items:
+        item["question_id"] = item.get("id")
+        _enrich_bank_question_author_roles(item)
     return {"items": items, "total": int(total), "limit": int(limit), "offset": int(offset)}
 
 
@@ -4424,7 +4531,7 @@ def bank_author_role_coverage(
         if not _question_eligible_for_selected_roles(q, selected_scope):
             continue
         diagnostics["eligible_total"] = int(diagnostics["eligible_total"]) + 1
-        hits = _question_role_hits_extended(q, selected_scope)
+        hits = _question_resolved_role_hits(q, selected_scope)
         if hits:
             if _question_hits_unselected_focus_roles(q, selected_scope):
                 diagnostics["selected_cross_focus_count"] = int(diagnostics["selected_cross_focus_count"]) + 1
@@ -4489,6 +4596,8 @@ def admin_patch_bank_question(
     question_type: Optional[str] = None,
     difficulty: Optional[str] = None,
     is_active: Optional[bool] = None,
+    author_roles_present: bool = False,
+    author_roles: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     repo.admin_update_question(
         collection=collection,
@@ -4501,6 +4610,14 @@ def admin_patch_bank_question(
     )
     if answer_present:
         repo.admin_update_question_answer(collection=collection, question_id=int(question_id), answer=answer)
+    if author_roles_present:
+        normalized = None if author_roles is None else _normalize_author_roles(author_roles)
+        repo.admin_update_question_author_roles(
+            collection=collection,
+            question_id=int(question_id),
+            author_roles_present=True,
+            author_roles=normalized,
+        )
     repo.admin_update_bank_fields(
         collection=collection,
         question_id=int(question_id),
