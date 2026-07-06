@@ -1758,34 +1758,7 @@ def _audit_checkpoint_raw_stem_for_format(
     return stem
 
 
-def _strip_broken_open_book_html(stem: str) -> str:
-    """清理题干中误写入的前端开卷链接 HTML 片段（历史脏数据）。
-
-    兼容多种破损形态：完整/半截 <button> 标签、游离的属性碎片
-    （data-open-book-file / class / type / title），以及去链接后残留的
-    「裸文件名《同名》」重复。
-    """
-    s = str(stem or "")
-    # 1) 完整 button 标签对：保留内部纯文本（去掉包裹的书名号避免二次注入）
-    s = re.sub(
-        r"<button[^>]*exam-open-book-link[^>]*>(.*?)</button>",
-        lambda m: re.sub(r"</?[^>]+>", "", m.group(1)).strip("《》"),
-        s,
-        flags=re.I | re.S,
-    )
-    # 2) 残留的起始/结束标签
-    s = re.sub(r"<button\b[^>]*>", "", s, flags=re.I)
-    s = re.sub(r"</button\s*>", "", s, flags=re.I)
-    # 3) 游离属性碎片（含前缀被截断只剩属性值的情况）
-    s = re.sub(r'\s*data-open-book-file\s*=\s*"[^"]*"', "", s, flags=re.I)
-    s = re.sub(r'\s*class\s*=\s*"[^"]*exam-open-book-link[^"]*"', "", s, flags=re.I)
-    s = re.sub(r'\s*type\s*=\s*"button"', "", s, flags=re.I)
-    # title 文案：允许前面残留引号、后面残留 '>' 或 '》'
-    s = re.sub(r'"?\s*title\s*=\s*"开卷查阅[:：]点击展开全文"\s*[>》]?', "", s, flags=re.I)
-    # 4) 折叠去链接后残留的「裸名《同名》」重复（仅限审核点清单文件名，较安全）
-    s = re.sub(r"(审核点清单[-:][\w.\-]+)\s*《\1》", r"《\1》", s)
-    s = re.sub(r"《(审核点清单[-:][\w.\-]+)》\s*\1(?![\w.\-])", r"《\1》", s)
-    return s.strip()
+from src.core.quiz.open_book_stem_sanitize import strip_broken_open_book_html as _strip_broken_open_book_html
 
 
 def _sanitize_question_stem_for_display(item: Dict[str, Any]) -> None:
@@ -1949,14 +1922,15 @@ def _ensure_question_shape(question: Dict[str, Any], fallback_category: str = ""
                     break
         answer = uniq
     ev_out = question.get("evidence") if isinstance(question.get("evidence"), list) else []
-    stem_out = str(question.get("stem") or "").strip()
+    stem_out = _strip_broken_open_book_html(str(question.get("stem") or "").strip())
     stem_out = _trim_embedded_evidence_from_stem(stem_out, ev_out)
+    expl_out = _strip_broken_open_book_html(str(question.get("explanation") or "").strip())
     return {
         "question_type": q_type,
         "stem": stem_out,
         "options": opts,
         "answer": answer,
-        "explanation": str(question.get("explanation") or "").strip(),
+        "explanation": expl_out,
         "category": str(question.get("category") or fallback_category or "").strip(),
         "difficulty": _safe_difficulty(str(question.get("difficulty") or "medium")),
         "evidence": ev_out,

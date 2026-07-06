@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-清洗历史脏数据：quiz_questions 中题干/解析里误写入的前端「开卷查阅」链接 HTML 片段。
+清洗 aicheckword 题库 quiz_questions 题干/解析中的开卷链接 HTML 脏数据。
 
-背景：早期前端 linkify 逻辑在题干含重复文件名时，会把已生成的
-<button data-open-book-file="..."> 标签再次匹配替换，破损后的 HTML 片段
-（如 `... 审核点清单-xxx" title="开卷查阅：点击展开全文">《审核点清单-xxx》`）
-被存进了 quiz_questions.stem，导致学生端题干直接露出 HTML 代码。
+与 service 下发前清理共用 open_book_stem_sanitize.strip_broken_open_book_html。
+对全表逐条比对清洗前后；仅在有变化时 UPDATE（不依赖特征子串预筛）。
 
-本脚本复用 service._strip_broken_open_book_html 对每条题目的 stem（及可选
-explanation）做清洗；仅在清洗后内容发生变化时才 UPDATE。
-
-用法（在 aicheckword 项目根目录、已配置好 DB 与 venv）：
+用法：
   python scripts/fix_quiz_stem_open_book_html.py --dry-run
-  python scripts/fix_quiz_stem_open_book_html.py                 # 落库
-  python scripts/fix_quiz_stem_open_book_html.py --collection regulations
-  python scripts/fix_quiz_stem_open_book_html.py --include-explanation
-  python scripts/fix_quiz_stem_open_book_html.py --limit 50 --dry-run
+  python scripts/fix_quiz_stem_open_book_html.py
+  python scripts/fix_quiz_stem_open_book_html.py --collection regulations --include-explanation
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from typing import Any, Dict, List, Optional
@@ -31,28 +25,10 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from src.core import db  # noqa: E402
-from src.core.quiz.service import _strip_broken_open_book_html  # noqa: E402
+from src.core.quiz.open_book_stem_sanitize import strip_broken_open_book_html  # noqa: E402
 
 
-# 命中以下任一特征即视为「疑似脏数据」，仅对这些行做清洗与比较，降低全表扫描误改风险
-_DIRTY_MARKERS = (
-    "exam-open-book-link",
-    "data-open-book-file",
-    "开卷查阅：点击展开全文",
-    "开卷查阅:点击展开全文",
-    "<button",
-    "</button",
-)
-
-
-def _looks_dirty(text: Optional[str]) -> bool:
-    s = str(text or "")
-    if not s:
-        return False
-    return any(marker in s for marker in _DIRTY_MARKERS)
-
-
-def _fetch_rows(collection: Optional[str], include_explanation: bool) -> List[Dict[str, Any]]:
+def _fetch_rows(collection: Optional[str]) -> List[Dict[str, Any]]:
     db.init_db()
     conn = db._get_conn()  # noqa: SLF001
     try:
@@ -66,16 +42,9 @@ def _fetch_rows(collection: Optional[str], include_explanation: bool) -> List[Di
                 cur.execute(
                     "SELECT id, collection, stem, explanation FROM quiz_questions ORDER BY collection ASC, id ASC"
                 )
-            rows = [dict(r) for r in (cur.fetchall() or [])]
+            return [dict(r) for r in (cur.fetchall() or [])]
     finally:
         conn.close()
-
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        dirty = _looks_dirty(r.get("stem")) or (include_explanation and _looks_dirty(r.get("explanation")))
-        if dirty:
-            out.append(r)
-    return out
 
 
 def _update_row(
@@ -110,13 +79,11 @@ def main() -> int:
     ap.add_argument("--collection", default="", help="仅处理指定 collection；留空=全部")
     ap.add_argument("--dry-run", action="store_true", help="只统计与打印，不落库")
     ap.add_argument("--include-explanation", action="store_true", help="同时清洗 explanation 字段")
-    ap.add_argument("--limit", type=int, default=0, help="仅处理前 N 条疑似脏数据（0=不限）")
+    ap.add_argument("--limit", type=int, default=0, help="仅处理前 N 条有变化的记录（0=不限）")
     args = ap.parse_args()
 
     collection = str(args.collection or "").strip() or None
-    rows = _fetch_rows(collection, include_explanation=bool(args.include_explanation))
-    if args.limit and args.limit > 0:
-        rows = rows[: int(args.limit)]
+    rows = _fetch_rows(collection)
 
     total = len(rows)
     changed = 0
@@ -129,14 +96,14 @@ def main() -> int:
         coll = str(r.get("collection") or "regulations")
 
         stem_before = str(r.get("stem") or "")
-        stem_after = _strip_broken_open_book_html(stem_before)
+        stem_after = strip_broken_open_book_html(stem_before)
         stem_changed = stem_after != stem_before
 
         expl_after: Optional[str] = None
         expl_changed = False
         if args.include_explanation:
             expl_before = str(r.get("explanation") or "")
-            _expl_after = _strip_broken_open_book_html(expl_before)
+            _expl_after = strip_broken_open_book_html(expl_before)
             if _expl_after != expl_before:
                 expl_after = _expl_after
                 expl_changed = True
@@ -144,19 +111,22 @@ def main() -> int:
         if not stem_changed and not expl_changed:
             continue
 
+        if args.limit and args.limit > 0 and changed >= int(args.limit):
+            break
+
         changed += 1
         if stem_changed:
             changed_stem += 1
         if expl_changed:
             changed_expl += 1
 
-        if len(samples) < 10:
+        if len(samples) < 12:
             samples.append(
                 {
                     "id": qid,
                     "collection": coll,
-                    "stem_before": stem_before[:200],
-                    "stem_after": stem_after[:200],
+                    "stem_before": stem_before[:280],
+                    "stem_after": stem_after[:280],
                 }
             )
 
@@ -168,15 +138,13 @@ def main() -> int:
                 explanation=expl_after if expl_changed else None,
             )
 
-    import json
-
     print(
         json.dumps(
             {
                 "collection": collection or "(all)",
                 "dry_run": bool(args.dry_run),
                 "include_explanation": bool(args.include_explanation),
-                "suspect_rows": total,
+                "rows_scanned": total,
                 "changed": changed,
                 "changed_stem": changed_stem,
                 "changed_explanation": changed_expl,
