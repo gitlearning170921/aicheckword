@@ -34,19 +34,22 @@ streamlit run src/app.py
 ## 多用户 / 多设备访问
 
 - **本机打开**：用 **`http://localhost:8501`**（或 `http://127.0.0.1:8501`）。**不要**在浏览器里输入 `http://0.0.0.0:8501`（0.0.0.0 仅表示“监听所有网卡”，不能当网址用）。
-- **仅本机**：运行 `start.bat` 或 `streamlit run src/app.py` 即可。
-- **局域网内其他电脑也要访问**：请运行 **`start-lan.bat`**（会监听 `0.0.0.0`）；本机仍用 `http://localhost:8501`，其他电脑用 `http://<本机IP>:8501`，并放行防火墙 8501 端口。
+- **仅本机**：`dev\local-run\start_streamlit.bat` 或 `streamlit run src/app.py`
+- **局域网内其他电脑也要访问**：`dev\local-run\start_streamlit_lan.bat`；本机仍用 `http://localhost:8501`，其他电脑用 `http://<本机IP>:8501`
 - **多会话**：`.streamlit/config.toml` 中 `runner.fastReruns` 默认为 **false**，减轻查看/编辑报告时的整页重跑与焦点丢失；多浏览器仍可同时操作。若更在意侧栏切换的瞬时响应，可改为 `true`（报告页大量控件时可能更易感觉「自动刷新」）。
 
 ## 服务控制（Windows）
 
+脚本统一在 **`dev/local-run/`**（详见 [`dev/README.md`](dev/README.md)）：
+
 | 脚本 | 说明 |
 |------|------|
-| `start.bat` | 启动 Web UI（本机访问，推荐用 localhost:8501） |
-| `start-lan.bat` | 启动 Web UI（局域网可访问；本机仍用 localhost:8501 打开） |
-| `restart_api.bat` | 重启 API 服务（会杀占用端口的进程；默认端口 8000） |
-| `start_all.bat` | 同时启动 Web + API（分别在窗口中运行） |
-| `restart_all.bat` | 同时重启 Web + API |
-| `stop.bat` | 停止运行中的服务（端口 8501/8000） |
-| `stop_api.bat` | 仅停止 API 服务（默认端口 8000；不影响 Web UI） |
-| `restart.bat` | 先停止再在新窗口启动 |
+| `dev\local-run\start_streamlit.bat` | Streamlit Web UI（8501） |
+| `dev\local-run\start_streamlit_lan.bat` | Streamlit 局域网模式 |
+| `dev\local-run\start_api.bat` | FastAPI（8000，推荐） |
+| `dev\local-run\start_all.bat` | Web + API 一起启动 |
+| `dev\local-run\stop_all.bat` | 停止 Web + API |
+| `dev\local-run\stop_api.bat` | 仅停 API |
+| `dev\local-run\restart_all.bat` | 重启 Web + API |
+
+日常 Git：`dev\git-no_tag\commit.bat`。发版 tag 在 **aiword** 跑 `dev\git-tag_release\release.bat`。
