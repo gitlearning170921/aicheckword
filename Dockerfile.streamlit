@@ -11,8 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 USER root
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install streamlit "altair<5" "protobuf>=3.20.0,<=3.20.3"
+RUN pip install streamlit "altair<5" "protobuf>=3.20.0,<=3.20.3"
 
 # API 镜像 .dockerignore 排除了 Streamlit 入口，此处补入
 COPY src/app.py src/system_config_ui.py /app/src/

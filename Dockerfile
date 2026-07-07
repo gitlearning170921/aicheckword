@@ -11,8 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /w
 
 COPY requirements-api.txt .
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --prefix=/install -r requirements-api.txt
+RUN pip install --prefix=/install -r requirements-api.txt
 
 FROM python:3.11-slim-bookworm AS runtime
 
@@ -31,6 +30,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+ENV DEBIAN_FRONTEND=noninteractive
+
 RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g; s|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -39,8 +40,9 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g; s|security.debian.o
         libglib2.0-0 \
         libgomp1 \
         libreoffice-writer-nogui \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u 1000 -s /bin/bash app
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 -s /bin/bash app
 
 COPY --from=builder /install /usr/local
 
