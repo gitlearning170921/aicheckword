@@ -1201,7 +1201,12 @@ class DocumentReviewer:
             kept.append(p)
         return kept
 
-    def _rule_based_obvious_checks(self, text: str, file_name: str) -> List[AuditPoint]:
+    def _rule_based_obvious_checks(
+        self,
+        text: str,
+        file_name: str,
+        review_context: Optional[dict] = None,
+    ) -> List[AuditPoint]:
         """
         程序级显性检查：补足模型容易漏掉但人眼一眼能看出的错误。
         当前仅做低风险、通用、误报率低的检查：文件编号是否在正文出现。
@@ -1209,9 +1214,13 @@ class DocumentReviewer:
         pts: List[AuditPoint] = []
         fn = (file_name or "").strip()
         blob = (text or "")
-        # 从文件名中提取疑似“受控文件编号”
-        m = re.search(r"([A-Z]{2,6}[A-Z0-9]{0,4}-[A-Z]{2,6}-\d{2,4})", fn, re.I)
-        cand = (m.group(1) if m else "").upper()
+        # 先用台账下发的 document_number（若有），否则回退到文件名提取
+        expected = str((review_context or {}).get("document_number") or "").strip()
+        if expected:
+            cand = re.sub(r"[\s_]+", "-", expected).upper()
+        else:
+            m = re.search(r"([A-Z]{2,6}[A-Z0-9]{0,4}-[A-Z]{2,6}-\d{2,4})", fn, re.I)
+            cand = (m.group(1) if m else "").upper()
         if cand:
             # 容错：允许空格/下划线/连字符差异
             norm = re.sub(r"[\s_]+", "-", cand)
@@ -1223,7 +1232,7 @@ class DocumentReviewer:
                         category="一致性",
                         severity="medium",
                         location=f"{fn}（文件编号）",
-                        description=f"文件名中包含受控文件编号「{cand}」，但在已提取的文档正文/表格中未检索到该编号；可能导致受控编号与正文不一致或页眉页脚编号丢失。",
+                        description=f"任务台账/文件名中要求的受控文件编号「{cand}」在已提取的文档正文/表格中未检索到；可能导致台账编号与文档内编号不一致或页眉页脚编号丢失。",
                         regulation_ref="受控文件识别/编号一致性（通用质量体系要求）",
                         suggestion=f"请在文档首页/页眉页脚/封面处确认并统一显示文件编号为「{cand}」；若确有该编号但因版式/页眉页脚提取未覆盖，请提供带页眉页脚的可复制文本版或导出 PDF 再审。",
                         modify_docs=[fn] if fn else [],
@@ -1556,7 +1565,14 @@ class DocumentReviewer:
         )
         # 程序级显性检查（补漏）
         try:
-            audit_points = (self._rule_based_obvious_checks(text, eff_display) or []) + (audit_points or [])
+            audit_points = (
+                self._rule_based_obvious_checks(
+                    text,
+                    eff_display,
+                    review_context=review_context,
+                )
+                or []
+            ) + (audit_points or [])
         except Exception:
             pass
         audit_points = self._deduplicate_audit_points(audit_points)

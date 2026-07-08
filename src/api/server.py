@@ -74,7 +74,12 @@ from src.core.db import (
     CompanyMappingConflictError,
 )
 from src.core.project_option_label import format_project_option_label
-from src.core.document_loader import load_single_file, split_documents
+from src.core.document_loader import (
+    _build_docx_headers_footers_plaintext,
+    _build_docx_textbox_plaintext,
+    load_single_file,
+    split_documents,
+)
 from config.runtime_settings import apply_runtime_config_dict, sync_cursor_overrides_from_settings
 from src.core.db import load_app_settings
 from src.core.quiz import service as quiz_service
@@ -416,6 +421,20 @@ class CollectionRequest(BaseModel):
     collection: str = "regulations"
 
 
+class DocumentControlValidateRequest(BaseModel):
+    collection: str = "regulations"
+    document_number: str = ""
+    doc_type_code: str = ""
+    title: str = ""
+    project_code: str = ""
+
+
+class DocumentControlParseRulesRequest(BaseModel):
+    collection: str = "regulations"
+    query: str = "文件控制程序 编号规则"
+    text: str = ""
+
+
 class IntegrationCreateProjectBody(BaseModel):
     """创建 aicheckword 专属项目（与 Streamlit「项目与专属资料」新建表单一致）。"""
 
@@ -620,6 +639,70 @@ def _merge_review_context(
             continue
         ctx[k] = v
     return ctx or None
+
+
+_DOCNO_RE = re.compile(r"([A-Z0-9]{2,12}-[A-Z0-9]{2,12}-\d{2,6})", re.I)
+_VERSION_RE = re.compile(r"\b([A-Z]\/\d{1,2}|V(?:ER)?\.?\s*\d+(?:\.\d+)*)\b", re.I)
+_TYPE_RE = re.compile(r"-([A-Z]{2,10})-\d{2,6}\b")
+
+
+def _normalize_document_number_local(value: str) -> str:
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    text = re.sub(r"[\s_]+", "-", text)
+    text = text.replace("—", "-").replace("–", "-").replace("－", "-")
+    text = re.sub(r"-{2,}", "-", text)
+    return text.strip("-")
+
+
+def _extract_document_control_meta(file_name: str, text_blob: str) -> Dict[str, Any]:
+    source = "\n".join([str(file_name or ""), str(text_blob or "")])
+    m_doc = _DOCNO_RE.search(source)
+    raw_no = (m_doc.group(1) if m_doc else "").strip()
+    doc_no = _normalize_document_number_local(raw_no)
+    m_ver = _VERSION_RE.search(source)
+    version = (m_ver.group(1) if m_ver else "").strip().upper()
+    doc_type = ""
+    if doc_no:
+        tm = _TYPE_RE.search(doc_no)
+        doc_type = (tm.group(1) if tm else "").strip().upper()
+    confidence = 0.45
+    if doc_no:
+        confidence = 0.85
+        if doc_no in _normalize_document_number_local(file_name):
+            confidence = 0.95
+    return {
+        "document_number": doc_no,
+        "version": version or "",
+        "doc_type": doc_type or "",
+        "extract_confidence": round(confidence, 2),
+    }
+
+
+def _parse_rule_candidates_from_text(text: str) -> List[Dict[str, Any]]:
+    blob = str(text or "")
+    if not blob.strip():
+        return []
+    candidates: List[Dict[str, Any]] = []
+    for m in re.finditer(r"([A-Z]{2,10})[-_ ]?\d{2,4}", blob, re.I):
+        typ = (m.group(1) or "").upper()
+        if len(typ) < 2:
+            continue
+        item = {
+            "name": f"{typ} 文件编号规则",
+            "docTypeCode": typ,
+            "patternRegex": rf"^([A-Z0-9]{{2,12}})-{typ}-(\d{{2,6}})$",
+            "renderTemplate": "{prefix}-{type}-{seq:03d}",
+            "prefixSource": "from_project_code",
+            "seqStart": 1,
+            "seqPad": 3,
+        }
+        if item not in candidates:
+            candidates.append(item)
+        if len(candidates) >= 12:
+            break
+    return candidates
 
 
 def _extract_first_json_object(text: str) -> Dict[str, Any]:
@@ -1292,6 +1375,145 @@ async def review_upload(
             Path(tmp_path).unlink(missing_ok=True)
 
     return {"reports": reports, "total_files": len(reports)}
+
+
+@app.post("/api/integration/document-control/extract-batch")
+async def integration_document_control_extract_batch(
+    req: Request,
+    files: List[UploadFile] = File(...),
+    collection: str = Form("regulations"),
+):
+    collection = _resolve_request_collection(req, collection)
+    items: List[Dict[str, Any]] = []
+    for file in files or []:
+        suffix = Path(file.filename or "").suffix or ".tmp"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            tmp_path = Path(tmp.name)
+        try:
+            text_parts: List[str] = []
+            if tmp_path.suffix.lower() == ".docx":
+                text_parts.append(_build_docx_headers_footers_plaintext(tmp_path))
+                text_parts.append(_build_docx_textbox_plaintext(tmp_path))
+            try:
+                docs = split_documents(load_single_file(tmp_path))
+                if docs:
+                    text_parts.append("\n".join((d.page_content or "") for d in docs[:12]))
+            except Exception:
+                pass
+            merged = "\n".join(p for p in text_parts if p).strip()
+            meta = _extract_document_control_meta(file.filename or "", merged)
+            title = Path(file.filename or "").stem
+            items.append(
+                {
+                    "original_filename": file.filename or "",
+                    "document_number": meta["document_number"],
+                    "version": meta["version"],
+                    "title": title,
+                    "doc_type": meta["doc_type"],
+                    "extract_confidence": meta["extract_confidence"],
+                    "status": "new",
+                }
+            )
+        except Exception as e:
+            items.append(
+                {
+                    "original_filename": file.filename or "",
+                    "status": "error",
+                    "message": str(e),
+                }
+            )
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    return {"ok": True, "collection": collection, "items": items}
+
+
+@app.post("/api/integration/document-control/validate-allocation")
+def integration_document_control_validate_allocation(
+    req: Request,
+    body: DocumentControlValidateRequest,
+):
+    body.collection = _resolve_request_collection(req, body.collection or "regulations")
+    number = _normalize_document_number_local(body.document_number or "")
+    warnings: List[str] = []
+    blocked: List[str] = []
+    if not number:
+        blocked.append("文件编号不能为空")
+    elif not _DOCNO_RE.search(number):
+        blocked.append("文件编号不符合“前缀-类型-流水号”格式")
+    if body.doc_type_code and number and f"-{body.doc_type_code.strip().upper()}-" not in number:
+        warnings.append("编号中的类型码与当前文档类型不一致，请人工确认")
+    if body.project_code and number and not number.startswith(_normalize_document_number_local(body.project_code)):
+        warnings.append("编号前缀与项目编号不一致，请确认是否为跨项目文档")
+    kb_hits = []
+    try:
+        agent = get_agent(body.collection)
+        kb_hits = agent.search_knowledge(
+            f"文件控制程序 编号规则 {body.doc_type_code or ''} {body.title or ''}",
+            top_k=5,
+            use_checkpoints=False,
+        ) or []
+    except Exception:
+        kb_hits = []
+    if not kb_hits:
+        warnings.append("未检索到明确的知识库规则摘录，已降级为规则引擎校验")
+    status = "ok"
+    if blocked:
+        status = "blocked"
+    elif warnings:
+        status = "warnings"
+    refs = []
+    for row in kb_hits[:3]:
+        refs.append(
+            {
+                "file_name": row.get("file_name") or "",
+                "score": row.get("score"),
+                "snippet": str(row.get("content") or "")[:240],
+            }
+        )
+    return {
+        "ok": status != "blocked",
+        "status": status,
+        "warnings": warnings,
+        "blocked": blocked,
+        "knowledge_refs": refs,
+    }
+
+
+@app.post("/api/integration/document-control/parse-numbering-rules")
+def integration_document_control_parse_numbering_rules(
+    req: Request,
+    body: DocumentControlParseRulesRequest,
+):
+    body.collection = _resolve_request_collection(req, body.collection or "regulations")
+    text_blob = (body.text or "").strip()
+    refs = []
+    if not text_blob:
+        try:
+            agent = get_agent(body.collection)
+            refs = agent.search_knowledge(
+                (body.query or "文件控制程序 编号规则").strip(),
+                top_k=8,
+                use_checkpoints=False,
+            ) or []
+            text_blob = "\n\n".join(str(x.get("content") or "") for x in refs)
+        except Exception:
+            refs = []
+            text_blob = ""
+    candidates = _parse_rule_candidates_from_text(text_blob)
+    return {
+        "ok": True,
+        "collection": body.collection,
+        "candidates": candidates,
+        "references": [
+            {
+                "file_name": x.get("file_name") or "",
+                "score": x.get("score"),
+                "snippet": str(x.get("content") or "")[:240],
+            }
+            for x in refs[:5]
+        ],
+    }
 
 
 @app.post("/review/text")
