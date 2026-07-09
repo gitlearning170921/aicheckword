@@ -435,6 +435,11 @@ class DocumentControlParseRulesRequest(BaseModel):
     text: str = ""
 
 
+class DocumentControlTranslateTitleRequest(BaseModel):
+    collection: str = "regulations"
+    text: str = ""
+
+
 class IntegrationCreateProjectBody(BaseModel):
     """创建 aicheckword 专属项目（与 Streamlit「项目与专属资料」新建表单一致）。"""
 
@@ -680,29 +685,175 @@ def _extract_document_control_meta(file_name: str, text_blob: str) -> Dict[str, 
     }
 
 
+_KNOWN_DOC_TYPE_CODES = (
+    "SOP",
+    "DHF",
+    "QR",
+    "SMP",
+    "WI",
+    "FR",
+    "QP",
+    "URS",
+    "SRS",
+    "IFU",
+    "DMR",
+    "PAP",
+    "CAPA",
+    "FMEA",
+    "FRM",
+    "REC",
+    "CE",
+    "CS",
+)
+
+
+def _rule_candidate_item(doc_type: str, *, name: str = "") -> Dict[str, Any]:
+    typ = re.sub(r"[^A-Z0-9]", "", (doc_type or "").upper())
+    if len(typ) < 2 or len(typ) > 12:
+        return {}
+    label = (name or "").strip() or f"{typ} 文件编号规则"
+    return {
+        "name": label,
+        "docTypeCode": typ,
+        "patternRegex": rf"^([A-Z0-9]{{2,12}})-{typ}-(\d{{2,6}})$",
+        "renderTemplate": "{prefix}-{type}-{seq:03d}",
+        "prefixSource": "from_project_code",
+        "seqStart": 1,
+        "seqPad": 3,
+    }
+
+
+def _append_rule_candidate(candidates: List[Dict[str, Any]], seen: set[str], doc_type: str, *, name: str = "") -> None:
+    item = _rule_candidate_item(doc_type, name=name)
+    typ = item.get("docTypeCode") if item else ""
+    if not typ or typ in seen:
+        return
+    seen.add(typ)
+    candidates.append(item)
+
+
 def _parse_rule_candidates_from_text(text: str) -> List[Dict[str, Any]]:
     blob = str(text or "")
     if not blob.strip():
         return []
     candidates: List[Dict[str, Any]] = []
-    for m in re.finditer(r"([A-Z]{2,10})[-_ ]?\d{2,4}", blob, re.I):
-        typ = (m.group(1) or "").upper()
-        if len(typ) < 2:
-            continue
-        item = {
-            "name": f"{typ} 文件编号规则",
-            "docTypeCode": typ,
-            "patternRegex": rf"^([A-Z0-9]{{2,12}})-{typ}-(\d{{2,6}})$",
-            "renderTemplate": "{prefix}-{type}-{seq:03d}",
-            "prefixSource": "from_project_code",
-            "seqStart": 1,
-            "seqPad": 3,
-        }
-        if item not in candidates:
-            candidates.append(item)
-        if len(candidates) >= 12:
-            break
-    return candidates
+    seen: set[str] = set()
+
+    # 三段式示例：PAPUWIS-DHF-001 / PROJECT-SOP-012
+    for m in re.finditer(r"\b([A-Z0-9]{2,12})-([A-Z][A-Z0-9]{1,11})-(\d{2,6})\b", blob, re.I):
+        _append_rule_candidate(candidates, seen, m.group(2))
+
+    # 四段式示例：QR-SMP7.3-03-01（取首段类型码；与 PREFIX-TYPE-SEQ 区分）
+    for m in re.finditer(
+        r"\b([A-Z]{2,8})-(?:[A-Z]+\d[\w.-]*|[A-Z0-9]+(?:\.\d+)+)-\d{2,4}-\d{2,4}\b",
+        blob,
+        re.I,
+    ):
+        _append_rule_candidate(candidates, seen, m.group(1))
+
+    # 中文条款：类型代号 / 文件类别
+    for m in re.finditer(
+        r"(?:类型代号|文件类别|类别代码|文件类型|代号)[：:\s]*([A-Z]{2,12})",
+        blob,
+        re.I,
+    ):
+        _append_rule_candidate(candidates, seen, m.group(1))
+
+    # 常见缩写（须在编号/文件语境附近）
+    ctx = blob
+    for typ in _KNOWN_DOC_TYPE_CODES:
+        if re.search(rf"(?:编号|文件|受控|记录|程序).{{0,40}}\b{typ}\b|\b{typ}\b.{{0,40}}(?:编号|文件|受控)", ctx, re.I):
+            _append_rule_candidate(candidates, seen, typ)
+
+    # 旧版兼容：TYPE-001 / TYPE 001
+    for m in re.finditer(r"\b([A-Z]{2,10})[-_ ](\d{2,6})\b", blob, re.I):
+        _append_rule_candidate(candidates, seen, m.group(1))
+
+    return candidates[:12]
+
+
+def _numbering_rule_ref_from_hit(row: Dict[str, Any]) -> Dict[str, Any]:
+    md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    content = str(row.get("content") or "").strip()
+    file_name = str(
+        row.get("file_name")
+        or row.get("source")
+        or md.get("source_file")
+        or ""
+    ).strip()
+    return {
+        "file_name": file_name,
+        "score": row.get("score"),
+        "snippet": content[:240],
+        "content": content,
+    }
+
+
+def _gather_numbering_rule_kb_context(collection: str, query: str) -> tuple[str, List[Dict[str, Any]]]:
+    """向量检索 + 关键词库检索，尽量召回《文件控制程序》编号章节。"""
+    coll = (collection or "regulations").strip() or "regulations"
+    base_query = (query or "文件控制程序 编号规则").strip() or "文件控制程序 编号规则"
+    queries = [
+        base_query,
+        "文件控制程序 文件编号 格式",
+        "受控文件 编号规则 类型代号",
+        "文件控制程序",
+    ]
+    chunks: List[str] = []
+    refs: List[Dict[str, Any]] = []
+    seen_snip: set[str] = set()
+
+    def _append_ref(row: Dict[str, Any]) -> None:
+        ref = _numbering_rule_ref_from_hit(row)
+        content = (ref.get("content") or "").strip()
+        if not content:
+            return
+        key = f"{ref.get('file_name') or ''}|{content[:160]}"
+        if key in seen_snip:
+            return
+        seen_snip.add(key)
+        chunks.append(content)
+        refs.append({k: ref[k] for k in ("file_name", "score", "snippet") if k in ref})
+
+    try:
+        agent = get_agent(coll)
+    except Exception:
+        agent = None
+
+    if agent is not None:
+        for q in queries:
+            try:
+                hits = agent.search_knowledge(q, top_k=8, use_checkpoints=False) or []
+            except Exception:
+                hits = []
+            for row in hits:
+                _append_ref(row)
+
+    keyword_sets = [
+        (["文件控制程序", "编号"], "program"),
+        (["文件控制", "编号规则"], "program"),
+        (["受控文件", "编号"], None),
+        (["文件编号", "规则"], None),
+    ]
+    for keywords, category in keyword_sets:
+        try:
+            from src.core.db import search_knowledge_docs_by_content_keywords
+
+            rows = search_knowledge_docs_by_content_keywords(
+                collection=coll,
+                keywords=keywords,
+                category=category,
+                limit=40,
+            )
+        except Exception:
+            rows = []
+        for row in rows or []:
+            fn = str(row.get("file_name") or "").strip()
+            if category == "program" or "文件控制" in fn or "编号" in fn:
+                _append_ref(row)
+
+    text_blob = "\n\n".join(chunks)
+    return text_blob, refs
 
 
 def _extract_first_json_object(text: str) -> Dict[str, Any]:
@@ -1143,6 +1294,128 @@ def _chat_simplify_match_text(text: str, *, max_len: int = 56) -> str:
     return s
 
 
+def _chat_split_into_sentences(text: str) -> List[str]:
+    """将正文切分为句子列表（保留句末标点）。"""
+    t = (text or "").replace("\r", "")
+    if not t.strip():
+        return []
+    parts = re.split(r"([。；;!?？\n])", t)
+    sents: List[str] = []
+    buf = ""
+    for p in parts:
+        if not p:
+            continue
+        buf += p
+        if p in "。；;!?？\n":
+            s = re.sub(r"\s+", " ", buf).strip()
+            if s:
+                sents.append(s)
+            buf = ""
+    if buf.strip():
+        sents.append(re.sub(r"\s+", " ", buf).strip())
+    return sents
+
+
+def _chat_sentence_seems_incomplete(sent: str, keyword: str = "") -> bool:
+    """判断单句是否过短/缺主语，简化版需补前后文。"""
+    s = re.sub(r"\s+", " ", (sent or "").strip())
+    if not s:
+        return True
+    if len(s) < 20:
+        return True
+    subject_hints = (
+        "文件",
+        "记录",
+        "程序",
+        "受控",
+        "应",
+        "须",
+        "应当",
+        "必须",
+        "管理",
+        "体系",
+        "复审",
+        "更新",
+        "修订",
+        "换版",
+        "规定",
+        "要求",
+    )
+    has_subject = any(h in s for h in subject_hints)
+    if len(s) < 40 and not has_subject:
+        return True
+    if re.search(r"(一次|每两|每\d+年|至少每|每\d+个月)[。；;]?$", s) and not has_subject:
+        return True
+    if keyword and len(s) <= len(keyword) + 8:
+        return True
+    return False
+
+
+def _chat_find_sentence_index(sentences: List[str], full_text: str, pos: int, term_end: int) -> int:
+    if not sentences:
+        return 0
+    hit = max(pos, 0)
+    end_hit = max(term_end, hit)
+    cum = 0
+    for i, s in enumerate(sentences):
+        found = full_text.find(s, cum)
+        if found < 0:
+            found = cum
+        seg_end = found + len(s)
+        if found <= hit <= seg_end or found <= end_hit <= seg_end:
+            return i
+        cum = max(cum, seg_end)
+    return 0
+
+
+def _chat_expand_summary_sentence(
+    text: str,
+    pos: int,
+    term_end: int,
+    keyword: str = "",
+    *,
+    max_sentences: int = 5,
+    max_chars: int = 320,
+) -> str:
+    """简易版：核心句不完整时，向前后扩展若干句直至语义相对完整。"""
+    core = _chat_extract_sentence_containing(text, pos, term_end)
+    if not _chat_sentence_seems_incomplete(core, keyword):
+        return core
+    full = (text or "").replace("\r", "")
+    sentences = _chat_split_into_sentences(full)
+    if len(sentences) <= 1:
+        para = _chat_extract_paragraph_containing(full, pos)
+        para_one = re.sub(r"\s+", " ", para).strip()
+        if para_one and len(para_one) > len(core):
+            return para_one[:max_chars].rstrip() + ("…" if len(para_one) > max_chars else "")
+        return core
+    idx = _chat_find_sentence_index(sentences, full, pos, term_end)
+    lo = hi = idx
+    parts = [sentences[idx]]
+    while _chat_sentence_seems_incomplete(" ".join(parts), keyword) and (hi - lo + 1) < max_sentences:
+        grew = False
+        if lo > 0:
+            lo -= 1
+            parts.insert(0, sentences[lo])
+            grew = True
+        if _chat_sentence_seems_incomplete(" ".join(parts), keyword) and hi < len(sentences) - 1:
+            hi += 1
+            parts.append(sentences[hi])
+            grew = True
+        if len(" ".join(parts)) >= max_chars:
+            break
+        if not grew:
+            break
+    merged = " ".join(parts).strip()
+    if _chat_sentence_seems_incomplete(merged, keyword):
+        para = re.sub(r"\s+", " ", _chat_extract_paragraph_containing(full, pos)).strip()
+        if para and len(para) > len(merged):
+            merged = para
+    if len(merged) > max_chars:
+        merged = merged[: max_chars - 1].rstrip() + "…"
+    return merged or core
+
+
 def _chat_extract_sentence_containing(text: str, pos: int, term_end: int) -> str:
     """提取包含关键词的整句话（以。；;!?？或换行分句）。"""
     t = (text or "").replace("\r", "")
@@ -1236,7 +1509,7 @@ def _chat_extract_match_spans(content: str, query: str) -> Dict[str, Any]:
             "match_keywords": [],
             "full_content": text,
         }
-    sentence = _chat_extract_sentence_containing(text, best_pos, term_end)
+    sentence = _chat_expand_summary_sentence(text, best_pos, term_end, best_term)
     paragraph = _chat_extract_paragraph_containing(text, best_pos)
     matched = [t for t in terms if t in text or t.replace(" ", "") in compact]
     return {
@@ -2398,33 +2671,91 @@ def integration_document_control_parse_numbering_rules(
 ):
     body.collection = _resolve_request_collection(req, body.collection or "regulations")
     text_blob = (body.text or "").strip()
-    refs = []
+    refs: List[Dict[str, Any]] = []
     if not text_blob:
-        try:
-            agent = get_agent(body.collection)
-            refs = agent.search_knowledge(
-                (body.query or "文件控制程序 编号规则").strip(),
-                top_k=8,
-                use_checkpoints=False,
-            ) or []
-            text_blob = "\n\n".join(str(x.get("content") or "") for x in refs)
-        except Exception:
-            refs = []
-            text_blob = ""
+        text_blob, refs = _gather_numbering_rule_kb_context(body.collection, body.query)
     candidates = _parse_rule_candidates_from_text(text_blob)
+    from src.core.document_control_rules import merge_kb_rules_with_fallback
+
+    source_file = ""
+    if refs:
+        source_file = str((refs[0] or {}).get("file_name") or "").strip()
+    rules = merge_kb_rules_with_fallback(text_blob, source_file=source_file)
+    if not rules and candidates:
+        rules = [
+            {
+                "docTypeCode": c.get("docTypeCode"),
+                "name": c.get("name"),
+                "renderTemplate": c.get("renderTemplate"),
+                "prefixSource": c.get("prefixSource"),
+                "seqStart": c.get("seqStart"),
+                "seqPad": c.get("seqPad"),
+                "example": c.get("example") or "",
+                "autoAllocatable": True,
+                "needsProjectCode": (c.get("prefixSource") or "") == "from_project_code",
+                "kbRuleExcerpt": c.get("name") or "",
+            }
+            for c in candidates
+        ]
+    ref_items = refs[:8]
+    if not ref_items and text_blob.strip():
+        ref_items = [{"file_name": "", "snippet": text_blob[:240]}]
+    message = f"知识库检索到 {len(refs)} 条相关片段"
+    if rules:
+        auto_n = sum(1 for r in rules if r.get("autoAllocatable"))
+        message += f"，已解析 {len(rules)} 类文件编号规则（{auto_n} 类可自动取号）"
+    elif refs:
+        message += "，已加载《文件控制程序》缺省规则结构"
+        rules = merge_kb_rules_with_fallback("", source_file=source_file)
+    else:
+        message += "；未检索到《文件控制程序》，请确认知识库已训练且 collection 与当前公司一致"
     return {
         "ok": True,
         "collection": body.collection,
+        "rules": rules,
         "candidates": candidates,
-        "references": [
-            {
-                "file_name": x.get("file_name") or "",
-                "score": x.get("score"),
-                "snippet": str(x.get("content") or "")[:240],
-            }
-            for x in refs[:5]
-        ],
+        "references": ref_items,
+        "referenceCount": len(refs),
+        "candidateCount": len(candidates),
+        "ruleCount": len(rules),
+        "sourceFile": source_file,
+        "message": message,
     }
+
+
+@app.post("/api/integration/document-control/translate-title")
+def integration_document_control_translate_title(
+    req: Request,
+    body: DocumentControlTranslateTitleRequest,
+):
+    body.collection = _resolve_request_collection(req, body.collection or "regulations")
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text 必填")
+    from .draft_integration import _header_provider, _parse_client_llm
+
+    client_llm = _parse_client_llm(req)
+    provider = _header_provider(req)
+    prompt = (
+        "将以下医疗器械技术文件名称直译为简洁、专业的英文标题（Title Case）。"
+        "须忠实于原意，不要套用固定缩写（如不要无故使用 SRS），不要添加原文没有的含义。"
+        "仅输出一行英文标题，不要解释、不要引号、不要编号。\n\n"
+        f"{text}"
+    )
+    try:
+        result = _invoke_chat_llm_text(
+            prompt,
+            header_provider=provider,
+            client_llm=client_llm if client_llm.has_any() else None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"翻译失败：{exc}") from exc
+    raw_en = (result.text or "").strip()
+    lines = raw_en.splitlines()
+    title_en = (lines[0] if lines else raw_en).strip().strip("\"'「」『』《》")
+    if not title_en:
+        raise HTTPException(status_code=502, detail="翻译结果为空")
+    return {"ok": True, "titleEn": title_en[:255], "source": "translated"}
 
 
 @app.post("/review/text")
