@@ -459,7 +459,7 @@ class ChatReplyOptions(BaseModel):
     knowledge_category: str = "program"
     top_k: int = Field(default=0, ge=0, le=30)
     min_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
-    max_reply_chars: int = Field(default=280, ge=80, le=600)
+    max_reply_chars: int = Field(default=280, ge=80, le=8000)
     max_detail_chars: int = Field(default=0, ge=0, le=6000)
 
 
@@ -766,23 +766,807 @@ def _chat_as_str_list(val: Any, *, limit: int = 8) -> List[str]:
     return out[:limit]
 
 
+# 近义词组：仅当用户问题里已出现组内词时才做替换扩展；不含过宽单字词（如单独「文件」）
+_CHAT_SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("更新", "复审", "修订", "换版", "再评审", "改版"),
+    ("程序文件", "受控文件", "体系文件", "管理文件"),
+    ("文件控制", "受控文件", "文件管理"),
+    ("规定", "要求", "制度"),
+    ("周期", "期限", "频次", "有效期", "保留期"),
+    ("记录", "台账", "日志", "表单"),
+    ("哪些", "何种", "什么", "有哪些"),
+    ("两年", "2年", "二年", "每两年", "每2年", "每二年"),
+)
+_CHAT_SYNONYM_STOP_ALTS = frozenset({"文件", "规定", "要求", "一次", "1次", "一回", "标准", "制度"})
+
+
+def _chat_is_list_or_policy_question(query: str) -> bool:
+    """清单/周期类规定问答：需要跨多份程序文件召回。"""
+    q = (query or "").strip()
+    if any(x in q for x in ("哪些", "什么文件", "哪些文件", "哪些记录", "清单", "列出", "有哪些", "包括")):
+        return True
+    if re.search(r"\d+\s*年", q) and any(x in q for x in ("更新", "复审", "修订", "换版", "周期", "规定", "受控")):
+        return True
+    return False
+
+
+def _chat_build_synonym_queries(query: str, base_queries: List[str], *, limit: int = 10) -> List[str]:
+    """基于问题已有表述做近义替换/改写，生成多条检索句。"""
+    q = (query or "").strip()
+    out: List[str] = []
+
+    def _add(s: str) -> None:
+        s = (s or "").strip()
+        if s and s not in out:
+            out.append(s)
+
+    for b in base_queries:
+        _add(b)
+    _add(q)
+    if not q:
+        return out[:limit]
+
+    for group in _CHAT_SYNONYM_GROUPS:
+        hits = [term for term in group if term in q]
+        if not hits:
+            continue
+        for hit in hits:
+            for alt in group:
+                if alt == hit or alt in _CHAT_SYNONYM_STOP_ALTS or len(alt) < 2:
+                    continue
+                _add(q.replace(hit, alt, 1))
+                if len(out) >= limit:
+                    return out[:limit]
+
+    m_year = re.search(r"(\d+)\s*年", q)
+    if m_year:
+        n = m_year.group(1)
+        for alt in (f"每{n}年", f"{n}年一次", f"{n}年1次", f"至少每{n}年"):
+            _add(re.sub(r"\d+\s*年", alt, q, count=1))
+
+    if "程序文件" in q or "规定" in q:
+        core = re.sub(r"^(根据|按|依照|按照)", "", q).strip()
+        if core and core != q:
+            _add(core)
+
+    return out[:limit]
+
+
+def _chat_extract_year_num(query: str) -> Optional[str]:
+    q = (query or "").strip()
+    m = re.search(r"(\d+)\s*年", q)
+    if m:
+        return m.group(1)
+    if re.search(r"每?\s*两\s*年|每?\s*二\s*年|每?\s*2\s*年", q):
+        return "2"
+    return None
+
+
+def _chat_year_period_db_terms(year_num: Optional[str]) -> List[str]:
+    """与用户在 knowledge_docs 中手工 LIKE 的年限近义词对齐。"""
+    if not year_num:
+        return []
+    n = str(year_num).strip()
+    if not n.isdigit():
+        return []
+    terms = [
+        f"{n}年",
+        f"每{n}年",
+        f"至少每{n}年",
+        f"{n}年1次",
+        f"{n}年一次",
+        f"每{n}年1次",
+        f"每{n}年一次",
+    ]
+    if n == "2":
+        terms.extend(
+            [
+                "两年",
+                "二年",
+                "每两年",
+                "每二年",
+                "每2年",
+                "至少每两年",
+                "至少每2年",
+                "24个月",
+                "24 个月",
+                "2 年",
+                "每 2 年",
+                "两 年",
+                "每 两 年",
+            ]
+        )
+    dedup: List[str] = []
+    for t in terms:
+        t = (t or "").strip()
+        if len(t) >= 2 and t not in dedup:
+            dedup.append(t)
+    return dedup
+
+
+def _chat_count_keyword_hits(content: str, terms: List[str]) -> int:
+    text = (content or "").replace("\r", "")
+    compact = text.replace(" ", "")
+    hits = 0
+    for t in terms or []:
+        t = (t or "").strip()
+        if len(t) < 2:
+            continue
+        if t in text or t.replace(" ", "") in compact:
+            hits += 1
+    return hits
+
+
+def _chat_content_has_year_period(text: str, year_num: Optional[str]) -> bool:
+    if not text:
+        return False
+    blob = (text or "").replace("\r", "")
+    if year_num:
+        if any(t in blob for t in _chat_year_period_db_terms(year_num)):
+            return True
+        if year_num == "2" and re.search(r"每?\s*2\s*年|每?\s*两\s*年|每?\s*二\s*年", blob):
+            return True
+        return False
+    return bool(re.search(r"\d+\s*年|两\s*年|二\s*年", blob))
+
+
+def _chat_ref_content_relevance(query: str, ref: Dict[str, Any]) -> float:
+    """片段正文与问题的语义贴合度（0~1），用于过滤跑题召回。"""
+    content = (ref.get("content") or "").replace("\r", "")
+    fn = str(ref.get("file_name") or "")
+    blob = f"{fn}\n{content}"
+    list_q = _chat_is_list_or_policy_question(query)
+    year_num = _chat_extract_year_num(query)
+    period_terms = ("更新", "复审", "修订", "换版", "再评审", "有效期", "保留期")
+
+    score = 0.0
+    hints = [h for h in _chat_rule_hint_terms(query) if len(h) >= 2]
+    hint_hits = sum(1 for h in hints if h in blob)
+    score += min(0.35, hint_hits * 0.07)
+
+    has_period = any(t in blob for t in period_terms)
+    has_year = _chat_content_has_year_period(blob, year_num)
+
+    if list_q and year_num:
+        if has_period and has_year:
+            score += 0.5
+        elif has_period:
+            score += 0.12
+        else:
+            score -= 0.25
+        if not has_year:
+            score -= 0.15
+    elif list_q:
+        if has_period:
+            score += 0.28
+        if has_year:
+            score += 0.18
+    else:
+        if has_period or has_year:
+            score += 0.08
+
+    vec = float(ref.get("relevance_score") or ref.get("score") or 0.0)
+    if 0.0 < vec <= 1.0:
+        score += min(0.2, vec * 0.22)
+    elif vec > 1.0:
+        score += 0.08
+
+    llm_rel = float(ref.get("relevance_score") or 0.0)
+    if llm_rel >= 0.55:
+        score += 0.12
+
+    return max(0.0, min(1.0, score))
+
+
+def _chat_filter_relevant_refs(
+    refs: List[Dict[str, Any]],
+    query: str,
+    *,
+    min_score: float = 0.38,
+    list_or_policy: bool = False,
+) -> List[Dict[str, Any]]:
+    threshold = min_score + (0.06 if list_or_policy else 0.0)
+    scored: List[tuple[float, Dict[str, Any]]] = []
+    for r in refs:
+        rel = _chat_ref_content_relevance(query, r)
+        r2 = dict(r)
+        r2["content_relevance"] = rel
+        if rel >= threshold:
+            scored.append((rel, r2))
+    scored.sort(key=lambda x: (-x[0], -float(x[1].get("relevance_score") or x[1].get("score") or 0.0)))
+    return [r for _, r in scored]
+
+
+def _chat_supplement_policy_queries(query: str) -> List[str]:
+    """周期/清单类问题的补充检索句（锚定年限+复审，提高漏召回文件的命中率）。"""
+    if not _chat_is_list_or_policy_question(query):
+        return []
+    out: List[str] = []
+    year_num = _chat_extract_year_num(query)
+    if year_num:
+        for yt in _chat_year_period_db_terms(year_num)[:6]:
+            out.append(f"{yt} 复审 更新 受控文件")
+        out.append(f"受控文件 {year_num}年 复审 修订")
+    out.extend(["受控文件 复审周期 更新周期", "文件控制 复审 修订周期"])
+    dedup: List[str] = []
+    for s in out:
+        s = s.strip()
+        if s and s not in dedup:
+            dedup.append(s)
+    return dedup[:5]
+
+
+def _chat_db_keyword_terms(query: str) -> List[str]:
+    """用于 knowledge_docs LIKE 检索的关键词（与用户手工查库近义词口径一致）。"""
+    q = (query or "").strip()
+    if not q:
+        return []
+    terms: List[str] = []
+
+    def _add(t: str) -> None:
+        t = (t or "").strip()
+        if len(t) >= 2 and t not in terms:
+            terms.append(t)
+
+    year_num = _chat_extract_year_num(q)
+    for yt in _chat_year_period_db_terms(year_num):
+        _add(yt)
+    for group in _CHAT_SYNONYM_GROUPS:
+        for term in group:
+            if term in q:
+                _add(term)
+    for h in _chat_rule_hint_terms(q):
+        if len(h) >= 2:
+            _add(h)
+    return terms[:18]
+
+
+def _chat_keyword_search_program_refs(
+    collection: str,
+    query: str,
+    *,
+    allowed_category: str,
+    limit: int = 80,
+) -> List[Dict[str, Any]]:
+    """MySQL knowledge_docs 关键词检索，补齐向量漏召回的 program 块。"""
+    terms = _chat_db_keyword_terms(query)
+    if not terms or not (collection or "").strip():
+        return []
+    try:
+        from src.core.db import search_knowledge_docs_by_content_keywords
+
+        rows = search_knowledge_docs_by_content_keywords(
+            collection=collection.strip(),
+            keywords=terms,
+            category=allowed_category,
+            limit=limit,
+        )
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in rows or []:
+        content = (row.get("content") or "").strip()
+        if not content:
+            continue
+        fn = str(row.get("file_name") or "未知")
+        kw_hits = _chat_count_keyword_hits(content, terms)
+        ref = {
+            "content": content,
+            "file_name": fn,
+            "category": str(row.get("category") or allowed_category),
+            "score": 0.75 + min(0.15, kw_hits * 0.04),
+            "source": "keyword_db",
+            "chunk_index": row.get("chunk_index"),
+            "db_id": row.get("id"),
+            "keyword_hits": kw_hits,
+        }
+        ref["content_relevance"] = _chat_ref_content_relevance(query, ref)
+        out.append(ref)
+    return out
+
+
+def _chat_merge_ref_pools(*pools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for pool in pools:
+        for r in pool or []:
+            key = f"{r.get('file_name')}\n{(r.get('content') or '')[:240]}"
+            if key not in order:
+                order.append(key)
+            old = merged.get(key)
+            if not old or float(r.get("score") or 0) > float(old.get("score") or 0):
+                merged[key] = dict(r)
+    return [merged[k] for k in order if k in merged]
+
+
+def _chat_ref_should_keep_for_policy(ref: Dict[str, Any], query: str, terms: List[str]) -> bool:
+    content = ref.get("content") or ""
+    year_num = _chat_extract_year_num(query)
+    kw_hits = int(ref.get("keyword_hits") or _chat_count_keyword_hits(content, terms))
+    cr = float(ref.get("content_relevance") or _chat_ref_content_relevance(query, ref))
+    if ref.get("source") == "keyword_db" and kw_hits >= 1:
+        return True
+    if kw_hits >= 2:
+        return True
+    if kw_hits >= 1 and _chat_content_has_year_period(content, year_num):
+        return True
+    if cr >= 0.32:
+        return True
+    return False
+
+
+def _chat_ref_match_score(ref: Dict[str, Any], query: str, terms: Optional[List[str]] = None) -> float:
+    """统一匹配度（越高越靠前）。"""
+    tms = terms if terms is not None else _chat_db_keyword_terms(query)
+    content = ref.get("content") or ""
+    kw = int(ref.get("keyword_hits") or _chat_count_keyword_hits(content, tms))
+    cr = float(ref.get("content_relevance") or _chat_ref_content_relevance(query, ref))
+    vec = float(ref.get("score") or 0.0)
+    if vec > 1.0:
+        vec = min(0.35, vec * 0.08)
+    llm = float(ref.get("relevance_score") or 0.0)
+    return round(kw * 0.32 + cr * 0.48 + vec * 0.12 + llm * 0.08, 4)
+
+
+def _chat_finalize_policy_refs(
+    refs: List[Dict[str, Any]],
+    query: str,
+) -> List[Dict[str, Any]]:
+    """周期/清单类：保留全部关键词命中块，并计算匹配度。"""
+    terms = _chat_db_keyword_terms(query)
+    kept: List[Dict[str, Any]] = []
+    for r in refs or []:
+        r2 = dict(r)
+        r2["content_relevance"] = float(
+            r2.get("content_relevance") or _chat_ref_content_relevance(query, r2)
+        )
+        r2["keyword_hits"] = int(
+            r2.get("keyword_hits") or _chat_count_keyword_hits(r2.get("content") or "", terms)
+        )
+        if _chat_ref_should_keep_for_policy(r2, query, terms):
+            r2["match_score"] = _chat_ref_match_score(r2, query, terms)
+            kept.append(r2)
+    kept.sort(
+        key=lambda x: (
+            -float(x.get("match_score") or 0.0),
+            -int(x.get("keyword_hits") or 0),
+            -float(x.get("content_relevance") or 0.0),
+        )
+    )
+    return kept
+
+
+def _chat_simplify_match_text(text: str, *, max_len: int = 56) -> str:
+    s = re.sub(r"\s+", " ", (text or "").replace("…", "")).strip()
+    if len(s) > max_len:
+        return s[: max_len - 1].rstrip() + "…"
+    return s
+
+
+def _chat_extract_sentence_containing(text: str, pos: int, term_end: int) -> str:
+    """提取包含关键词的整句话（以。；;!?？或换行分句）。"""
+    t = (text or "").replace("\r", "")
+    if not t or pos < 0:
+        return t.strip()
+    boundaries = [0]
+    for i, c in enumerate(t):
+        if c in "。；;!?？":
+            boundaries.append(i + 1)
+        elif c == "\n":
+            boundaries.append(i + 1)
+    boundaries.append(len(t))
+    uniq: List[int] = []
+    for b in boundaries:
+        if not uniq or uniq[-1] != b:
+            uniq.append(b)
+    hit = max(pos, 0)
+    for j in range(len(uniq) - 1):
+        s, e = uniq[j], uniq[j + 1]
+        if s <= hit < e or (s <= term_end <= e):
+            sent = t[s:e].strip()
+            if sent:
+                return re.sub(r"\s+", " ", sent)
+    line_start = t.rfind("\n", 0, hit) + 1
+    line_end = t.find("\n", term_end)
+    if line_end < 0:
+        line_end = len(t)
+    return re.sub(r"\s+", " ", t[line_start:line_end].strip())
+
+
+def _chat_extract_paragraph_containing(text: str, pos: int) -> str:
+    """提取包含关键词的整段（以空行或连续非空行组成段落）。"""
+    t = (text or "").replace("\r", "")
+    if not t or pos < 0:
+        return t.strip()
+    line_starts: List[tuple[int, str]] = []
+    idx = 0
+    for line in t.split("\n"):
+        line_starts.append((idx, line))
+        idx += len(line) + 1
+    target = 0
+    for i, (st, ln) in enumerate(line_starts):
+        en = st + len(ln)
+        if st <= pos <= en:
+            target = i
+            break
+    lines = [ln for _, ln in line_starts]
+    start = target
+    while start > 0 and lines[start - 1].strip():
+        start -= 1
+    end = target
+    while end < len(lines) - 1 and lines[end + 1].strip():
+        end += 1
+    para = "\n".join(lines[start : end + 1]).strip()
+    return para or t.strip()
+
+
+def _chat_extract_match_spans(content: str, query: str) -> Dict[str, Any]:
+    """定位最佳关键词，并提取对应句子（简易版）与段落（详细版）。"""
+    text = (content or "").replace("\r", "")
+    terms = _chat_db_keyword_terms(query)
+    best_pos = -1
+    best_term = ""
+    best_rank = -1
+    year_num = _chat_extract_year_num(query)
+    compact = text.replace(" ", "")
+    for term in sorted(terms, key=len, reverse=True):
+        start = 0
+        while True:
+            pos = text.find(term, start)
+            if pos < 0:
+                break
+            rank = len(term) * 10
+            window = text[max(0, pos - 40): min(len(text), pos + len(term) + 40)]
+            if _chat_content_has_year_period(window, year_num):
+                rank += 30
+            if any(x in window for x in ("更新", "复审", "修订", "换版", "周期")):
+                rank += 15
+            if rank > best_rank:
+                best_rank = rank
+                best_pos = pos
+                best_term = term
+            start = pos + max(1, len(term))
+    term_end = best_pos + len(best_term) if best_pos >= 0 and best_term else best_pos
+    if best_pos < 0:
+        sent, _ = _chat_pick_rule_sentences(text, query, max_chars=200)
+        return {
+            "match_keyword": "",
+            "match_sentence": sent,
+            "match_paragraph": sent,
+            "match_keywords": [],
+            "full_content": text,
+        }
+    sentence = _chat_extract_sentence_containing(text, best_pos, term_end)
+    paragraph = _chat_extract_paragraph_containing(text, best_pos)
+    matched = [t for t in terms if t in text or t.replace(" ", "") in compact]
+    return {
+        "match_keyword": best_term,
+        "match_sentence": sentence,
+        "match_paragraph": paragraph,
+        "match_keywords": matched[:6],
+        "full_content": text,
+    }
+
+
+def _chat_extract_match_excerpt(content: str, query: str, *, context: int = 20) -> Dict[str, Any]:
+    """兼容旧字段名：excerpt=段落。"""
+    spans = _chat_extract_match_spans(content, query)
+    return {
+        "excerpt": spans.get("match_paragraph") or spans.get("match_sentence") or "",
+        "match_keyword": spans.get("match_keyword") or "",
+        "match_keywords": spans.get("match_keywords") or [],
+        "match_sentence": spans.get("match_sentence") or "",
+        "match_paragraph": spans.get("match_paragraph") or "",
+        "full_content": spans.get("full_content") or content,
+    }
+
+
+def _chat_build_policy_file_items(
+    refs: List[Dict[str, Any]],
+    query: str,
+    *,
+    context: int = 20,
+) -> List[Dict[str, Any]]:
+    """每份文件保留匹配度最高的一条，按 match_score 倒序。"""
+    by_file: Dict[str, Dict[str, Any]] = {}
+    for r in refs or []:
+        fn = str(r.get("file_name") or "未知")
+        old = by_file.get(fn)
+        if not old or float(r.get("match_score") or 0.0) > float(old.get("match_score") or 0.0):
+            by_file[fn] = r
+    ordered = sorted(
+        by_file.values(),
+        key=lambda x: (
+            -float(x.get("match_score") or 0.0),
+            -int(x.get("keyword_hits") or 0),
+        ),
+    )
+    items: List[Dict[str, Any]] = []
+    for i, r in enumerate(ordered, start=1):
+        content = r.get("content") or ""
+        match_info = _chat_extract_match_spans(content, query)
+        kw = match_info.get("match_keyword") or ""
+        sentence = (match_info.get("match_sentence") or "").strip()
+        paragraph = (match_info.get("match_paragraph") or sentence).strip()
+        items.append(
+            {
+                "index": i,
+                "file_name": r.get("file_name") or "未知",
+                "chunk_index": r.get("chunk_index"),
+                "category": r.get("category") or "program",
+                "match_score": float(r.get("match_score") or 0.0),
+                "keyword_hits": int(r.get("keyword_hits") or 0),
+                "match_keyword": kw,
+                "match_keywords": match_info.get("match_keywords") or [],
+                "match_sentence": sentence,
+                "match_paragraph": paragraph,
+                "summary_snippet": sentence,
+                "matched_excerpt": paragraph,
+                "full_content": match_info.get("full_content") or content,
+                "source": r.get("source") or "knowledge_base",
+            }
+        )
+    return items
+
+
+def _chat_build_detail_items(
+    refs: List[Dict[str, Any]],
+    query: str,
+    *,
+    context: int = 20,
+) -> List[Dict[str, Any]]:
+    """兼容旧调用：委托给按文件聚合的实现。"""
+    return _chat_build_policy_file_items(refs, query, context=context)
+
+
+def _chat_compose_policy_answer_from_items(
+    detail_items: List[Dict[str, Any]],
+    query: str,
+    *,
+    max_summary_chars: int,
+) -> tuple[str, str, int]:
+    if not detail_items:
+        return "", "", 0
+    n_files = len(detail_items)
+    header = f"共匹配 {n_files} 份文件："
+    summary_lines = [header]
+
+    for it in detail_items:
+        idx = it.get("index") or 0
+        fn = str(it.get("file_name") or "未知").strip()
+        kw = str(it.get("match_keyword") or "").strip()
+        sent = str(it.get("match_sentence") or it.get("summary_snippet") or "").strip()
+        if fn and kw and sent:
+            summary_lines.append(f"{idx}. {fn} · 「{kw}」：{sent}")
+        elif fn and sent:
+            summary_lines.append(f"{idx}. {fn} · {sent}")
+        elif fn and kw:
+            summary_lines.append(f"{idx}. {fn} · 「{kw}」")
+        elif kw and sent:
+            summary_lines.append(f"{idx}. 「{kw}」：{sent}")
+        elif kw:
+            summary_lines.append(f"{idx}. 「{kw}」")
+        elif sent:
+            summary_lines.append(f"{idx}. {sent}")
+
+    summary = "\n".join(summary_lines)
+    if len(summary) > max_summary_chars:
+        summary = summary[: max_summary_chars - 1].rstrip() + "…"
+    detail_hint = f"共 {n_files} 份文件；详细版展示含关键词的整段内容，可点「查看更多」查看全文。"
+    return summary, detail_hint, n_files
+
+
+def _chat_diversify_refs_by_file(
+    refs: List[Dict[str, Any]],
+    *,
+    max_total: int,
+    max_per_file: int = 1,
+) -> List[Dict[str, Any]]:
+    """清单类问题：优先覆盖不同来源文件，避免只保留单份程序文件片段。"""
+    if not refs or max_total <= 0:
+        return []
+    per_file: Dict[str, List[Dict[str, Any]]] = {}
+    for r in refs:
+        fn = str(r.get("file_name") or "未知")
+        per_file.setdefault(fn, []).append(r)
+    picked: List[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    # 第一轮：每个文件先取一条
+    for fn, items in per_file.items():
+        if len(picked) >= max_total:
+            break
+        for r in items[:max_per_file]:
+            key = f"{fn}\n{(r.get('content') or '')[:120]}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            picked.append(r)
+            break
+    # 第二轮：若未满，再按原顺序补入
+    if len(picked) < max_total:
+        for r in refs:
+            if len(picked) >= max_total:
+                break
+            fn = str(r.get("file_name") or "未知")
+            key = f"{fn}\n{(r.get('content') or '')[:120]}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            picked.append(r)
+    return picked
+
+
+def _chat_group_refs_by_file(refs: List[Dict[str, Any]]) -> List[tuple[str, List[Dict[str, Any]]]]:
+    """按来源文件分组并保持首次出现顺序。"""
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    order: List[str] = []
+    for r in refs:
+        fn = str(r.get("file_name") or "未知").strip() or "未知"
+        if fn not in grouped:
+            grouped[fn] = []
+            order.append(fn)
+        grouped[fn].append(r)
+    return [(fn, grouped[fn]) for fn in order]
+
+
+def _chat_rule_hint_terms(query: str) -> List[str]:
+    q = (query or "").strip()
+    terms: List[str] = []
+    for group in _CHAT_SYNONYM_GROUPS:
+        for term in group:
+            if term in q and term not in terms:
+                terms.append(term)
+    if re.search(r"\d+\s*年", q):
+        for t in ("年", "更新", "复审", "修订", "换版", "周期", "有效期", "保留"):
+            if t not in terms:
+                terms.append(t)
+    if not terms:
+        terms = ["规定", "要求", "应", "须", "至少", "每"]
+    return terms
+
+
+def _chat_pick_rule_sentences(content: str, query: str, *, max_chars: int = 260) -> tuple[str, int]:
+    """从片段中抽取与问题最相关的规定句，返回 (文本, 相关度分)。"""
+    text = (content or "").replace("\r", "").strip()
+    if not text:
+        return "（片段中未提取到明确条文，请查阅原文）", 0
+    parts = [p.strip() for p in re.split(r"[\n；;。!?？]", text) if p.strip()]
+    if not parts:
+        parts = [text]
+    hints = _chat_rule_hint_terms(query)
+    year_num = _chat_extract_year_num(query)
+    scored: List[tuple[int, str]] = []
+    for part in parts:
+        score = sum(1 for h in hints if len(h) >= 2 and h in part)
+        if _chat_content_has_year_period(part, year_num):
+            score += 4
+        if any(x in part for x in ("更新", "复审", "修订", "换版", "周期")):
+            score += 2
+        scored.append((score, part))
+    scored.sort(key=lambda x: (-x[0], -len(x[1])))
+    picked = scored[0][1] if scored else text
+    best_score = scored[0][0] if scored else 0
+    if best_score <= 0 and len(text) <= max_chars:
+        picked = text
+    picked = re.sub(r"\s+", " ", picked).strip()
+    if len(picked) > max_chars:
+        picked = picked[: max_chars - 1].rstrip() + "…"
+    return picked, best_score
+
+
+def _chat_compose_multi_file_policy_answer(
+    scored_refs: List[Dict[str, Any]],
+    query: str,
+    *,
+    max_summary_chars: int,
+    max_detail_chars: int,
+    min_rule_score: int = 2,
+) -> tuple[str, str, int]:
+    """清单/周期类：仅汇总通过正文相关度校验的文件。"""
+    filtered = _chat_filter_relevant_refs(scored_refs, query, min_score=0.38, list_or_policy=True)
+    groups = _chat_group_refs_by_file(filtered)
+    if not groups:
+        return "", "", 0
+
+    n_files = len(groups)
+    header = f"根据程序文件检索，共 {n_files} 份文件与问题相关："
+    per_summary = max(48, min(140, (max_summary_chars - len(header) - 10) // max(n_files, 1)))
+    per_detail = max(120, min(520, (max_detail_chars - 80) // max(n_files, 1)))
+
+    summary_lines: List[str] = [header]
+    detail_blocks: List[str] = []
+    included = 0
+
+    for idx, (fn, items) in enumerate(groups, start=1):
+        best = max(
+            items,
+            key=lambda x: (
+                float(x.get("content_relevance") or 0.0),
+                float(x.get("relevance_score") or x.get("score") or 0.0),
+            ),
+        )
+        rule, rule_score = _chat_pick_rule_sentences(best.get("content") or "", query, max_chars=per_detail)
+        if rule_score < min_rule_score and float(best.get("content_relevance") or 0.0) < 0.5:
+            continue
+        short_rule, _ = _chat_pick_rule_sentences(best.get("content") or "", query, max_chars=per_summary)
+        included += 1
+        summary_lines.append(f"{included}. {fn}：{short_rule}")
+        detail_blocks.append(f"{included}. 《{fn}》\n{rule}")
+
+    if included == 0:
+        return "", "", 0
+    if included != n_files:
+        summary_lines[0] = f"根据程序文件检索，共 {included} 份文件与问题相关："
+
+    summary = "\n".join(summary_lines)
+    detail = summary_lines[0] + "\n\n" + "\n\n".join(detail_blocks)
+    if len(summary) > max_summary_chars:
+        summary = summary[: max_summary_chars - 1].rstrip() + "…"
+    if len(detail) > max_detail_chars:
+        detail = detail[: max_detail_chars - 1].rstrip() + "…"
+    return summary, detail, included
+
+
+def _chat_merge_llm_with_ref_coverage(
+    llm_summary: str,
+    llm_detail: str,
+    scored_refs: List[Dict[str, Any]],
+    query: str,
+    *,
+    max_summary_chars: int,
+    max_detail_chars: int,
+) -> tuple[str, str]:
+    """LLM 漏写文件时，仅用高相关检索结果补全。"""
+    det = _chat_normalize_answer_text(llm_detail)
+    filtered = _chat_filter_relevant_refs(scored_refs, query, min_score=0.42, list_or_policy=True)
+    groups = _chat_group_refs_by_file(filtered)
+    missing: List[tuple[str, str]] = []
+    for fn, items in groups:
+        if fn and fn in det:
+            continue
+        best = max(items, key=lambda x: float(x.get("content_relevance") or 0.0))
+        rule, rule_score = _chat_pick_rule_sentences(best.get("content") or "", query, max_chars=260)
+        if rule_score < 2:
+            continue
+        missing.append((fn, rule))
+    if not missing:
+        return (
+            _chat_normalize_answer_text(llm_summary)[:max_summary_chars],
+            det[:max_detail_chars],
+        )
+    append_lines = [f"《{fn}》\n{rule}" for fn, rule in missing]
+    merged_detail = det.rstrip() + "\n\n【补全未写入的文件】\n\n" + "\n\n".join(append_lines)
+    fallback_summary, fallback_detail, _ = _chat_compose_multi_file_policy_answer(
+        filtered,
+        query,
+        max_summary_chars=max_summary_chars,
+        max_detail_chars=max_detail_chars,
+    )
+    if len(fallback_detail) <= max_detail_chars:
+        return fallback_summary[:max_summary_chars], fallback_detail
+    return fallback_summary[:max_summary_chars], merged_detail[:max_detail_chars]
+
+
 def _chat_retrieval_plan(intent: Dict[str, Any], query: str) -> Dict[str, Any]:
-    """由意图分析产出检索计划（查询扩展 + 主题词），通用适配各业务域，不单靠仓库等硬编码。"""
+    """由意图分析产出检索计划（查询扩展 + 主题词），通用适配各业务域。"""
     q = str(intent.get("normalized_question") or query or "").strip() or (query or "").strip()
-    search_queries = _chat_as_str_list(intent.get("search_queries"), limit=6)
-    if not search_queries:
-        search_queries = [
-            q,
-            f"{q} 程序文件 管理制度 体系运行记录",
-            f"{q} SOP 规程 记录 填写要求",
-        ]
-    boost_terms = _chat_as_str_list(intent.get("topic_keywords") or intent.get("relevant_topics"), limit=10)
+    llm_queries = _chat_as_str_list(intent.get("search_queries"), limit=6)
+    search_queries = _chat_build_synonym_queries(q, llm_queries, limit=8)
+    search_queries.extend(_chat_supplement_policy_queries(q))
+    dedup_q: List[str] = []
+    for s in search_queries:
+        s = (s or "").strip()
+        if s and s not in dedup_q:
+            dedup_q.append(s)
+    search_queries = dedup_q[:12]
+    boost_terms = _chat_as_str_list(intent.get("topic_keywords") or intent.get("relevant_topics"), limit=12)
     penalty_terms = _chat_as_str_list(intent.get("avoid_topics") or intent.get("irrelevant_topics"), limit=8)
     return {
         "search_queries": search_queries,
         "boost_terms": boost_terms,
         "penalty_terms": penalty_terms,
         "normalized_question": q,
+        "is_list_or_policy": _chat_is_list_or_policy_question(q),
     }
 
 
@@ -809,11 +1593,14 @@ def _chat_retrieve_program_scored_refs(
     allowed_category: str,
     top_k: int,
     plan: Optional[Dict[str, Any]] = None,
+    recall_limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """程序文件检索：多查询扩展 + category 过滤 + 主题词加减分（计划由 LLM 意图分析生成）。"""
+    """程序文件检索：多查询近义扩展 + category 过滤 + 主题词加减分。"""
     ctx = plan if isinstance(plan, dict) else _chat_retrieval_plan({}, query)
     pool: List[Dict[str, Any]] = []
     seen: set[str] = set()
+    list_q = bool(ctx.get("is_list_or_policy")) or _chat_is_list_or_policy_question(query)
+    pool_cap = recall_limit or (max(top_k * 3, 30) if list_q else max(top_k * 2, 20))
 
     def _push(doc: Any, score: float) -> None:
         md = getattr(doc, "metadata", {}) or {}
@@ -834,25 +1621,42 @@ def _chat_retrieve_program_scored_refs(
             }
         )
 
-    over_k = max(top_k * 6, 24)
+    per_query_k = max(top_k * 4, 20) if list_q else max(top_k * 3, 16)
     for sq in ctx.get("search_queries") or [query]:
         sq = (sq or "").strip()
         if not sq:
             continue
         try:
-            for pair in agent.kb.search_with_scores(sq, top_k=over_k) or []:
+            for pair in agent.kb.search_with_scores(sq, top_k=per_query_k) or []:
                 if isinstance(pair, (list, tuple)) and len(pair) == 2:
                     _push(pair[0], pair[1])
         except Exception:
             pass
         try:
-            for doc in agent.kb.search_by_category(sq, category=allowed_category, top_k=over_k) or []:
-                _push(doc, 0.55)
+            for doc in agent.kb.search_by_category(sq, category=allowed_category, top_k=per_query_k) or []:
+                content = (getattr(doc, "page_content", "") or "").strip()
+                md = getattr(doc, "metadata", {}) or {}
+                stub = {
+                    "content": content,
+                    "file_name": str(md.get("source_file") or "未知"),
+                    "score": 0.45,
+                }
+                cr = _chat_ref_content_relevance(query, stub)
+                if cr >= 0.28:
+                    _push(doc, 0.42 + cr * 0.35)
         except Exception:
             pass
+        if len(pool) >= pool_cap * 2:
+            break
 
-    pool.sort(key=lambda r: _chat_ref_domain_score(query, r, ctx), reverse=True)
-    return pool[:top_k]
+    pool.sort(
+        key=lambda r: (
+            _chat_ref_content_relevance(query, r),
+            _chat_ref_domain_score(query, r, ctx),
+        ),
+        reverse=True,
+    )
+    return pool[:pool_cap]
 
 
 def _chat_rerank_refs_with_llm(
@@ -863,33 +1667,52 @@ def _chat_rerank_refs_with_llm(
     current_provider: Optional[str] = None,
     client_llm: Optional[Any] = None,
     header_provider: str = "",
+    list_or_policy: bool = False,
 ) -> tuple[List[Dict[str, Any]], float, str]:
-    """用 LLM 从候选片段中挑选与用户问题真正相关的程序文件依据（通用，非关键词表）。"""
+    """用 LLM 从候选片段中挑选与用户问题真正相关的程序文件依据。"""
     if not candidates:
         return [], 0.0, "无候选片段"
-    if len(candidates) <= top_k:
+    pick_k = min(max(top_k, 6 if list_or_policy else top_k), 10)
+    preview_n = min(20 if list_or_policy else 14, len(candidates))
+    prefiltered = _chat_filter_relevant_refs(
+        candidates[:preview_n + 8],
+        query,
+        min_score=0.28,
+        list_or_policy=list_or_policy,
+    )
+    rerank_pool = prefiltered[:preview_n] if prefiltered else candidates[:preview_n]
+
+    if len(rerank_pool) <= pick_k and not list_or_policy:
         ctx = {"boost_terms": [], "penalty_terms": []}
-        score = _chat_ref_domain_score(query, candidates[0], ctx) if candidates else 0.0
-        return candidates, score, "候选较少，跳过重排"
+        score = _chat_ref_content_relevance(query, rerank_pool[0]) if rerank_pool else 0.0
+        return rerank_pool, score, "候选较少，跳过重排"
 
     lines: List[str] = []
-    for i, r in enumerate(candidates[:14], start=1):
+    for i, r in enumerate(rerank_pool, start=1):
         snippet = (r.get("content") or "")[:320].replace("\n", " ")
         lines.append(f"[{i}] 文件: {r.get('file_name') or '未知'}\n片段: {snippet}")
+    task_hint = (
+        "用户可能在问「程序文件中的规定」（如更新/复审周期、哪些受控文件需几年更新一次等）。"
+        "仅选片段中**明确写出**与问题一致的复审/更新/修订年限或周期要求的条目；"
+        "仅泛泛提到「文件」「记录」但未写周期年限的不要选。"
+        "在相关前提下尽量覆盖不同来源文件（同一文件最多 1 条）。"
+        if list_or_policy
+        else "请选出能回答该问题的片段（制度要求、记录项目、填写要点或文件控制规定等）。"
+    )
     prompt = (
-        "你是知识库检索质检员。用户要问的是医疗器械质量管理体系「运行记录怎么写」。\n"
+        "你是知识库检索质检员。用户要问的是医疗器械质量管理体系程序文件相关问题。\n"
         f"用户问题：{query}\n\n"
-        "下列是从程序文件知识库召回的候选片段。请判断哪些片段**确实**能用来回答该问题"
-        "（制度要求、记录项目、填写要点等），与问题业务域无关的（如问仓库管理却只有软件确认）不要选。\n\n"
+        f"{task_hint}\n"
+        "与问题无关的片段（业务域明显不符）不要选。\n\n"
         + "\n\n".join(lines)
         + "\n\n仅输出 JSON：\n"
         "{\n"
-        '  "selected": [1, 3],\n'
+        '  "selected": [1, 3, 5],\n'
         '  "scores": {"1": 0.92, "2": 0.05},\n'
         '  "reason": "一句话说明选择依据"\n'
         "}\n"
         "selected 为相关条目编号（至少 0 个，最多 "
-        f"{top_k}"
+        f"{pick_k}"
         " 个）；scores 为各编号 0~1 相关度。"
     )
     out = _extract_first_json_object(
@@ -909,29 +1732,63 @@ def _chat_rerank_refs_with_llm(
         for x in selected_raw:
             try:
                 n = int(x)
-                if 1 <= n <= len(candidates):
+                if 1 <= n <= len(rerank_pool):
                     selected_idx.append(n)
             except (TypeError, ValueError):
                 continue
-    selected_idx = list(dict.fromkeys(selected_idx))[:top_k]
+    selected_idx = list(dict.fromkeys(selected_idx))[:pick_k]
+
+    min_llm_rel = 0.48 if list_or_policy else 0.42
 
     if not selected_idx:
+        fallback = _chat_filter_relevant_refs(
+            rerank_pool,
+            query,
+            min_score=0.42,
+            list_or_policy=list_or_policy,
+        )
+        if fallback:
+            fb = _chat_diversify_refs_by_file(fallback, max_total=pick_k, max_per_file=1)
+            score = float(fb[0].get("content_relevance") or _chat_ref_content_relevance(query, fb[0]))
+            return fb, score, reason or "LLM 未选中，已按正文相关度回退"
         return [], 0.0, reason or "LLM 未选中任何相关程序文件片段"
 
     picked: List[Dict[str, Any]] = []
     rel_scores: List[float] = []
     for n in selected_idx:
-        ref = dict(candidates[n - 1])
+        ref = dict(rerank_pool[n - 1])
         key = str(n)
         try:
             rel = float((scores_map or {}).get(key, scores_map.get(str(n), 0.0)) or 0.0)
         except (TypeError, ValueError):
             rel = 0.0
+        content_rel = float(ref.get("content_relevance") or _chat_ref_content_relevance(query, ref))
+        if rel < min_llm_rel and content_rel < 0.45:
+            continue
         ref["relevance_score"] = max(0.0, min(1.0, rel))
+        ref["content_relevance"] = content_rel
         picked.append(ref)
         if rel > 0:
             rel_scores.append(rel)
-    top_rel = max(rel_scores) if rel_scores else 0.72
+        else:
+            rel_scores.append(content_rel)
+
+    if not picked:
+        fallback = _chat_filter_relevant_refs(
+            rerank_pool,
+            query,
+            min_score=0.44,
+            list_or_policy=list_or_policy,
+        )
+        if fallback:
+            fb = _chat_diversify_refs_by_file(fallback, max_total=pick_k, max_per_file=1)
+            score = float(fb[0].get("content_relevance") or 0.0)
+            return fb, score, reason or "选中片段相关度不足，已按正文过滤回退"
+        return [], 0.0, reason or "选中片段与问题不匹配"
+
+    if list_or_policy:
+        picked = _chat_diversify_refs_by_file(picked, max_total=pick_k, max_per_file=1)
+    top_rel = max(rel_scores) if rel_scores else float(picked[0].get("content_relevance") or 0.0)
     return picked, top_rel, reason or "已按语义重排"
 
 
@@ -1012,6 +1869,54 @@ def _invoke_chat_llm_text(
             ) from fallback_err
 
 
+def _chat_heuristic_program_scope(query: str) -> bool:
+    """规则兜底：问题明显与程序文件/体系记录相关时，不因意图 LLM 误判直接拒答。"""
+    q = (query or "").strip()
+    if not q:
+        return False
+    keys = (
+        "程序文件",
+        "体系",
+        "运行记录",
+        "受控",
+        "文件控制",
+        "更新",
+        "复审",
+        "修订",
+        "换版",
+        "周期",
+        "哪些文件",
+        "哪些记录",
+        "什么文件",
+        "多长时间",
+        "有效期",
+        "保留",
+        "SOP",
+        "规程",
+        "台账",
+        "怎么写",
+        "如何写",
+        "填写",
+        "规定",
+        "依据",
+    )
+    return any(k in q for k in keys)
+
+
+def _chat_restricted_date_personnel(intent: Dict[str, Any], query: str) -> bool:
+    """仅拦截「记录里日期/签字人员怎么填」，不拦截更新周期、复审年限等政策问法。"""
+    if not bool(intent.get("is_date_or_personnel_question")):
+        return False
+    q = (query or "").strip()
+    if re.search(r"\d+\s*年", q) and any(
+        x in q for x in ("更新", "复审", "修订", "换版", "周期", "有效期", "保留", "受控")
+    ):
+        return False
+    if any(x in q for x in ("哪些文件", "哪些记录", "什么文件", "哪些需要", "程序文件规定", "规定")):
+        return False
+    return True
+
+
 def _classify_chat_intent(
     query: str,
     current_provider: Optional[str] = None,
@@ -1036,10 +1941,13 @@ def _classify_chat_intent(
         '  "reason": "一句话原因"\n'
         "}\n"
         "规则：\n"
-        "1) 只有「体系运行记录怎么写/怎么填/记录项怎么写」相关才算 is_system_record_writing=true。\n"
-        "2) 涉及日期/人员/签字/审核/批准等即 is_date_or_personnel_question=true。\n"
-        "3) search_queries 写 3～5 条中文检索句，包含可能的制度名称、业务域、记录类型；"
-        "不要编造不存在的文件编号。\n"
+        "1) is_system_record_writing=true 包括：①体系运行记录怎么写/怎么填；"
+        "②程序文件中可检索的规定性问答（如哪些文件需更新/复审、更新周期几年、受控范围等）。"
+        "纯法规注册结论、与程序文件无关的 IT/行政杂问为 false。\n"
+        "2) is_date_or_personnel_question=true 仅当问「某条记录日期填什么、签字人员写谁」；"
+        "问「文件几年更新/复审」不算人员日期填写。\n"
+        "3) search_queries 写 5～8 条中文检索句：对用户问题做**近义改写**（如 更新↔复审↔修订、2年↔两年↔每两年、"
+        "程序文件↔受控文件），换表述不换含义；可含可能的制度名称、记录类型，勿编造文件编号。\n"
         "4) topic_keywords / avoid_topics 用于过滤明显跑题的召回结果。\n"
     )
     out = _extract_first_json_object(
@@ -1055,12 +1963,15 @@ def _classify_chat_intent(
     q = (query or "").strip()
     low = q.lower()
     date_or_personnel = any(x in low for x in ("日期", "什么时候", "人员", "谁签", "谁审核", "谁批准", "写谁"))
-    system_record = any(x in low for x in ("体系", "记录", "仓库", "设备", "电脑", "人事", "培训", "采购", "台账"))
+    system_record = _chat_heuristic_program_scope(q)
+    if re.search(r"\d+\s*年", q) and any(x in q for x in ("更新", "复审", "修订", "周期")):
+        date_or_personnel = False
+    fallback_queries = _chat_build_synonym_queries(q, [q], limit=8)
     return {
         "is_system_record_writing": bool(system_record),
         "is_date_or_personnel_question": bool(date_or_personnel),
         "normalized_question": q,
-        "search_queries": [q, f"{q} 程序文件 管理制度 体系运行记录"],
+        "search_queries": fallback_queries,
         "topic_keywords": [],
         "avoid_topics": [],
         "reason": "fallback",
@@ -1845,7 +2756,7 @@ def chat_reply_generate(
             "need_human": True,
             "answer": "",
             "confidence": 0.0,
-            "reason": "首版仅支持体系运行记录写作，且仅基于程序文件知识库。",
+            "reason": "首版仅支持基于程序文件知识库的体系记录与程序规定问答。",
             "references": [],
             "model_used": (getattr(settings, "llm_model", "") or "").strip(),
             "latency_ms": int((time.time() - started) * 1000),
@@ -1857,24 +2768,13 @@ def chat_reply_generate(
         client_llm=client_llm if client_llm.has_any() else None,
         header_provider=hp,
     )
-    if not bool(intent.get("is_system_record_writing")):
+    if _chat_restricted_date_personnel(intent, query):
         return {
             "request_id": request_id,
             "need_human": True,
             "answer": "",
             "confidence": 0.0,
-            "reason": "问题不在首版体系记录填写范围内。",
-            "references": [],
-            "model_used": (getattr(settings, "llm_model", "") or "").strip(),
-            "latency_ms": int((time.time() - started) * 1000),
-        }
-    if bool(intent.get("is_date_or_personnel_question")):
-        return {
-            "request_id": request_id,
-            "need_human": True,
-            "answer": "",
-            "confidence": 0.0,
-            "reason": "首版不自动回答日期与人员填写问题。",
+            "reason": "首版不自动回答记录中具体日期与人员填写问题。",
             "references": [],
             "model_used": (getattr(settings, "llm_model", "") or "").strip(),
             "latency_ms": int((time.time() - started) * 1000),
@@ -1886,7 +2786,7 @@ def chat_reply_generate(
     top_k = max(2, min(20, top_k))
     min_similarity = float(opts.min_similarity or 0.0) or float(getattr(settings, "chat_min_similarity", 0.55) or 0.55)
     conf_threshold = float(getattr(settings, "chat_confidence_threshold", 0.65) or 0.65)
-    max_summary_chars = max(80, min(600, int(opts.max_reply_chars or 280)))
+    max_summary_chars = max(80, min(8000, int(opts.max_reply_chars or 280)))
     max_detail_chars = int(opts.max_detail_chars or 0) or int(
         getattr(settings, "chat_max_detail_chars", 2400) or 2400
     )
@@ -1894,34 +2794,74 @@ def chat_reply_generate(
 
     retrieval_plan = _chat_retrieval_plan(intent, query)
     search_query = str(retrieval_plan.get("normalized_question") or query).strip() or query
-    recall_k = max(top_k * 3, 12)
+    list_or_policy = bool(retrieval_plan.get("is_list_or_policy")) or _chat_is_list_or_policy_question(query)
+    recall_k = max(top_k * (5 if list_or_policy else 3), 24 if list_or_policy else 16)
     candidates = _chat_retrieve_program_scored_refs(
         agent,
         search_query,
         allowed_category=allowed_category,
-        top_k=recall_k,
+        top_k=top_k,
         plan=retrieval_plan,
+        recall_limit=recall_k,
     )
-    if len(candidates) < 2:
+    collection_name = str(body.collection or "regulations").strip() or "regulations"
+    if list_or_policy:
+        kw_refs = _chat_keyword_search_program_refs(
+            collection_name,
+            query,
+            allowed_category=allowed_category,
+            limit=80,
+        )
+        candidates = _chat_merge_ref_pools(candidates, kw_refs)
+
+    in_scope = bool(intent.get("is_system_record_writing")) or _chat_heuristic_program_scope(query)
+    if not in_scope and len(candidates) < 1:
         return {
             "request_id": request_id,
             "need_human": True,
             "answer": "",
             "confidence": 0.0,
-            "reason": "未检索到足够的程序文件依据。",
+            "reason": intent.get("reason") or "问题不在程序文件知识库问答范围内。",
             "references": [],
             "model_used": (getattr(settings, "llm_model", "") or "").strip(),
             "latency_ms": int((time.time() - started) * 1000),
         }
-    scored_refs, top_score, rerank_reason = _chat_rerank_refs_with_llm(
-        search_query,
-        candidates,
-        top_k=top_k,
-        current_provider=eff_provider,
-        client_llm=client_llm if client_llm.has_any() else None,
-        header_provider=hp,
-    )
-    if len(scored_refs) < 2:
+    if len(candidates) < 1:
+        return {
+            "request_id": request_id,
+            "need_human": True,
+            "answer": "",
+            "confidence": 0.0,
+            "reason": "未检索到程序文件依据，请确认知识库已导入 program 类文档。",
+            "references": [],
+            "model_used": (getattr(settings, "llm_model", "") or "").strip(),
+            "latency_ms": int((time.time() - started) * 1000),
+        }
+    detail_items: List[Dict[str, Any]] = []
+    if list_or_policy:
+        detail_pool = _chat_finalize_policy_refs(candidates, query)
+        detail_items = _chat_build_policy_file_items(detail_pool, query, context=20)
+        scored_refs = detail_pool[: max(1, min(len(detail_pool), 20))]
+        top_score = float(detail_items[0].get("match_score") or 0.0) if detail_items else 0.0
+        rerank_reason = f"关键词库共匹配 {len(detail_items)} 份文件（{len(detail_pool)} 条片段）"
+    else:
+        rerank_k = min(max(top_k, 8 if list_or_policy else top_k), 10)
+        scored_refs, top_score, rerank_reason = _chat_rerank_refs_with_llm(
+            search_query,
+            candidates,
+            top_k=rerank_k,
+            current_provider=eff_provider,
+            client_llm=client_llm if client_llm.has_any() else None,
+            header_provider=hp,
+            list_or_policy=list_or_policy,
+        )
+        scored_refs = _chat_filter_relevant_refs(
+            scored_refs,
+            query,
+            min_score=0.35,
+            list_or_policy=False,
+        )
+    if len(scored_refs) < 1:
         return {
             "request_id": request_id,
             "need_human": True,
@@ -1933,87 +2873,148 @@ def chat_reply_generate(
             "latency_ms": int((time.time() - started) * 1000),
         }
     if top_score < min_similarity:
-        return {
-            "request_id": request_id,
-            "need_human": True,
-            "answer": "",
-            "confidence": top_score,
-            "reason": rerank_reason or "程序文件匹配度不足，建议人工确认。",
-            "references": [],
-            "model_used": (getattr(settings, "llm_model", "") or "").strip(),
-            "latency_ms": int((time.time() - started) * 1000),
-        }
+        content_top = float(scored_refs[0].get("content_relevance") or 0.0) if scored_refs else 0.0
+        if content_top < min_similarity - 0.08:
+            return {
+                "request_id": request_id,
+                "need_human": True,
+                "answer": "",
+                "confidence": top_score,
+                "reason": rerank_reason or "程序文件匹配度不足，建议人工确认。",
+                "references": [],
+                "model_used": (getattr(settings, "llm_model", "") or "").strip(),
+                "latency_ms": int((time.time() - started) * 1000),
+            }
+        top_score = max(top_score, content_top)
 
     refs_prompt = []
-    for idx, r in enumerate(scored_refs[:top_k], start=1):
-        snippet = (r["content"] or "")[:400]
+    prompt_ref_n = len(scored_refs) if list_or_policy else min(top_k, len(scored_refs))
+    for idx, r in enumerate(scored_refs[:prompt_ref_n], start=1):
+        snippet = (r["content"] or "")[:480]
         refs_prompt.append(
             f"[{idx}] 文件: {r['file_name']}\n分类: {r['category']}\n片段: {snippet}"
         )
-    answer_prompt = (
-        "你是医疗器械质量管理体系记录填写助手。\n"
-        "任务：根据“程序文件”片段回答用户“怎么写记录”的问题。\n"
-        "限制：\n"
-        "1) 仅可依据给定程序文件片段回答；无法确认就 need_human=true。\n"
-        "2) 仅使用与用户业务域一致的片段；已预筛选，若仍不对则 need_human=true。\n"
-        "3) 首版不回答日期写法和人员填写问题。\n"
-        "4) 不输出法规结论，不编造不存在的字段。\n"
-        "5) 输出简洁、可执行，列清记录项与依据来源文件。\n\n"
-        f"用户问题：{query}\n\n"
-        "程序文件片段：\n"
-        + "\n\n".join(refs_prompt)
-        + "\n\n仅输出 JSON：\n"
-        "{\n"
-        '  "need_human": false,\n'
-        '  "answer_summary": "2～4 句简化总结（群消息用，列关键记录项）",\n'
-        '  "answer_detail": "详细版：分条说明怎么写、依据哪份程序文件（可用换行）",\n'
-        '  "answer": "与 answer_summary 相同（兼容）",\n'
-        '  "confidence": 0.0,\n'
-        '  "reason": "一句话原因"\n'
-        "}"
-    )
-    answer_invoke = _invoke_chat_llm_text(
-        answer_prompt,
-        current_provider=eff_provider,
-        client_llm=client_llm if client_llm.has_any() else None,
-        header_provider=hp,
-    )
-    llm_out = _extract_first_json_object(answer_invoke.text)
-    llm_provider_used = answer_invoke.provider_used
-    if answer_invoke.fallback_note:
-        provider_note = (
-            f"{provider_note}；{answer_invoke.fallback_note}"
-            if provider_note
-            else answer_invoke.fallback_note
-        )
-    answer_summary = _chat_normalize_answer_text(
-        llm_out.get("answer_summary") or llm_out.get("answer") or ""
-    )[:max_summary_chars]
-    answer_detail = _chat_normalize_answer_text(
-        llm_out.get("answer_detail") or llm_out.get("answer") or answer_summary
-    )[:max_detail_chars]
-    answer = answer_summary
-    try:
-        confidence = float(llm_out.get("confidence", 0.0) or 0.0)
-    except Exception:
-        confidence = 0.0
-    confidence = max(0.0, min(1.0, confidence))
-    need_human = bool(llm_out.get("need_human"))
-    if not answer_summary and not answer_detail:
-        need_human = True
-    if confidence < conf_threshold:
-        need_human = True
 
-    references = []
-    for r in scored_refs[: min(3, len(scored_refs))]:
-        references.append(
-            {
-                "source": "knowledge_base",
-                "file_name": r.get("file_name") or "未知",
-                "category": r.get("category") or allowed_category,
-                "snippet": (r.get("content") or "")[:120],
-            }
+    n_ref_files = len(detail_items) if list_or_policy else len({str(r.get("file_name") or "") for r in scored_refs})
+    if list_or_policy and detail_items:
+        max_summary_chars = min(8000, max(max_summary_chars, 48 + n_ref_files * 88))
+
+    llm_out: Dict[str, Any] = {}
+    llm_provider_used = eff_provider
+    if list_or_policy and detail_items:
+        answer_summary, answer_detail, n_composed = _chat_compose_policy_answer_from_items(
+            detail_items,
+            query,
+            max_summary_chars=max_summary_chars,
         )
+        if n_composed >= 1:
+            confidence = min(0.92, 0.62 + n_composed * 0.04)
+            if confidence < conf_threshold:
+                confidence = conf_threshold
+            need_human = False
+            llm_out = {
+                "need_human": False,
+                "confidence": confidence,
+                "reason": (
+                    f"已汇总 {n_composed} 份文件、{len(detail_items)} 条关键词匹配片段"
+                ),
+            }
+        else:
+            answer_summary, answer_detail = "", ""
+            need_human = True
+            llm_out = {
+                "need_human": True,
+                "confidence": 0.0,
+                "reason": "未找到与关键词匹配的程序文件片段。",
+            }
+        answer = answer_summary
+    elif list_or_policy:
+        need_human = True
+        answer_summary, answer_detail = "", ""
+        answer = ""
+        llm_out = {
+            "need_human": True,
+            "confidence": 0.0,
+            "reason": rerank_reason or "未检索到匹配片段",
+        }
+    else:
+        answer_prompt = (
+            "你是医疗器械质量管理体系程序文件问答助手。\n"
+            "任务：根据给定的「程序文件」片段回答用户问题。"
+            "可能是「体系运行记录怎么写」，也可能是「程序文件中的规定"
+            "（如哪些文件需更新/复审、更新周期、受控要求等）」。\n"
+            "限制：\n"
+            "1) 仅可依据给定程序文件片段回答；片段中无依据则 need_human=true。\n"
+            "2) 不编造文件编号、周期或清单；可归纳多条片段，须注明来源文件名。\n"
+            "3) 不回答「某条记录具体日期填哪天、签字人员写谁」类问题（need_human=true）。\n"
+            "4) 不输出法规注册结论。\n"
+            "5) answer_summary 简洁可发群；answer_detail 可列条目与依据。\n\n"
+            f"用户问题：{query}\n\n"
+            "程序文件片段：\n"
+            + "\n\n".join(refs_prompt)
+            + "\n\n仅输出 JSON：\n"
+            "{\n"
+            '  "need_human": false,\n'
+            '  "answer_summary": "2～4 句简化总结（群消息用，列关键记录项）",\n'
+            '  "answer_detail": "详细版：分条说明怎么写、依据哪份程序文件（可用换行）",\n'
+            '  "answer": "与 answer_summary 相同（兼容）",\n'
+            '  "confidence": 0.0,\n'
+            '  "reason": "一句话原因"\n'
+            "}"
+        )
+        answer_invoke = _invoke_chat_llm_text(
+            answer_prompt,
+            current_provider=eff_provider,
+            client_llm=client_llm if client_llm.has_any() else None,
+            header_provider=hp,
+        )
+        llm_out = _extract_first_json_object(answer_invoke.text)
+        llm_provider_used = answer_invoke.provider_used
+        if answer_invoke.fallback_note:
+            provider_note = (
+                f"{provider_note}；{answer_invoke.fallback_note}"
+                if provider_note
+                else answer_invoke.fallback_note
+            )
+        answer_summary = _chat_normalize_answer_text(
+            llm_out.get("answer_summary") or llm_out.get("answer") or ""
+        )[:max_summary_chars]
+        answer_detail = _chat_normalize_answer_text(
+            llm_out.get("answer_detail") or llm_out.get("answer") or answer_summary
+        )[:max_detail_chars]
+        answer_summary, answer_detail = _chat_merge_llm_with_ref_coverage(
+            answer_summary,
+            answer_detail,
+            scored_refs,
+            query,
+            max_summary_chars=max_summary_chars,
+            max_detail_chars=max_detail_chars,
+        )
+        try:
+            confidence = float(llm_out.get("confidence", 0.0) or 0.0)
+        except Exception:
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+        need_human = bool(llm_out.get("need_human"))
+        if not answer_summary and not answer_detail:
+            need_human = True
+        if confidence < conf_threshold:
+            need_human = True
+        answer = answer_summary
+
+    answer_mode = "multi_file_compose" if list_or_policy else "llm"
+
+    ref_cap = len(detail_items) if list_or_policy else min(3, len(scored_refs))
+    if list_or_policy and detail_items:
+        ref_sources = detail_items
+    else:
+        ref_sources = _chat_diversify_refs_by_file(scored_refs, max_total=ref_cap, max_per_file=1)
+    references = []
+    for r in ref_sources:
+        if isinstance(r, dict) and r.get("matched_excerpt") is not None:
+            references.append({"file_name": r.get("file_name") or "未知"})
+        else:
+            references.append({"file_name": r.get("file_name") or "未知"})
     from src.core.llm_factory import resolve_model_for_provider
 
     cl_for_model = (
@@ -2031,9 +3032,11 @@ def chat_reply_generate(
         "confidence": confidence,
         "reason": str(llm_out.get("reason") or ""),
         "references": references,
+        "detail_items": detail_items if list_or_policy else [],
         "model_used": f"{llm_provider_used}:{model_label}",
         "effective_provider": eff_provider,
         "llm_provider_used": llm_provider_used,
+        "answer_mode": answer_mode,
         "latency_ms": int((time.time() - started) * 1000),
     }
     if provider_note:

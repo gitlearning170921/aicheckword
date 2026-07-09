@@ -1385,6 +1385,40 @@ def get_knowledge_docs(
         conn.close()
 
 
+def search_knowledge_docs_by_content_keywords(
+    *,
+    collection: str,
+    keywords: List[str],
+    category: Optional[str] = None,
+    limit: int = 80,
+) -> list:
+    """按 content 关键词 LIKE 检索（与用户在 knowledge_docs 里直接查库对齐）。"""
+    kws = [str(k or "").strip() for k in (keywords or []) if str(k or "").strip()]
+    if not collection or not kws:
+        return []
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = (
+                "SELECT id, collection, file_name, chunk_index, content, metadata_json, category "
+                "FROM knowledge_docs WHERE collection = %s"
+            )
+            params: List[Any] = [collection]
+            if category:
+                sql += " AND category = %s"
+                params.append(category)
+            like_parts = ["content LIKE %s"] * len(kws)
+            sql += " AND (" + " OR ".join(like_parts) + ")"
+            params.extend([f"%{k}%" for k in kws])
+            sql += " ORDER BY file_name, chunk_index LIMIT %s"
+            params.append(max(1, min(int(limit), 200)))
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def get_knowledge_stats_by_category(collection: Optional[str] = None) -> Dict[str, Any]:
     """按分类统计：总文件数/块数 + 各分类(regulation/program/project_case)的文件数/块数"""
     init_db()
