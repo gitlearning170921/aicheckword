@@ -273,7 +273,7 @@ FIELD_LABELS: Dict[str, str] = {
     "cursor_embedding": "Cursor 侧嵌入后端（如 ollama）",
     "llm_verify_ssl": "校验 HTTPS 证书（关闭=不校验，与侧栏一致）",
     "llm_trust_env": "使用系统代理（关闭=直连，与侧栏一致）",
-    "llm_http_proxy": "显式 HTTP 代理（如 http://127.0.0.1:7897；仅国外 AI 域名走代理，国内/内网直连）",
+    "llm_http_proxy": "显式 HTTP 代理（如 http://127.0.0.1:7897；国外 AI、DuckDuckGo 版本发布时间检索走代理，国内/内网直连）",
     "llm_proxy_foreign_suffixes": "追加走代理的域名后缀（逗号分隔，如 .openai.com）",
     "llm_proxy_domestic_suffixes": "追加直连的域名后缀（逗号分隔，如 .your-company.cn）",
     "cursor_verify_ssl": "cursor_verify_ssl（兼容项，保存时与上一项同步）",

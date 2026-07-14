@@ -44,18 +44,39 @@ def get_cursor_trust_env() -> bool:
     return get_llm_trust_env()
 
 
+def _normalize_llm_proxy_url(proxy: str) -> str:
+    """本机 Clash/V2Ray 多为 HTTP CONNECT；写成 https://127.0.0.1:端口易 SSLEOF。"""
+    text = (proxy or "").strip()
+    if not text:
+        return ""
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(text)
+    except Exception:
+        return text
+    host = (parsed.hostname or "").lower()
+    if host in {"127.0.0.1", "localhost", "::1"} and (parsed.scheme or "").lower() == "https":
+        netloc = parsed.netloc or f"{host}:{parsed.port or 7890}"
+        return f"http://{netloc}"
+    return text
+
+
 def get_llm_http_proxy() -> Optional[str]:
-    """显式 HTTP(S) 代理地址。优先 settings.llm_http_proxy，其次 .env 的 HTTPS_PROXY/HTTP_PROXY。"""
+    """显式 HTTP(S) 代理地址。优先 settings.llm_http_proxy，其次 .env 的 HTTPS_PROXY/HTTP_PROXY。
+
+    Cursor / OpenAI 等国外 AI 与 DuckDuckGo 发布时间检索共用此入口，勿单独再配。
+    """
     try:
         from config import settings
 
-        explicit = (getattr(settings, "llm_http_proxy", None) or "").strip()
+        explicit = _normalize_llm_proxy_url(getattr(settings, "llm_http_proxy", None) or "")
         if explicit:
             return explicit
     except Exception:
         pass
     for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
-        val = (os.environ.get(key) or "").strip()
+        val = _normalize_llm_proxy_url(os.environ.get(key) or "")
         if val:
             return val
     return None

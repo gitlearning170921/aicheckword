@@ -440,6 +440,16 @@ class DocumentControlTranslateTitleRequest(BaseModel):
     text: str = ""
 
 
+class DocumentControlReleaseDateSuggestRequest(BaseModel):
+    collection: str = "regulations"
+    productName: str = ""
+    fromVersion: str = ""
+    toVersion: str = ""
+    intermediateVersions: list[str] = Field(default_factory=list)
+    targetVersion: Optional[str] = None
+    registrationCountry: str = ""
+
+
 class IntegrationCreateProjectBody(BaseModel):
     """创建 aicheckword 专属项目（与 Streamlit「项目与专属资料」新建表单一致）。"""
 
@@ -2721,6 +2731,92 @@ def integration_document_control_parse_numbering_rules(
         "sourceFile": source_file,
         "message": message,
     }
+
+
+@app.post("/api/integration/document-control/release-date-suggest")
+def integration_document_control_release_date_suggest(
+    req: Request,
+    body: DocumentControlReleaseDateSuggestRequest,
+):
+    """AI 联网检索各版本公开发布时间候选（供 aiword 版本任务清单页调用）。"""
+    body.collection = _resolve_request_collection(req, body.collection or "regulations")
+    from_version = (body.fromVersion or "").strip()
+    to_version = (body.toVersion or "").strip()
+    if not from_version or not to_version:
+        raise HTTPException(status_code=400, detail="fromVersion 与 toVersion 必填")
+    from src.core.release_date_search import suggest_release_dates
+    from .draft_integration import _header_provider, _parse_client_llm
+
+    client_llm = _parse_client_llm(req)
+    provider = _header_provider(req)
+    cl = client_llm if client_llm.has_any() else None
+
+    def llm_text_fn(prompt: str) -> str:
+        result = _invoke_chat_llm_text(
+            prompt,
+            header_provider=provider,
+            client_llm=cl,
+        )
+        return result.text or ""
+
+    try:
+        result = suggest_release_dates(
+            product_name=(body.productName or "").strip(),
+            from_version=from_version,
+            to_version=to_version,
+            intermediate_versions=[str(x or "").strip() for x in (body.intermediateVersions or []) if str(x or "").strip()],
+            target_version=(body.targetVersion or "").strip() or None,
+            registration_country=(body.registrationCountry or "").strip(),
+            llm_text_fn=llm_text_fn,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "collection": body.collection, **result}
+
+
+@app.post("/api/integration/document-control/release-date-suggest/diagnose")
+def integration_document_control_release_date_suggest_diagnose(
+    req: Request,
+    body: DocumentControlReleaseDateSuggestRequest,
+):
+    """发布时间检索诊断：返回应用市场检索命中、解析器与日期抽取详情。"""
+    body.collection = _resolve_request_collection(req, body.collection or "regulations")
+    from_version = (body.fromVersion or "").strip()
+    to_version = (body.toVersion or "").strip()
+    if not from_version or not to_version:
+        raise HTTPException(status_code=400, detail="fromVersion 与 toVersion 必填")
+    from src.core.release_date_search import diagnose_release_dates
+    from .draft_integration import _header_provider, _parse_client_llm
+
+    client_llm = _parse_client_llm(req)
+    provider = _header_provider(req)
+    cl = client_llm if client_llm.has_any() else None
+
+    def llm_text_fn(prompt: str) -> str:
+        result = _invoke_chat_llm_text(
+            prompt,
+            header_provider=provider,
+            client_llm=cl,
+        )
+        return result.text or ""
+
+    try:
+        result = diagnose_release_dates(
+            product_name=(body.productName or "").strip(),
+            from_version=from_version,
+            to_version=to_version,
+            intermediate_versions=[
+                str(x or "").strip()
+                for x in (body.intermediateVersions or [])
+                if str(x or "").strip()
+            ],
+            target_version=(body.targetVersion or "").strip() or None,
+            registration_country=(body.registrationCountry or "").strip(),
+            llm_text_fn=llm_text_fn,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "collection": body.collection, **result}
 
 
 @app.post("/api/integration/document-control/translate-title")

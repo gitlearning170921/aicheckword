@@ -22,6 +22,7 @@ _DOMESTIC_HOST_SUFFIXES: tuple[str, ...] = (
 )
 
 # 仅这些后缀（及子域）走代理；其余默认直连
+# 含 DuckDuckGo：版本发布时间网页检索依赖境外搜索，与国外 AI 一样需代理
 _FOREIGN_AI_HOST_SUFFIXES: tuple[str, ...] = (
     ".cursor.com",
     ".openai.com",
@@ -29,6 +30,11 @@ _FOREIGN_AI_HOST_SUFFIXES: tuple[str, ...] = (
     ".openai.azure.com",
     ".googleapis.com",
     ".azure.com",
+    ".duckduckgo.com",
+    # 国际 Bing（非 cn.bing.com）常需代理；cn.bing.com 仍直连
+    ".bing.com",
+    # App Store 网页/amp-api：国内直连常被重定向到 /cn/iphone/today，需走代理拿欧区版本历史
+    ".apple.com",
 )
 
 _LOCAL_HOSTNAMES: frozenset[str] = frozenset({"localhost", "localhost.localdomain"})
