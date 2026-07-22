@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     llm_verify_ssl: bool = True  # False 时不校验 SSL（代理/证书异常时可勾选）
     llm_trust_env: bool = True  # False 时不使用系统代理，直连 API（代理导致 SSL EOF 时可勾选）
     # 显式 HTTP 代理（如 Clash http://127.0.0.1:7897）；空则读 HTTPS_PROXY/HTTP_PROXY
+    # 国外 AI / DuckDuckGo 发布时间 / Google Scholar 文献检索共用，勿另配文献代理
     llm_http_proxy: str = ""
     # 追加「走代理」的域名后缀（逗号分隔，如 .your-relay.com）；内置已含 openai.com/cursor.com 等
     llm_proxy_foreign_suffixes: str = ""

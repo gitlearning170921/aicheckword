@@ -69,6 +69,7 @@ from src.core.db import (
     create_project,
     create_project_case,
     get_project_case,
+    get_existing_file_names,
     upsert_company_mapping,
     delete_company_by_aiword_id,
     CompanyMappingConflictError,
@@ -87,7 +88,10 @@ from src.core.quiz.models import EXAM_TRACKS
 from src.core.quiz.service import QuizRequestError
 from src.api.audit_integration import router as audit_integration_router
 from src.api.draft_integration import router as draft_integration_router
+from src.api.train_integration import router as train_integration_router
+from src.api.deficiency_api import router as deficiency_api_router
 from src.api.integration_common import router as integration_common_router
+from src.api.literature_integration import router as literature_integration_router
 from src.api.translation_integration import router as translation_integration_router
 
 app = FastAPI(
@@ -108,8 +112,11 @@ app.add_middleware(
 
 app.include_router(draft_integration_router)
 app.include_router(audit_integration_router)
+app.include_router(train_integration_router)
+app.include_router(deficiency_api_router)
 app.include_router(translation_integration_router)
 app.include_router(integration_common_router)
+app.include_router(literature_integration_router)
 
 _agents: Dict[str, ReviewAgent] = {}
 
@@ -419,6 +426,7 @@ class CompanySyncRequest(BaseModel):
 
 class CollectionRequest(BaseModel):
     collection: str = "regulations"
+    which: str = "all"
 
 
 class DocumentControlValidateRequest(BaseModel):
@@ -940,6 +948,138 @@ _CHAT_SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
 )
 _CHAT_SYNONYM_STOP_ALTS = frozenset({"文件", "规定", "要求", "一次", "1次", "一回", "标准", "制度"})
 
+# 中英对照组：用户问题含中文词时，同步生成英文检索词/句以覆盖英文程序文件
+_CHAT_BILINGUAL_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("更新", "update", "updated", "updating"),
+    ("复审", "review", "re-review", "periodic review", "re review"),
+    ("修订", "revise", "revision", "revised", "amend", "amended"),
+    ("换版", "reissue", "re-issue", "revision"),
+    ("再评审", "re-review", "periodic review"),
+    ("程序文件", "procedure", "procedural document", "SOP"),
+    ("受控文件", "controlled document", "controlled documents"),
+    ("体系文件", "management system document", "QMS document"),
+    ("管理文件", "management document"),
+    ("文件控制", "document control"),
+    ("文件管理", "document management"),
+    ("规定", "requirement", "requirements"),
+    ("要求", "requirement", "requirements", "shall"),
+    ("周期", "cycle", "period", "frequency"),
+    ("有效期", "validity period", "validity"),
+    ("保留期", "retention period", "retention"),
+    ("记录", "record", "records"),
+    ("台账", "log", "register"),
+    ("至少", "at least"),
+    ("两年", "two years", "2 years", "every two years", "every 2 years"),
+    ("2年", "2 years", "two years", "every 2 years"),
+    ("每两年", "every two years", "every 2 years"),
+    ("每2年", "every 2 years", "every two years"),
+    ("一次", "once"),
+)
+
+
+def _chat_query_has_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _chat_is_cjk_term(term: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", term or ""))
+
+
+def _chat_year_period_en_terms(year_num: Optional[str]) -> List[str]:
+    if not year_num or not str(year_num).strip().isdigit():
+        return []
+    n = str(year_num).strip()
+    terms = [
+        f"{n} years",
+        f"every {n} years",
+        f"at least every {n} years",
+        f"every {n} year",
+    ]
+    if n == "2":
+        terms.extend(
+            [
+                "two years",
+                "every two years",
+                "every 2 years",
+                "at least every two years",
+                "at least every 2 years",
+                "biennial",
+                "24 months",
+            ]
+        )
+    dedup: List[str] = []
+    for t in terms:
+        t = (t or "").strip()
+        if len(t) >= 2 and t.lower() not in [x.lower() for x in dedup]:
+            dedup.append(t)
+    return dedup
+
+
+def _chat_en_terms_for_query(query: str) -> List[str]:
+    """将问题中的中文关键词扩展为英文检索词。"""
+    q = (query or "").strip()
+    if not q or not _chat_query_has_cjk(q):
+        return []
+    out: List[str] = []
+
+    def _add(t: str) -> None:
+        t = (t or "").strip()
+        if len(t) >= 2 and t not in out:
+            out.append(t)
+
+    for group in _CHAT_BILINGUAL_GROUPS:
+        if not any(term in q for term in group if _chat_is_cjk_term(term)):
+            continue
+        for term in group:
+            if not _chat_is_cjk_term(term):
+                _add(term)
+    year_num = _chat_extract_year_num(q)
+    for yt in _chat_year_period_en_terms(year_num):
+        _add(yt)
+    return out
+
+
+def _chat_build_english_search_queries(query: str, *, limit: int = 8) -> List[str]:
+    """生成英文向量检索句，覆盖英文版程序文件。"""
+    q = (query or "").strip()
+    if not q or not _chat_query_has_cjk(q):
+        return []
+    out: List[str] = []
+
+    def _add(s: str) -> None:
+        s = (s or "").strip()
+        if s and s not in out:
+            out.append(s)
+
+    en_terms = _chat_en_terms_for_query(q)
+    if en_terms:
+        _add(" ".join(en_terms[:10]))
+    year_num = _chat_extract_year_num(q)
+    if year_num:
+        if year_num == "2":
+            _add("every two years review revision controlled document")
+            _add("at least every 2 years update controlled documents")
+        else:
+            _add(f"every {year_num} years review revision controlled document")
+    if any(x in q for x in ("哪些", "什么文件", "哪些文件", "有哪些")):
+        _add("which controlled documents require review revision")
+    if any(x in q for x in ("更新", "复审", "修订", "换版", "周期")):
+        _add("document review revision update period procedure")
+    if "程序文件" in q or "受控" in q:
+        _add("controlled document procedure review requirements")
+    return out[:limit]
+
+
+def _chat_term_in_text(term: str, text: str) -> bool:
+    t = (term or "").strip()
+    if len(t) < 2:
+        return False
+    blob = text or ""
+    if _chat_is_cjk_term(t):
+        compact = blob.replace(" ", "")
+        return t in blob or t.replace(" ", "") in compact
+    return t.lower() in blob.lower()
+
 
 def _chat_is_list_or_policy_question(query: str) -> bool:
     """清单/周期类规定问答：需要跨多份程序文件召回。"""
@@ -1047,13 +1187,9 @@ def _chat_year_period_db_terms(year_num: Optional[str]) -> List[str]:
 
 def _chat_count_keyword_hits(content: str, terms: List[str]) -> int:
     text = (content or "").replace("\r", "")
-    compact = text.replace(" ", "")
     hits = 0
     for t in terms or []:
-        t = (t or "").strip()
-        if len(t) < 2:
-            continue
-        if t in text or t.replace(" ", "") in compact:
+        if _chat_term_in_text(t, text):
             hits += 1
     return hits
 
@@ -1062,13 +1198,22 @@ def _chat_content_has_year_period(text: str, year_num: Optional[str]) -> bool:
     if not text:
         return False
     blob = (text or "").replace("\r", "")
+    blob_low = blob.lower()
     if year_num:
-        if any(t in blob for t in _chat_year_period_db_terms(year_num)):
+        if any(_chat_term_in_text(t, blob) for t in _chat_year_period_db_terms(year_num)):
             return True
-        if year_num == "2" and re.search(r"每?\s*2\s*年|每?\s*两\s*年|每?\s*二\s*年", blob):
+        if any(_chat_term_in_text(t, blob) for t in _chat_year_period_en_terms(year_num)):
+            return True
+        if year_num == "2" and re.search(
+            r"每?\s*2\s*年|每?\s*两\s*年|每?\s*二\s*年|every\s+(?:2|two)\s+years?|biennial",
+            blob_low,
+        ):
             return True
         return False
-    return bool(re.search(r"\d+\s*年|两\s*年|二\s*年", blob))
+    return bool(
+        re.search(r"\d+\s*年|两\s*年|二\s*年", blob)
+        or re.search(r"every\s+\d+\s+years?|every\s+two\s+years?|biennial", blob_low)
+    )
 
 
 def _chat_ref_content_relevance(query: str, ref: Dict[str, Any]) -> float:
@@ -1078,7 +1223,21 @@ def _chat_ref_content_relevance(query: str, ref: Dict[str, Any]) -> float:
     blob = f"{fn}\n{content}"
     list_q = _chat_is_list_or_policy_question(query)
     year_num = _chat_extract_year_num(query)
-    period_terms = ("更新", "复审", "修订", "换版", "再评审", "有效期", "保留期")
+    period_terms = (
+        "更新",
+        "复审",
+        "修订",
+        "换版",
+        "再评审",
+        "有效期",
+        "保留期",
+        "review",
+        "revision",
+        "update",
+        "revised",
+        "amended",
+        "re-review",
+    )
 
     score = 0.0
     hints = [h for h in _chat_rule_hint_terms(query) if len(h) >= 2]
@@ -1148,17 +1307,26 @@ def _chat_supplement_policy_queries(query: str) -> List[str]:
         for yt in _chat_year_period_db_terms(year_num)[:6]:
             out.append(f"{yt} 复审 更新 受控文件")
         out.append(f"受控文件 {year_num}年 复审 修订")
-    out.extend(["受控文件 复审周期 更新周期", "文件控制 复审 修订周期"])
+        for en_yt in _chat_year_period_en_terms(year_num)[:4]:
+            out.append(f"{en_yt} review revision controlled document")
+    out.extend(
+        [
+            "受控文件 复审周期 更新周期",
+            "文件控制 复审 修订周期",
+            "controlled document review cycle update period",
+            "document control review revision procedure",
+        ]
+    )
     dedup: List[str] = []
     for s in out:
         s = s.strip()
         if s and s not in dedup:
             dedup.append(s)
-    return dedup[:5]
+    return dedup[:8]
 
 
 def _chat_db_keyword_terms(query: str) -> List[str]:
-    """用于 knowledge_docs LIKE 检索的关键词（与用户手工查库近义词口径一致）。"""
+    """用于 knowledge_docs LIKE 检索的关键词（中文近义词 + 英文译词）。"""
     q = (query or "").strip()
     if not q:
         return []
@@ -1172,6 +1340,8 @@ def _chat_db_keyword_terms(query: str) -> List[str]:
     year_num = _chat_extract_year_num(q)
     for yt in _chat_year_period_db_terms(year_num):
         _add(yt)
+    for yt in _chat_year_period_en_terms(year_num):
+        _add(yt)
     for group in _CHAT_SYNONYM_GROUPS:
         for term in group:
             if term in q:
@@ -1179,7 +1349,9 @@ def _chat_db_keyword_terms(query: str) -> List[str]:
     for h in _chat_rule_hint_terms(q):
         if len(h) >= 2:
             _add(h)
-    return terms[:18]
+    for en in _chat_en_terms_for_query(q):
+        _add(en)
+    return terms[:32]
 
 
 def _chat_keyword_search_program_refs(
@@ -1483,6 +1655,16 @@ def _chat_extract_paragraph_containing(text: str, pos: int) -> str:
     return para or t.strip()
 
 
+def _chat_find_term_pos(text: str, term: str, start: int = 0) -> int:
+    t = (term or "").strip()
+    if not t:
+        return -1
+    if _chat_is_cjk_term(t):
+        return text.find(t, start)
+    m = re.search(re.escape(t), text[start:], re.I)
+    return (start + m.start()) if m else -1
+
+
 def _chat_extract_match_spans(content: str, query: str) -> Dict[str, Any]:
     """定位最佳关键词，并提取对应句子（简易版）与段落（详细版）。"""
     text = (content or "").replace("\r", "")
@@ -1491,18 +1673,21 @@ def _chat_extract_match_spans(content: str, query: str) -> Dict[str, Any]:
     best_term = ""
     best_rank = -1
     year_num = _chat_extract_year_num(query)
-    compact = text.replace(" ", "")
+    period_hints = (
+        "更新", "复审", "修订", "换版", "周期",
+        "review", "revision", "update", "revised", "amended",
+    )
     for term in sorted(terms, key=len, reverse=True):
         start = 0
         while True:
-            pos = text.find(term, start)
+            pos = _chat_find_term_pos(text, term, start)
             if pos < 0:
                 break
             rank = len(term) * 10
             window = text[max(0, pos - 40): min(len(text), pos + len(term) + 40)]
             if _chat_content_has_year_period(window, year_num):
                 rank += 30
-            if any(x in window for x in ("更新", "复审", "修订", "换版", "周期")):
+            if any(_chat_term_in_text(x, window) for x in period_hints):
                 rank += 15
             if rank > best_rank:
                 best_rank = rank
@@ -1521,7 +1706,7 @@ def _chat_extract_match_spans(content: str, query: str) -> Dict[str, Any]:
         }
     sentence = _chat_expand_summary_sentence(text, best_pos, term_end, best_term)
     paragraph = _chat_extract_paragraph_containing(text, best_pos)
-    matched = [t for t in terms if t in text or t.replace(" ", "") in compact]
+    matched = [t for t in terms if _chat_term_in_text(t, text)]
     return {
         "match_keyword": best_term,
         "match_sentence": sentence,
@@ -1836,12 +2021,13 @@ def _chat_retrieval_plan(intent: Dict[str, Any], query: str) -> Dict[str, Any]:
     llm_queries = _chat_as_str_list(intent.get("search_queries"), limit=6)
     search_queries = _chat_build_synonym_queries(q, llm_queries, limit=8)
     search_queries.extend(_chat_supplement_policy_queries(q))
+    search_queries.extend(_chat_build_english_search_queries(q, limit=8))
     dedup_q: List[str] = []
     for s in search_queries:
         s = (s or "").strip()
         if s and s not in dedup_q:
             dedup_q.append(s)
-    search_queries = dedup_q[:12]
+    search_queries = dedup_q[:18]
     boost_terms = _chat_as_str_list(intent.get("topic_keywords") or intent.get("relevant_topics"), limit=12)
     penalty_terms = _chat_as_str_list(intent.get("avoid_topics") or intent.get("irrelevant_topics"), limit=8)
     return {
@@ -2229,8 +2415,8 @@ def _classify_chat_intent(
         "纯法规注册结论、与程序文件无关的 IT/行政杂问为 false。\n"
         "2) is_date_or_personnel_question=true 仅当问「某条记录日期填什么、签字人员写谁」；"
         "问「文件几年更新/复审」不算人员日期填写。\n"
-        "3) search_queries 写 5～8 条中文检索句：对用户问题做**近义改写**（如 更新↔复审↔修订、2年↔两年↔每两年、"
-        "程序文件↔受控文件），换表述不换含义；可含可能的制度名称、记录类型，勿编造文件编号。\n"
+        "3) search_queries 写 5～8 条检索句：中文近义改写 + 若用户用中文提问须补充**英文**检索句"
+        "（如 every two years review controlled document），以覆盖英文版程序文件；勿编造文件编号。\n"
         "4) topic_keywords / avoid_topics 用于过滤明显跑题的召回结果。\n"
     )
     out = _extract_first_json_object(
@@ -2333,26 +2519,50 @@ async def train_upload(
     files: List[UploadFile] = File(...),
     collection: str = Form("regulations"),
     category: str = Form("regulation"),
+    overwrite_mode: str = Form("overwrite"),
 ):
     collection = _resolve_request_collection(req, collection)
     agent = get_agent(collection)
     results = []
+    mode = (overwrite_mode or "overwrite").strip().lower()
+    if mode not in ("overwrite", "skip"):
+        mode = "overwrite"
+    existing = set(get_existing_file_names(collection, category=category) or [])
 
     for file in files:
-        suffix = Path(file.filename).suffix
+        display_name = Path(str(file.filename or "upload.bin")).name
+        suffix = Path(display_name).suffix
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
 
         try:
-            result = agent.train(tmp_path, category=category)
-            result["original_filename"] = file.filename
+            if display_name in existing and mode == "skip":
+                results.append(
+                    {
+                        "status": "skipped",
+                        "original_filename": display_name,
+                        "message": "已存在，按 skip 跳过",
+                        "chunks_added": 0,
+                    }
+                )
+                continue
+            if display_name in existing and mode == "overwrite":
+                try:
+                    agent.kb.delete_documents_by_file_name(display_name)
+                except Exception:
+                    pass
+                existing.discard(display_name)
+            result = agent.train(tmp_path, category=category, display_name=display_name)
+            result["original_filename"] = display_name
             results.append(result)
+            if result.get("status") == "success":
+                existing.add(display_name)
         except Exception as e:
             results.append({
                 "status": "error",
-                "original_filename": file.filename,
+                "original_filename": display_name,
                 "message": str(e),
             })
         finally:
@@ -3147,7 +3357,10 @@ def knowledge_search_options(req: Request, collection: str = Query("regulations"
 def clear_knowledge(req: Request, request: CollectionRequest):
     request.collection = _resolve_request_collection(req, request.collection)
     agent = get_agent(request.collection)
-    return agent.clear_knowledge()
+    which = (request.which or "all").strip() or "all"
+    if which not in ("regulations", "checkpoints", "all"):
+        which = "all"
+    return agent.clear_knowledge(which=which)
 
 
 @app.post("/api/chat/reply/generate")

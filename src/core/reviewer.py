@@ -1490,6 +1490,31 @@ class DocumentReviewer:
         if review_context and review_context.get("extra_instructions"):
             context += "\n\n【自定义审核要求（请严格遵守）】\n" + (review_context.get("extra_instructions") or "")
 
+        try:
+            from datetime import date as _date
+
+            from .deficiency_context import build_deficiency_lessons_context
+
+            _rc = review_context or {}
+            _countries = _rc.get("registration_country")
+            if isinstance(_countries, (list, tuple)):
+                _country = str((_countries[0] if _countries else "") or "").strip()
+            else:
+                _country = str(_countries or "").strip()
+            _cat = str(_rc.get("registration_type") or _rc.get("registration_category") or "").strip()
+            _def_ctx = build_deficiency_lessons_context(
+                self.collection_name or "regulations",
+                as_of_date=_date.today(),
+                registration_country=_country,
+                registration_category=_cat,
+                query_text=(text or "")[:1500],
+                top_k=8,
+            )
+            if _def_ctx:
+                context += "\n\n" + _def_ctx
+        except Exception:
+            pass
+
         sys_prompt = system_prompt if (system_prompt and system_prompt.strip()) else REVIEW_SYSTEM_PROMPT
         usr_prompt = user_prompt if (user_prompt and user_prompt.strip()) else REVIEW_USER_PROMPT
 

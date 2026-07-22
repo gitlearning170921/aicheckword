@@ -314,9 +314,17 @@ class KnowledgeBase:
             save_knowledge_docs(self.collection_name, file_name, documents, category=category, case_id=case_id)
         return total
 
-    def train_from_file(self, file_path, category: str = "regulation") -> int:
+    def train_from_file(
+        self,
+        file_path,
+        category: str = "regulation",
+        *,
+        display_name: str = "",
+    ) -> int:
         chunks = load_and_split(file_path)
-        return self.add_documents(chunks, file_name=str(file_path), category=category)
+        # 展示名优先用上传原名；禁止把 NamedTemporaryFile 的 tmp 路径基名写入知识库。
+        name = (display_name or "").strip() or Path(file_path).name
+        return self.add_documents(chunks, file_name=name, category=category)
 
     def train_from_directory(self, dir_path, category: str = "regulation") -> int:
         chunks = load_and_split_directory(dir_path)

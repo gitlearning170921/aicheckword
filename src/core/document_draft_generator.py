@@ -1514,6 +1514,24 @@ class DocumentDraftGenerator:
                     "**禁止**用单个数字 1-5 作为 Risk ID 去匹配/覆盖已有行。\n"
                 )
 
+        try:
+            from datetime import date as _date
+
+            from .deficiency_context import build_deficiency_lessons_context
+
+            _def_ctx = build_deficiency_lessons_context(
+                self.collection,
+                as_of_date=_date.today(),
+                registration_country=registration_country or "",
+                registration_category=registration_type or "",
+                query_text=(template_file_name or "") + "\n" + (input_docs_excerpt or "")[:800],
+                top_k=8,
+            )
+            if _def_ctx:
+                prompt += "\n\n" + _def_ctx + "\n"
+        except Exception:
+            pass
+
         _uap = (user_prompt_append or "").strip()
         if _uap:
             _lim = 8000

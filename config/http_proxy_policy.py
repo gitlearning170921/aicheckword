@@ -35,6 +35,9 @@ _FOREIGN_AI_HOST_SUFFIXES: tuple[str, ...] = (
     ".bing.com",
     # App Store 网页/amp-api：国内直连常被重定向到 /cn/iphone/today，需走代理拿欧区版本历史
     ".apple.com",
+    # Google Scholar 文献检索（与初稿/Cursor 共用 llm_http_proxy）
+    "scholar.google.com",
+    ".scholar.google.com",
 )
 
 _LOCAL_HOSTNAMES: frozenset[str] = frozenset({"localhost", "localhost.localdomain"})

@@ -306,6 +306,31 @@ def _get_kb_context(
             parts.append("【Reference phrasing】")
             for d in case_docs[:2]:
                 parts.append((d.page_content or "").strip()[:400])
+        try:
+            from datetime import date as _date
+
+            from src.core.deficiency_context import build_deficiency_lessons_context
+
+            # 翻译侧无国家/类别时跳过；有则注入表述类发补经验
+            _def = build_deficiency_lessons_context(
+                collection_name,
+                as_of_date=_date.today(),
+                registration_country="",  # 由调用方若有维度可再扩展；此处尝试从 deficiency 向量块补充
+                registration_category="",
+                query_text=query,
+                top_k=3,
+            )
+            # 无国家类别时 build 返回空，安全
+            if _def:
+                parts.append(_def)
+            else:
+                def_docs = kb.search_by_category(query, "deficiency", top_k=3)
+                if def_docs:
+                    parts.append("【Historical deficiency phrasing lessons】")
+                    for d in def_docs[:2]:
+                        parts.append((d.page_content or "").strip()[:600])
+        except Exception:
+            pass
     except Exception:
         pass
     if not parts:

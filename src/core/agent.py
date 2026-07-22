@@ -98,14 +98,27 @@ class ReviewAgent:
 
     # ─── 第一步：训练法规 / 程序 / 案例 ────────────────────
 
-    def train(self, file_path: str, category: str = "regulation") -> dict:
+    def train(
+        self,
+        file_path: str,
+        category: str = "regulation",
+        *,
+        display_name: str = "",
+    ) -> dict:
         path = Path(file_path)
         if path.is_dir():
             count = self.kb.train_from_directory(path, category=category)
             return {"status": "success", "chunks_added": count, "source": str(path), "category": category}
         elif path.is_file():
-            count = self.kb.train_from_file(path, category=category)
-            return {"status": "success", "chunks_added": count, "source": path.name, "category": category}
+            name = (display_name or "").strip() or path.name
+            count = self.kb.train_from_file(path, category=category, display_name=name)
+            return {
+                "status": "success",
+                "chunks_added": count,
+                "source": name,
+                "category": category,
+                "original_filename": name,
+            }
         else:
             return {"status": "error", "message": f"路径不存在：{file_path}"}
 

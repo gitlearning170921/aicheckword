@@ -334,6 +334,35 @@ class ChecklistGenerator:
             max_docs=scale["max_context_docs"],
             extra_query_terms=extra_query_terms or None,
         )
+        try:
+            from langchain_core.documents import Document as _Doc
+
+            from .deficiency_context import build_deficiency_lessons_context
+            from datetime import date as _date
+
+            _countries = registration_countries or []
+            _country = str((_countries[0] if _countries else "") or "").strip()
+            _cat = str(registration_type or "").strip()
+            _def_txt = build_deficiency_lessons_context(
+                getattr(self.kb, "collection_name", None) or "regulations",
+                as_of_date=_date.today(),
+                registration_country=_country,
+                registration_category=_cat,
+                query_text=" ".join(str(x) for x in (query_hints or [])[:5]),
+                top_k=5,
+            )
+            if _def_txt:
+                all_docs = list(all_docs or []) + [_Doc(page_content=_def_txt, metadata={"category": "deficiency"})]
+            else:
+                def_docs = self.kb.search_by_category(
+                    " ".join(str(x) for x in (query_hints or ["发补"])[:3]) or "发补",
+                    "deficiency",
+                    top_k=5,
+                )
+                if def_docs:
+                    all_docs = list(all_docs or []) + list(def_docs)
+        except Exception:
+            pass
         context_batches = self._docs_to_batched_contexts(all_docs)
         total_batches = len(context_batches)
 

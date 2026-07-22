@@ -97,6 +97,12 @@ def init_db() -> None:
             return
         _init_db_schema_locked()
         _db_schema_initialized = True
+        try:
+            from src.core.deficiency_store import ensure_deficiency_tables
+
+            ensure_deficiency_tables()
+        except Exception:
+            pass
 
 
 def _init_db_schema_locked() -> None:
