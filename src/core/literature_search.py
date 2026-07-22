@@ -19,7 +19,13 @@ import httpx
 
 PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
-_RESULT_START_RE = re.compile(r'<div class="gs_r\b[^"]*"[^>]*>', re.I)
+# 仅主结果卡（gs_or），排除侧栏/相关推荐等纯 gs_r，避免掺条与打乱浏览器顺序
+_RESULT_START_RE = re.compile(
+    r'<div class="gs_r\b[^"]*\bgs_or\b[^"]*"[^>]*>',
+    re.I,
+)
+# 回退：部分镜像页可能无 gs_or
+_RESULT_START_FALLBACK_RE = re.compile(r'<div class="gs_r\b[^"]*"[^>]*>', re.I)
 _TITLE_RE = re.compile(r'<h3 class="gs_rt"[^>]*>(.*?)</h3>', re.S | re.I)
 _LINK_RE = re.compile(r'<a[^>]+href="([^"]+)"', re.I)
 _META_RE = re.compile(r'<div class="gs_a"[^>]*>(.*?)</div>', re.S | re.I)
@@ -27,13 +33,15 @@ _DATA_RP_RE = re.compile(r'\bdata-rp=["\']?(\d+)', re.I)
 _TAG_RE = re.compile(r"<[^>]+>")
 _YEAR_RE = re.compile(r"(19|20)\d{2}")
 _SCHOLAR_PAGE_SIZE = 10
-# 抓取总时限（秒）：留足余量给补全，且不超过上游读超时(900s)
-_SCHOLAR_FETCH_BUDGET_S = 600.0
-# 翻页间隔（秒）：模拟真人，降低 429；下限抬高是抗限流关键
-_SCHOLAR_PAGE_DELAY_MIN = 5.0
-_SCHOLAR_PAGE_DELAY_MAX = 11.0
-# 命中 429 后对同一页的最大退避重试次数
-_SCHOLAR_RL_RETRIES = 3
+# 抓取总时限（秒）：翻页放慢后一次全量抓取更耗时，预算随之抬高；
+# 需 ≤ 上游读超时(见 aiword search_service，已同步抬到 1800s)。
+_SCHOLAR_FETCH_BUDGET_S = 1500.0
+# 翻页间隔（秒）：模拟真人浏览节奏（读完一页再翻），拉长是抗 429 的关键。
+# 一次抓 ~20 页大约 4~8 分钟，用「慢而稳」换「一次抓全、少弹验证码」。
+_SCHOLAR_PAGE_DELAY_MIN = 12.0
+_SCHOLAR_PAGE_DELAY_MAX = 26.0
+# 命中 429 后对同一页的最大退避重试次数（更有耐心，别轻易转验证码）
+_SCHOLAR_RL_RETRIES = 4
 
 
 class ScholarRateLimitedError(RuntimeError):
@@ -633,9 +641,11 @@ def _clean_html_text(value: str) -> str:
 
 
 def _iter_scholar_blocks(html_text: str) -> list[str]:
-    """按结果卡起点切块，避免嵌套 div 导致正则提前截断（旧实现常只解析出少数条）。"""
+    """按主结果卡起点切块（优先 gs_or），保持 DOM 顺序 = 浏览器顺序。"""
     text = html_text or ""
     starts = [m.start() for m in _RESULT_START_RE.finditer(text)]
+    if not starts:
+        starts = [m.start() for m in _RESULT_START_FALLBACK_RE.finditer(text)]
     if not starts:
         return []
     blocks: list[str] = []
@@ -646,16 +656,18 @@ def _iter_scholar_blocks(html_text: str) -> list[str]:
 
 
 def _parse_scholar_entries(html_text: str, max_results: int) -> list[dict[str, Any]]:
+    """解析单页结果；严格按 DOM 顺序，不再按 data-rp 重排（避免与浏览器错位）。"""
     records: list[dict[str, Any]] = []
     seen_titles: set[str] = set()
     blocks = _iter_scholar_blocks(html_text)
-    # 回退：有时页面结构变化，至少按标题节点捞
+    # 回退：有时页面结构变化，至少按标题节点捞（仍保持出现顺序）
     if not blocks:
         for tmatch in _TITLE_RE.finditer(html_text or ""):
             blocks.append(tmatch.group(0))
 
-    ranked: list[tuple[int, dict[str, Any]]] = []
     for idx, block in enumerate(blocks):
+        if len(records) >= max_results:
+            break
         tmatch = _TITLE_RE.search(block)
         if not tmatch:
             continue
@@ -686,35 +698,26 @@ def _parse_scholar_entries(html_text: str, max_results: int) -> list[dict[str, A
             # gs_a 常见：Authors - Venue, Year - Publisher；去掉末尾年份避免导出重复
             journal = re.sub(r",?\s*(19|20)\d{2}\s*$", "", parts[1]).strip(" ,;")
         rp_match = _DATA_RP_RE.search(block)
+        # data-rp 仅作参考位次；展示顺序以 DOM / 翻页 start 为准
         rank = int(rp_match.group(1)) if rp_match else idx
         link = html.unescape(lmatch.group(1)).strip() if lmatch else ""
         if link.startswith("/"):
             link = "https://scholar.google.com" + link
-        # 侧栏 PDF/全文链接也可能含 DOI
         doi = _extract_doi_from_text(link, block)
-        ranked.append(
-            (
-                rank,
-                {
-                    "source": "scholar",
-                    "title": title,
-                    "authors": authors,
-                    "year": year,
-                    "journal": journal,
-                    "volume_issue_pages": "",
-                    "doi": doi,
-                    "pmid": "",
-                    "source_url": link,
-                    "rank": rank,
-                },
-            )
+        records.append(
+            {
+                "source": "scholar",
+                "title": title,
+                "authors": authors,
+                "year": year,
+                "journal": journal,
+                "volume_issue_pages": "",
+                "doi": doi,
+                "pmid": "",
+                "source_url": link,
+                "rank": rank,
+            }
         )
-
-    ranked.sort(key=lambda x: x[0])
-    for _, rec in ranked:
-        records.append(rec)
-        if len(records) >= max_results:
-            break
     return records
 
 
@@ -761,15 +764,24 @@ def _extract_doi_from_text(*parts: str) -> str:
 
 
 def _crossref_authors(item: dict[str, Any]) -> str:
+    """输出**全名**作者列表（名 + 姓，全部作者，不缩写、不截断），
+    与期刊文章页/正式引用一致，例如「Atul Malhotra, Maureen E. Crocker, …」。
+    Scholar 的 gs_a 行是缩写并省略的（「A Malhotra … …」），必须用 Crossref 全名覆盖。"""
     names: list[str] = []
     for a in item.get("author") or []:
         fam = (a.get("family") or "").strip()
         given = (a.get("given") or "").strip()
-        initials = "".join(p[0].upper() for p in re.split(r"[\s\-]+", given) if p)
-        if fam and initials:
-            names.append(f"{fam} {initials}")
+        if given and fam:
+            names.append(f"{given} {fam}")
         elif fam:
             names.append(fam)
+        elif given:
+            names.append(given)
+        else:
+            # 机构作者
+            org = (a.get("name") or "").strip()
+            if org:
+                names.append(org)
     return ", ".join(names)
 
 
@@ -784,6 +796,33 @@ def _crossref_year(item: dict[str, Any]) -> str:
     return ""
 
 
+def _crossref_get_json(
+    url: str,
+    *,
+    params: Optional[dict[str, Any]] = None,
+    timeout_seconds: int = 20,
+) -> Optional[dict[str, Any]]:
+    """请求 Crossref：先直连，失败再走共享代理（部分环境外网必须经代理）。"""
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "aicheckword-literature/1.0 (metadata enrichment)",
+    }
+    for force_proxy in (False, True):
+        try:
+            resp = _outbound_get(
+                url,
+                params=params,
+                headers=headers,
+                timeout_seconds=timeout_seconds,
+                force_proxy=force_proxy,
+                retries=2,
+            )
+            return resp.json()
+        except Exception:
+            continue
+    return None
+
+
 def _crossref_lookup_by_doi(
     doi: str,
     *,
@@ -792,21 +831,10 @@ def _crossref_lookup_by_doi(
     d = (doi or "").strip().lower()
     if not d.startswith("10."):
         return None
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "aicheckword-literature/1.0 (metadata enrichment)",
-    }
-    try:
-        resp = _outbound_get(
-            f"{CROSSREF_BASE}/{quote_plus(d)}",
-            headers=headers,
-            timeout_seconds=timeout_seconds,
-            force_proxy=False,
-            retries=2,
-        )
-        data = resp.json()
-    except Exception:
-        return None
+    data = _crossref_get_json(
+        f"{CROSSREF_BASE}/{quote_plus(d)}",
+        timeout_seconds=timeout_seconds,
+    )
     msg = (data or {}).get("message")
     return msg if isinstance(msg, dict) else None
 
@@ -822,22 +850,7 @@ def _crossref_lookup(
     if not t:
         return None
     params = {"query.bibliographic": t, "rows": 5}
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "aicheckword-literature/1.0 (metadata enrichment)",
-    }
-    try:
-        resp = _outbound_get(
-            CROSSREF_BASE,
-            params=params,
-            headers=headers,
-            timeout_seconds=timeout_seconds,
-            force_proxy=False,
-            retries=2,
-        )
-        data = resp.json()
-    except Exception:
-        return None
+    data = _crossref_get_json(CROSSREF_BASE, params=params, timeout_seconds=timeout_seconds)
     items = ((data or {}).get("message") or {}).get("items") or []
     want_key = _norm_title_key(t)
     if not want_key:
@@ -895,8 +908,9 @@ def _apply_crossref(rec: dict[str, Any], item: dict[str, Any]) -> None:
     if year:
         rec["pub_date"] = year
 
-    cur_authors = (rec.get("authors") or "").strip()
-    if authors and (not cur_authors or _is_truncated_field(cur_authors) or len(cur_authors) < 4):
+    # Scholar 的作者行永远是缩写+可能截断；Crossref（按 DOI/强标题匹配）是权威来源，
+    # 只要拿到作者就用全名覆盖，保证与文章页一致。
+    if authors:
         rec["authors"] = authors
 
     # 标题被 Scholar 截断时用 Crossref 全称覆盖
@@ -914,8 +928,11 @@ def _enrich_one_record(rec: dict[str, Any]) -> None:
         rec.get("source_url") or "", rec.get("journal") or ""
     )
 
+    # Scholar 记录的作者/期刊几乎总是缩写或截断，一律尝试用 Crossref 补全全名。
+    is_scholar = (rec.get("source") or "") == "scholar"
     need = (
-        _is_truncated_field(rec.get("journal"))
+        is_scholar
+        or _is_truncated_field(rec.get("journal"))
         or _is_truncated_field(rec.get("authors"))
         or _is_truncated_field(rec.get("title"))
         or not (rec.get("volume_issue_pages") or "").strip()
@@ -955,7 +972,8 @@ def _enrich_records_crossref(
         rec
         for rec in records
         if (
-            _is_truncated_field(rec.get("journal"))
+            (rec.get("source") or "") == "scholar"
+            or _is_truncated_field(rec.get("journal"))
             or _is_truncated_field(rec.get("authors"))
             or _is_truncated_field(rec.get("title"))
             or not (rec.get("volume_issue_pages") or "").strip()
@@ -1023,20 +1041,34 @@ _SCHOLAR_TOTAL_RE = re.compile(
     r"(?:找到约|约)\s*([\d,]+)\s*条",
     re.I,
 )
+# 优先从结果统计条解析（避免正文里「约 N 条」误匹配导致 total 虚低、翻页提前停）
+_SCHOLAR_AB_TOTAL_RE = re.compile(
+    r'class="[^"]*gs_ab_mdw[^"]*"[^>]*>\s*(?:About\s+)?([\d,]+)\s+results|'
+    r'class="[^"]*gs_ab_mdw[^"]*"[^>]*>[^<]*(?:找到约|约)\s*([\d,]+)\s*条|'
+    r'id="gs_ab"[^>]*>[\s\S]{0,400}?(?:About\s+)?([\d,]+)\s+results|'
+    r'id="gs_ab"[^>]*>[\s\S]{0,400}?(?:找到约|约)\s*([\d,]+)\s*条',
+    re.I,
+)
 _SCHOLAR_NEXT_RE = re.compile(
-    r'<button[^>]+aria-label="Next"[^>]*>|<a[^>]+aria-label="Next"[^>]*>|'
+    # 兼容中英文与按钮/链接两种形态：aria-label=Next/下一页、下一页文案、
+    # 「下一页」箭头图标类 gs_ico_nav_next、以及 onclick 里带 start= 的按钮。
+    r'aria-label="(?:Next|下一页)"|'
+    r'<button[^>]+aria-label="[^"]*"[^>]*>\s*(?:下一页|Next)|'
+    r'gs_ico_nav_next|'
+    r'onclick="[^"]*[?&]start=\d+|'
     r'<td[^>]*class="[^"]*gs_n[^"]*"[^>]*>.*?(?:Next|下一页)',
     re.I | re.S,
 )
 
 
 def _parse_scholar_total_found(html_text: str) -> int:
-    m = _SCHOLAR_TOTAL_RE.search(html_text or "")
+    text = html_text or ""
+    m = _SCHOLAR_AB_TOTAL_RE.search(text) or _SCHOLAR_TOTAL_RE.search(text)
     if not m:
         return 0
-    raw = m.group(1) or m.group(2) or ""
+    raw = next((g for g in m.groups() if g), "") or ""
     try:
-        return int(raw.replace(",", ""))
+        return int(str(raw).replace(",", ""))
     except (TypeError, ValueError):
         return 0
 
@@ -1098,10 +1130,8 @@ def _scholar_warmup_session(
     仅记录 cookie（拿不到 cookie 也不影响后续，只是更容易被限流）。
     """
     lang = (hl or "zh-CN").strip() or "zh-CN"
-    for warm_url in (
-        f"https://scholar.google.com/?hl={quote_plus(lang)}",
-        f"https://scholar.google.com/scholar_settings?hl={quote_plus(lang)}",
-    ):
+    # 仅访问首页一次拿 cookie；不再连点 settings，减少「异常流量」嫌疑
+    for warm_url in (f"https://scholar.google.com/?hl={quote_plus(lang)}",):
         try:
             resp = _outbound_get(
                 warm_url,
@@ -1109,13 +1139,14 @@ def _scholar_warmup_session(
                 timeout_seconds=timeout_seconds,
                 force_proxy=True,
                 cookies=cookie_map,
-                retries=2,
+                retries=1,
             )
             try:
                 cookie_map.update({k: v for k, v in resp.cookies.items()})
             except Exception:
                 pass
-            time.sleep(1.5 + random.uniform(0.5, 1.5))
+            # 首页停留久一点，像真人先看首页再开始检索
+            time.sleep(3.5 + random.uniform(1.5, 4.0))
         except ScholarRateLimitedError:
             # 首页就被限流：继续尝试，主循环会处理
             break
@@ -1140,9 +1171,9 @@ def search_scholar(
 
     策略（保证数据全面、排序对齐浏览器）：
     - 默认 ``hl=zh-CN`` + ``as_sdt=0,5``，与浏览器结果页参数一致；
-    - **逐页顺序**抓取（每页 10 条），按 ``start`` / ``data-rp`` 保留浏览器顺序；
-    - 每页之间**暂停数秒**（3–6s）降低限流；
-    - 空页允许**重试+退避**；
+    - **逐页顺序**抓取（每页 10 条），按 DOM 顺序保留浏览器排序（仅解析 gs_or 主结果）；
+    - **不以**顶部「约 N 条」估计值作为翻页硬上限（估计值常虚低，会导致 36/34 提前停）；
+    - 每页之间**暂停数秒**降低限流；空页/无下一页才停；
     - 字段截断时用 Crossref（优先 DOI）覆盖补全。
     """
     q = (query or "").strip()
@@ -1212,20 +1243,21 @@ def search_scholar(
     hard_page_cap = 120
     page_no = 0
     start = offset
+    last_html = ""
 
     while len(all_records) < want and page_no < hard_page_cap:
-        if total_found and start >= total_found:
-            break
         # 抓取总时限：超时则优雅停止，返回已抓部分（可点继续检索续抓）
         if time.monotonic() > fetch_deadline:
             break
         if page_no == 0:
-            time.sleep(0.8 + random.uniform(0.4, 1.2))
+            # 首页进入前先像真人一样停顿看一眼（热身后不要立刻连点）
+            time.sleep(2.5 + random.uniform(1.0, 3.0))
         else:
-            # 翻页间隔模拟真人（抬高下限是抗 429 关键），偶尔更长停顿
+            # 翻页间隔模拟真人「读完这页再翻下一页」，抬高下限是抗 429 关键；
+            # 每隔几页再加一段更长的「阅读/走神」停顿，进一步降低机器人特征。
             delay = random.uniform(_SCHOLAR_PAGE_DELAY_MIN, _SCHOLAR_PAGE_DELAY_MAX)
-            if page_no % 5 == 0:
-                delay += random.uniform(4.0, 9.0)
+            if page_no % 4 == 0:
+                delay += random.uniform(15.0, 35.0)
             time.sleep(delay)
         page_no += 1
 
@@ -1282,10 +1314,11 @@ def search_scholar(
                     first_url = url
                 # 编码已在出站处按 UTF-8 设定
                 html_text = resp.text or ""
-                if not total_found:
-                    parsed_total = _parse_scholar_total_found(html_text)
-                    if parsed_total:
-                        total_found = parsed_total
+                last_html = html_text
+                parsed_total = _parse_scholar_total_found(html_text)
+                # 估计值会波动：取较大值，且绝不把它当翻页硬上限
+                if parsed_total > total_found:
+                    total_found = parsed_total
                 body_l = html_text.lower()
                 robot = (
                     "please show you're not a robot" in body_l
@@ -1295,14 +1328,25 @@ def search_scholar(
                     rate_limited = True
 
             if rate_limited:
-                # 429/人机验证：真人此时会等一会再试。对同一页做长退避重试，
-                # 而不是立刻中断整次检索（这正是之前卡在 ~44 条的原因）。
-                if rl_retry < _SCHOLAR_RL_RETRIES and time.monotonic() < fetch_deadline:
+                # 区分两种限流场景：
+                # 1) 初始硬封锁（首页就被拦、一条都没抓到）：此时该 IP 已被标记，
+                #    多等几分钟也不会解封，反而让用户以为「弹不出验证码」。快速探一次
+                #    即转人机验证弹窗，让用户尽快解验证码或换节点。
+                # 2) 翻页途中 429（会话本来在工作，只是被临时限速）：值得像真人一样
+                #    长退避重试，避免卡在 ~44 条。
+                initial_block = (not all_records) and (start == offset)
+                max_rl = 1 if initial_block else _SCHOLAR_RL_RETRIES
+                if rl_retry < max_rl and time.monotonic() < fetch_deadline:
                     rl_retry += 1
-                    wait = min(90.0, 18.0 * rl_retry + random.uniform(4.0, 12.0))
+                    if initial_block:
+                        # 只快速探一次，别让用户干等
+                        wait = random.uniform(6.0, 12.0)
+                    else:
+                        # 遇限流像真人一样等更久再试（渐进退避，最长约 2.5 分钟）
+                        wait = min(150.0, 25.0 * rl_retry + random.uniform(8.0, 20.0))
                     time.sleep(wait)
-                    # 退避后重新热身一次 cookie，进一步降低持续限流
-                    if rl_retry == _SCHOLAR_RL_RETRIES - 1:
+                    # 翻页途中退避到最后一次前重新热身 cookie（初始硬封锁跳过）
+                    if (not initial_block) and rl_retry == _SCHOLAR_RL_RETRIES - 1:
                         try:
                             _scholar_warmup_session(
                                 headers=headers,
@@ -1357,7 +1401,8 @@ def search_scholar(
 
         if not page_records:
             empty_pages += 1
-            if empty_pages >= 2 and not (total_found and start + page_size < total_found):
+            # 连续空页且没有「下一页」→ 结束（不再用虚低的 total_found 硬停）
+            if empty_pages >= 2 or not _scholar_has_next_page(last_html):
                 break
             start += page_size
             continue
@@ -1374,12 +1419,16 @@ def search_scholar(
                 seen.add(url_key)
             if key:
                 seen.add(key)
+            # 绝对位次对齐浏览器翻页序号（续抓时从 start_offset 接上）
+            rec["rank"] = offset + len(all_records)
             all_records.append(rec)
             if len(all_records) >= want:
                 break
         start += page_size
-        # 已取满「想要」或已达到库内命中总数 → 结束
-        if total_found and len(all_records) >= min(want, total_found):
+        # 仅在「取满目标」或「无下一页」时停止；Scholar 顶部「约 N 条」是估计值，不能当硬上限
+        if len(all_records) >= want:
+            break
+        if not _scholar_has_next_page(last_html) and len(page_records) < page_size:
             break
 
     result = all_records[:want]
@@ -1396,6 +1445,9 @@ def search_scholar(
             val = rec.get(key)
             if val and "\ufffd" in str(val):
                 rec[key] = re.sub(r"\ufffd+", "…", str(val)).strip()
+    # 展示用总数：至少不低于已抓条数，避免出现「36/34」这种倒挂
+    if len(result) > total_found:
+        total_found = len(result)
     return result, total_found
 
 
@@ -1442,6 +1494,7 @@ def run_literature_search(
     details: list[dict[str, Any]] = []
     aggregated: list[dict[str, Any]] = []
     captcha_session_id = ""
+    captcha_search_url = ""
     needs_captcha = False
     with ThreadPoolExecutor(max_workers=min(2, len(jobs))) as pool:
         futs = {pool.submit(fn): source for source, fn in jobs.items()}
@@ -1459,6 +1512,8 @@ def run_literature_search(
                 if records:
                     err = f"{err}（已保留本源前 {len(records)} 条；验证后可继续补全翻页）"
                 needs_captcha = True
+                # 真实 Google 验证页地址（供前端在用户浏览器原生打开解验证，同一出口 IP 放行）
+                captcha_search_url = (exc.search_url or exc.captcha_url or "").strip()
                 try:
                     captcha_session_id = create_scholar_captcha_session(
                         captcha_url=exc.captcha_url,
@@ -1508,4 +1563,5 @@ def run_literature_search(
         "needsCaptcha": bool(needs_captcha and captcha_session_id),
         "captchaSessionId": captcha_session_id,
         "captchaSource": "scholar" if captcha_session_id else "",
+        "captchaSearchUrl": captcha_search_url,
     }
