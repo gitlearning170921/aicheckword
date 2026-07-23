@@ -42,6 +42,9 @@ _SCHOLAR_PAGE_DELAY_MIN = 12.0
 _SCHOLAR_PAGE_DELAY_MAX = 26.0
 # 命中 429 后对同一页的最大退避重试次数（更有耐心，别轻易转验证码）
 _SCHOLAR_RL_RETRIES = 4
+# 续抓时：连续 N 页「零新增」（结果全与已抓重叠）→ 判定该出口 IP 对本检索式
+# 已停止提供更多新结果（翻页被 Scholar 折叠/软封锁），停止空转翻页。
+_SCHOLAR_OVERLAP_STOP = 2
 
 
 class ScholarRateLimitedError(RuntimeError):
@@ -57,6 +60,7 @@ class ScholarRateLimitedError(RuntimeError):
         search_url: str = "",
         partial_records: Optional[list[dict[str, Any]]] = None,
         total_found: int = 0,
+        next_offset: int = 0,
     ):
         super().__init__(message)
         self.captcha_url = captcha_url or ""
@@ -65,6 +69,8 @@ class ScholarRateLimitedError(RuntimeError):
         self.search_url = search_url or ""
         self.partial_records = list(partial_records or [])
         self.total_found = int(total_found or 0)
+        # 原始翻页位置（续抓时从这里接着翻，而非去重后的条数）
+        self.next_offset = int(next_offset or 0)
 
 
 class ScholarFetchError(RuntimeError):
@@ -76,10 +82,12 @@ class ScholarFetchError(RuntimeError):
         *,
         partial_records: Optional[list[dict[str, Any]]] = None,
         total_found: int = 0,
+        next_offset: int = 0,
     ):
         super().__init__(message)
         self.partial_records = list(partial_records or [])
         self.total_found = int(total_found or 0)
+        self.next_offset = int(next_offset or 0)
 
 
 def _is_proxy_or_ssl_error(exc: BaseException) -> bool:
@@ -136,6 +144,7 @@ def _raise_rate_limited(
     search_url: str = "",
     partial_records: Optional[list[dict[str, Any]]] = None,
     total_found: int = 0,
+    next_offset: int = 0,
 ) -> None:
     captcha_url = ""
     cookies: dict[str, str] = {}
@@ -162,6 +171,7 @@ def _raise_rate_limited(
         search_url=search_url,
         partial_records=partial_records,
         total_found=total_found,
+        next_offset=next_offset,
     )
 
 
@@ -839,6 +849,25 @@ def _crossref_lookup_by_doi(
     return msg if isinstance(msg, dict) else None
 
 
+def _title_consistent(rec_title: str, item: dict[str, Any]) -> bool:
+    """校验 Crossref 命中项与本记录标题是否为同一篇，避免张冠李戴。
+
+    Scholar 标题常被截断，故除完全相等外，也接受「一方是另一方前缀且足够长」。
+    """
+    rk = _norm_title_key(re.sub(r"\s*[…\.]{1,3}\s*$", "", rec_title or "").strip())
+    titles = item.get("title") or []
+    ck = _norm_title_key(titles[0] if titles else "")
+    if not rk or not ck:
+        return False
+    if rk == ck:
+        return True
+    if len(rk) >= 20 and ck.startswith(rk):
+        return True
+    if len(ck) >= 20 and rk.startswith(ck):
+        return True
+    return False
+
+
 def _crossref_lookup(
     title: str,
     *,
@@ -852,24 +881,20 @@ def _crossref_lookup(
     params = {"query.bibliographic": t, "rows": 5}
     data = _crossref_get_json(CROSSREF_BASE, params=params, timeout_seconds=timeout_seconds)
     items = ((data or {}).get("message") or {}).get("items") or []
-    want_key = _norm_title_key(t)
-    if not want_key:
-        return None
+    # 仅返回标题一致的命中，宁缺毋滥（一致性判断统一走 _title_consistent）
     for it in items:
-        titles = it.get("title") or []
-        cand = titles[0] if titles else ""
-        ck = _norm_title_key(cand)
-        if not ck:
-            continue
-        # 强标题匹配，避免张冠李戴
-        if ck == want_key:
-            return it
-        if len(want_key) >= 16 and (ck.startswith(want_key[:24]) or want_key.startswith(ck[:24])):
+        if _title_consistent(title, it):
             return it
     return None
 
 
-def _apply_crossref(rec: dict[str, Any], item: dict[str, Any]) -> None:
+def _apply_crossref(rec: dict[str, Any], item: dict[str, Any], *, trusted: bool) -> None:
+    """把 Crossref 字段并入记录。
+
+    ``trusted``（按 DOI 命中且标题一致）时才允许覆盖已有的标题/作者（用权威全名/全称）；
+    否则（仅标题检索命中）只**填空**，绝不改动已有 title/authors，避免把别的文献的
+    作者串写进标题这类错位。
+    """
     ctitle = item.get("container-title") or []
     short = item.get("short-container-title") or []
     journal = (ctitle[0] if ctitle else "").strip() or (short[0] if short else "").strip()
@@ -891,44 +916,52 @@ def _apply_crossref(rec: dict[str, Any], item: dict[str, Any]) -> None:
     else:
         vip = page or volume
 
+    # 期刊：为空时填入；仅在可信匹配时才覆盖被截断的旧值
     cur_journal = (rec.get("journal") or "").strip()
-    if journal and (not cur_journal or _is_truncated_field(cur_journal)):
+    if not cur_journal:
+        rec["journal"] = journal or publisher
+    elif trusted and journal and _is_truncated_field(cur_journal):
         rec["journal"] = journal
-    elif not (rec.get("journal") or "").strip() and publisher:
-        rec["journal"] = publisher
 
-    cur_vip = (rec.get("volume_issue_pages") or "").strip()
-    if vip and (not cur_vip or _is_truncated_field(cur_vip)):
+    # 卷/期/页：仅在为空时填入
+    if vip and not (rec.get("volume_issue_pages") or "").strip():
         rec["volume_issue_pages"] = vip
 
-    if doi:
-        rec["doi"] = doi
-    if year and (not (rec.get("year") or "").strip() or _is_truncated_field(rec.get("year"))):
+    # 年份：仅在为空时填入
+    if year and not (rec.get("year") or "").strip():
         rec["year"] = year
-    if year:
+    if year and not (rec.get("pub_date") or "").strip():
         rec["pub_date"] = year
 
-    # Scholar 的作者行永远是缩写+可能截断；Crossref（按 DOI/强标题匹配）是权威来源，
-    # 只要拿到作者就用全名覆盖，保证与文章页一致。
-    if authors:
-        rec["authors"] = authors
-
-    # 标题被 Scholar 截断时用 Crossref 全称覆盖
-    cur_title = (rec.get("title") or "").strip()
-    if full_title and (not cur_title or _is_truncated_field(cur_title)):
-        rec["title"] = full_title
+    if trusted:
+        # 按 DOI 可信匹配：可用权威 DOI、全名作者，并修正被截断的标题
+        if doi:
+            rec["doi"] = doi
+        if authors:
+            rec["authors"] = authors
+        if full_title and _is_truncated_field(rec.get("title")):
+            rec["title"] = full_title
+    else:
+        # 仅标题检索命中：只补空，绝不覆盖已有 title/authors
+        if doi and not (rec.get("doi") or "").strip():
+            rec["doi"] = doi
+        if authors and not (rec.get("authors") or "").strip():
+            rec["authors"] = authors
 
 
 def _enrich_one_record(rec: dict[str, Any]) -> None:
-    """单条补全（供线程池调用）。"""
+    """单条补全（供线程池调用）。
+
+    只在能确认是同一篇文献时才补全：
+    - 记录自带 DOI，或 URL 里提取到 DOI，经 Crossref 反查且**标题一致** → 可信(trusted)；
+    - 否则按标题检索，命中项**标题一致**才用，且仅填空、不覆盖既有 title/authors。
+    """
+    rec_title = (rec.get("title") or "").strip()
     existing_doi = (rec.get("doi") or "").strip()
-    # URL 里的 DOI 可能被 Scholar 截断（如 phy2.1482 实为 phy2.14827），
-    # 仅作查验线索，验证不通过就不落库。
     url_doi = existing_doi or _extract_doi_from_text(
         rec.get("source_url") or "", rec.get("journal") or ""
     )
 
-    # Scholar 记录的作者/期刊几乎总是缩写或截断，一律尝试用 Crossref 补全全名。
     is_scholar = (rec.get("source") or "") == "scholar"
     need = (
         is_scholar
@@ -942,16 +975,23 @@ def _enrich_one_record(rec: dict[str, Any]) -> None:
         return
 
     item = None
+    trusted = False
+    # 1) 按 DOI 反查（记录自带或 URL 提取），必须标题一致才采信，杜绝截断/错误 DOI 张冠李戴
     if url_doi:
-        item = _crossref_lookup_by_doi(url_doi, timeout_seconds=8)
-        if item is not None and not existing_doi:
-            # DOI 经 Crossref 校验通过，可信
-            rec["doi"] = url_doi
-    # DOI 查不到（或本就截断/缺失）时按标题回查，Crossref 命中会写回权威 DOI
+        cand = _crossref_lookup_by_doi(url_doi, timeout_seconds=8)
+        if cand is not None and (not rec_title or _title_consistent(rec_title, cand)):
+            item = cand
+            trusted = True
+            if not existing_doi:
+                rec["doi"] = url_doi
+    # 2) DOI 无果时按标题检索（_crossref_lookup 内部已做标题一致校验）
     if item is None:
-        item = _crossref_lookup(rec.get("title") or "", timeout_seconds=8)
+        cand = _crossref_lookup(rec_title, timeout_seconds=8)
+        if cand is not None:
+            item = cand
+            trusted = False
     if item:
-        _apply_crossref(rec, item)
+        _apply_crossref(rec, item, trusted=trusted)
 
 
 def _enrich_records_crossref(
@@ -1166,6 +1206,7 @@ def search_scholar(
     start_offset: int = 0,
     enrich: bool = True,
     hl: str = "zh-CN",
+    prior_keys: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """返回 (records, total_found)。
 
@@ -1178,7 +1219,7 @@ def search_scholar(
     """
     q = (query or "").strip()
     if not q:
-        return [], 0
+        return [], 0, int(start_offset or 0)
     want = max(1, min(500, int(max_results)))
     page_size = _SCHOLAR_PAGE_SIZE
     offset = max(0, int(start_offset or 0))
@@ -1236,13 +1277,19 @@ def search_scholar(
     fetch_deadline = time.monotonic() + _SCHOLAR_FETCH_BUDGET_S
 
     all_records: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    # 续抓：用「已抓记录的 key」预置 seen，使本次翻页跳过与已抓重叠的结果，
+    # 只把「真正新增」的记录计入，并据此判断该 IP 是否还在提供新结果。
+    seen: set[str] = set(k for k in (prior_keys or set()) if k)
     total_found = 0
     first_url = ""
     empty_pages = 0
+    overlap_streak = 0
     hard_page_cap = 120
     page_no = 0
     start = offset
+    # 「原始翻页位置」：续抓必须用它（而非去重后的条数）作为下次 start，
+    # 否则去重会让 offset 落回已抓过的页 → 全被去重 → 误判「没有更多」。
+    next_start = offset
     last_html = ""
 
     while len(all_records) < want and page_no < hard_page_cap:
@@ -1301,11 +1348,13 @@ def search_scholar(
                         f"可稍后点继续检索）：{exc}",
                         partial_records=all_records,
                         total_found=total_found,
+                        next_offset=start,
                     ) from exc
                 raise ScholarFetchError(
                     f"Scholar 请求失败（已重试）：{exc}",
                     partial_records=[],
                     total_found=total_found,
+                    next_offset=start,
                 ) from exc
 
             html_text = ""
@@ -1371,6 +1420,8 @@ def search_scholar(
                     # 复用原始验证码页信息（captcha_url/cookies/html），并补上已抓部分
                     captured_rl.partial_records = list(all_records)
                     captured_rl.total_found = total_found
+                    # 续抓从「当前被拦的原始页位置」接上，而非去重后的条数
+                    captured_rl.next_offset = start
                     if not captured_rl.search_url:
                         captured_rl.search_url = first_url
                     raise captured_rl
@@ -1379,6 +1430,7 @@ def search_scholar(
                     search_url=first_url or url,
                     partial_records=all_records,
                     total_found=total_found,
+                    next_offset=start,
                 )
 
             page_records = _parse_scholar_entries(html_text, max_results=page_size * 3)
@@ -1404,10 +1456,12 @@ def search_scholar(
             # 连续空页且没有「下一页」→ 结束（不再用虚低的 total_found 硬停）
             if empty_pages >= 2 or not _scholar_has_next_page(last_html):
                 break
+            # 空页不推进 next_start：续抓仍从「上次真正有新增处」接上，避免偏移空转
             start += page_size
             continue
         empty_pages = 0
 
+        gained = 0
         for rec in page_records:
             key = re.sub(r"\W+", "", (rec.get("title") or "").lower())
             url_key = (rec.get("source_url") or "").strip().lower()
@@ -1422,9 +1476,21 @@ def search_scholar(
             # 绝对位次对齐浏览器翻页序号（续抓时从 start_offset 接上）
             rec["rank"] = offset + len(all_records)
             all_records.append(rec)
+            gained += 1
             if len(all_records) >= want:
                 break
         start += page_size
+        if gained > 0:
+            # 有真正新增：推进「下一原始页位置」，续抓从这里接上
+            next_start = start
+            overlap_streak = 0
+        else:
+            # 本页结果全部与已抓重叠：不推进 next_start（否则续抓偏移会空转到无结果区，
+            # 表现为「序号一直加、记录不增加」）。连续多页零新增 → 该出口 IP 已不再
+            # 提供更多新结果（翻页被折叠/软封锁），停止翻页。
+            overlap_streak += 1
+            if overlap_streak >= _SCHOLAR_OVERLAP_STOP:
+                break
         # 仅在「取满目标」或「无下一页」时停止；Scholar 顶部「约 N 条」是估计值，不能当硬上限
         if len(all_records) >= want:
             break
@@ -1448,7 +1514,7 @@ def search_scholar(
     # 展示用总数：至少不低于已抓条数，避免出现「36/34」这种倒挂
     if len(result) > total_found:
         total_found = len(result)
-    return result, total_found
+    return result, total_found, next_start
 
 
 def run_literature_search(
@@ -1462,6 +1528,7 @@ def run_literature_search(
     scholar_sort_by: str = "relevance",
     scholar_start_offset: int = 0,
     scholar_hl: str = "zh-CN",
+    scholar_prior_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     from config.cursor_overrides import get_llm_http_proxy
     from src.core.scholar_captcha import create_scholar_captcha_session
@@ -1471,15 +1538,19 @@ def run_literature_search(
     if not srcs:
         raise ValueError("sources 至少包含 pubmed 或 scholar 之一")
 
-    jobs: dict[str, Callable[[], tuple[list[dict[str, Any]], int]]] = {}
+    jobs: dict[str, Callable[[], tuple[list[dict[str, Any]], int, int]]] = {}
     if "pubmed" in srcs:
-        jobs["pubmed"] = lambda: search_pubmed(
-            query=query,
-            start_year=start_year,
-            end_year=end_year,
-            max_results=max_results_per_source,
+        jobs["pubmed"] = lambda: (
+            *search_pubmed(
+                query=query,
+                start_year=start_year,
+                end_year=end_year,
+                max_results=max_results_per_source,
+            ),
+            0,  # pubmed 不用翻页续抓，nextOffset 恒为 0
         )
     if "scholar" in srcs:
+        _prior_keyset = set(str(k).strip() for k in (scholar_prior_keys or []) if str(k).strip())
         jobs["scholar"] = lambda: search_scholar(
             query=query,
             start_year=start_year,
@@ -1489,6 +1560,7 @@ def run_literature_search(
             sort_by=scholar_sort_by,
             start_offset=scholar_start_offset,
             hl=(scholar_hl or "zh-CN").strip() or "zh-CN",
+            prior_keys=_prior_keyset,
         )
 
     details: list[dict[str, Any]] = []
@@ -1502,12 +1574,14 @@ def run_literature_search(
             source = futs[fut]
             t0 = time.perf_counter()
             total_found = 0
+            next_offset = 0
             try:
-                records, total_found = fut.result()
+                records, total_found, next_offset = fut.result()
                 err = ""
             except ScholarRateLimitedError as exc:
                 records = list(getattr(exc, "partial_records", None) or [])
                 total_found = int(getattr(exc, "total_found", 0) or 0)
+                next_offset = int(getattr(exc, "next_offset", 0) or 0)
                 err = str(exc)
                 if records:
                     err = f"{err}（已保留本源前 {len(records)} 条；验证后可继续补全翻页）"
@@ -1526,6 +1600,7 @@ def run_literature_search(
             except ScholarFetchError as exc:
                 records = list(getattr(exc, "partial_records", None) or [])
                 total_found = int(getattr(exc, "total_found", 0) or 0)
+                next_offset = int(getattr(exc, "next_offset", 0) or 0)
                 err = str(exc)
                 if records:
                     try:
@@ -1547,6 +1622,7 @@ def run_literature_search(
                     "elapsed_ms": int((time.perf_counter() - t0) * 1000),
                     "totalFound": total_found,
                     "fetched": len(records),
+                    "nextOffset": int(next_offset or 0),
                     "needsCaptcha": bool(source == "scholar" and needs_captcha and captcha_session_id),
                     "captchaSessionId": captcha_session_id if source == "scholar" else "",
                 }

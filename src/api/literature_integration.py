@@ -25,6 +25,11 @@ class LiteratureSearchRequest(BaseModel):
         default=0,
         description="Scholar 翻页起点（验证后继续检索时传入已抓条数，避免从 0 重抓）",
     )
+    scholar_prior_keys: Optional[List[str]] = Field(
+        default=None,
+        description="续抓时已抓 Scholar 记录的去重 key（title/url 归一化）；用于跳过重叠、"
+        "只计真正新增，并据此判断该出口 IP 是否已停止提供更多结果",
+    )
 
 
 @router.post("/search")
@@ -63,6 +68,7 @@ def literature_search(body: LiteratureSearchRequest) -> dict[str, Any]:
             scholar_captcha_session_id=(body.scholar_captcha_session_id or "").strip(),
             scholar_sort_by=(body.scholar_sort_by or "relevance").strip() or "relevance",
             scholar_start_offset=start_off,
+            scholar_prior_keys=list(body.scholar_prior_keys or []),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
