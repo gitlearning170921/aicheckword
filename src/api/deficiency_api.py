@@ -15,10 +15,14 @@ from src.core.deficiency_store import (
     add_deficiency_asset,
     archive_deficiency_record,
     create_deficiency_record,
+    create_deficiency_records_batch,
+    deficiency_import_fingerprint,
+    find_duplicates_by_opinion,
     get_deficiency_record,
     list_deficiency_assets,
     list_deficiency_records,
     update_deficiency_record,
+    upsert_deficiency_records_batch,
 )
 from src.core.document_loader import load_and_split
 
@@ -41,6 +45,7 @@ class DeficiencyCreateBody(BaseModel):
     collection: str = "regulations"
     linked_company_project_id: str = ""
     linked_project_id: Optional[int] = None
+    project_name: str = ""
     registration_country: str = ""
     registration_category: str = ""
     opinion_text: str = ""
@@ -51,12 +56,15 @@ class DeficiencyCreateBody(BaseModel):
     completed_on: Optional[str] = None
     deficiency_type: str = "registration_review"
     deficiency_source: str = ""
+    import_batch_id: str = ""
+    excel_row_index: Optional[int] = None
 
 
 class DeficiencyUpdateBody(BaseModel):
     collection: str = "regulations"
     linked_company_project_id: Optional[str] = None
     linked_project_id: Optional[int] = None
+    project_name: Optional[str] = None
     registration_country: Optional[str] = None
     registration_category: Optional[str] = None
     opinion_text: Optional[str] = None
@@ -70,6 +78,15 @@ class DeficiencyUpdateBody(BaseModel):
     status: Optional[str] = None
 
 
+class DeficiencyBatchBody(BaseModel):
+    collection: str = "regulations"
+    records: List[DeficiencyCreateBody] = []
+    # create=仅新增（旧行为）；upsert=指纹命中则更新（Excel 增量导入）
+    mode: str = "create"
+    # 导入开始时系统指纹快照；传入则只与该快照判重（同一次 Excel 内不互相更新）
+    match_fingerprints: Optional[Dict[str, int]] = None
+
+
 @router.post("/records")
 def create_record(req: Request, body: DeficiencyCreateBody):
     collection = _resolve_collection(req, body.collection)
@@ -81,6 +98,82 @@ def create_record(req: Request, body: DeficiencyCreateBody):
         raise HTTPException(status_code=500, detail=str(e)) from e
     row = get_deficiency_record(rid)
     return {"ok": True, "data": row}
+
+
+@router.post("/records/batch")
+def create_records_batch(req: Request, body: DeficiencyBatchBody):
+    """批量创建/增量更新发补记录（供 Excel 导入）。"""
+    collection = _resolve_collection(req, body.collection)
+    items: List[Dict[str, Any]] = []
+    for r in body.records or []:
+        d = r.model_dump() if hasattr(r, "model_dump") else dict(r)
+        d["collection"] = collection
+        items.append(d)
+    if not items:
+        raise HTTPException(status_code=400, detail="records 不能为空")
+    if len(items) > 2000:
+        raise HTTPException(status_code=400, detail="单次最多导入 2000 条")
+    mode = str(body.mode or "create").strip().lower() or "create"
+    try:
+        if mode == "upsert":
+            result = upsert_deficiency_records_batch(
+                items,
+                match_index=body.match_fingerprints,
+                # 覆盖模式下本批新增也进入判重，同文件相同键不会再插一条
+                grow_match_index=True,
+            )
+        else:
+            raw = create_deficiency_records_batch(items)
+            result = {
+                "created": int(raw.get("created") or 0),
+                "updated": 0,
+                "failed": raw.get("failed") or [],
+                "results": [],
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {
+        "ok": True,
+        "data": {
+            "created": int(result.get("created") or 0),
+            "updated": int(result.get("updated") or 0),
+            "failed": result.get("failed") or [],
+            "results": result.get("results") or [],
+            "collection": collection,
+            "mode": mode,
+        },
+    }
+
+
+@router.get("/records/import-fingerprints")
+def list_import_fingerprints(req: Request, collection: str = Query("regulations")):
+    """返回 active 记录的导入指纹索引，供预览分类 new/update。"""
+    collection = _resolve_collection(req, collection)
+    from src.core.deficiency_store import _load_active_fingerprint_index
+
+    index = _load_active_fingerprint_index(collection)
+    # JSON key 必须是 str
+    data = {str(k): int(v) for k, v in (index or {}).items()}
+    return {"ok": True, "data": data, "collection": collection, "count": len(data)}
+
+
+@router.get("/records/duplicates")
+def list_opinion_duplicates(
+    req: Request,
+    opinion_text: str = Query(""),
+    collection: str = Query("regulations"),
+    exclude_id: Optional[int] = Query(None),
+    limit: int = Query(50),
+):
+    """按发补意见查重，并按导入批次汇总（供新增前确认）。"""
+    collection = _resolve_collection(req, collection)
+    data = find_duplicates_by_opinion(
+        collection,
+        opinion_text,
+        exclude_id=exclude_id,
+        limit=limit,
+    )
+    return {"ok": True, "data": data, "collection": collection}
 
 
 @router.get("/records")
