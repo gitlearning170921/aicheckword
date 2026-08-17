@@ -7,7 +7,7 @@
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 import chromadb
 from .langchain_compat import Document
@@ -27,6 +27,15 @@ from .db import (
     delete_knowledge_docs_by_file,
     delete_knowledge_docs_by_case_id,
     get_project_case_file_names,
+    migrate_knowledge_docs_category_by_filenames,
+    list_knowledge_file_names_for_internal_control_migration,
+    is_schema_migration_done,
+    mark_schema_migration_done,
+    MIGRATION_YY_IW_020_INTERNAL_CONTROL,
+)
+from .knowledge_categories import (
+    AUDIT_EXCLUDED_CATEGORIES,
+    is_audit_excluded_category,
 )
 
 
@@ -330,8 +339,54 @@ class KnowledgeBase:
         chunks = load_and_split_directory(dir_path)
         return self.add_documents(chunks, file_name=str(dir_path), category=category)
 
-    def search(self, query: str, top_k: int = 10) -> List[Document]:
-        return self.vectorstore.similarity_search(query, k=top_k)
+    def _filter_excluded_categories(
+        self,
+        docs: List[Document],
+        exclude_categories: Optional[FrozenSet[str]] = None,
+    ) -> List[Document]:
+        if self.project_id or self.is_checkpoint:
+            return docs
+        excl = AUDIT_EXCLUDED_CATEGORIES if exclude_categories is None else exclude_categories
+        if not excl:
+            return docs
+        excl_l = {str(x).strip().lower() for x in excl}
+        out = []
+        for d in docs or []:
+            md = getattr(d, "metadata", None) or {}
+            cat = str(md.get("category") or "").strip().lower()
+            if cat and cat in excl_l:
+                continue
+            out.append(d)
+        return out
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        *,
+        exclude_categories: Optional[FrozenSet[str]] = None,
+        include_internal_control: bool = False,
+    ) -> List[Document]:
+        """主库默认排除 internal_control，避免进入审核/生成链路。"""
+        if self.project_id or self.is_checkpoint or include_internal_control:
+            return self.vectorstore.similarity_search(query, k=top_k)
+        excl = AUDIT_EXCLUDED_CATEGORIES if exclude_categories is None else exclude_categories
+        # 多取一些再过滤，避免排除后不足 top_k
+        fetch_k = min(max(int(top_k) * 3, int(top_k) + 8), max(int(top_k) * 5, 40))
+        try:
+            # Chroma $nin（部分版本支持）
+            if excl:
+                flt = {"category": {"$nin": list(excl)}}
+                try:
+                    docs = self.vectorstore.similarity_search(query, k=top_k, filter=flt)
+                    if docs is not None:
+                        return docs[:top_k]
+                except Exception:
+                    pass
+            pool = self.vectorstore.similarity_search(query, k=fetch_k)
+        except Exception:
+            pool = self.vectorstore.similarity_search(query, k=top_k)
+        return self._filter_excluded_categories(pool, excl)[:top_k]
 
     def search_by_category(
         self, query: str, category: str, top_k: int = 10, case_id: Optional[int] = None
@@ -339,18 +394,25 @@ class KnowledgeBase:
         """按分类检索（如 category='glossary' 检索词条）。仅对主知识库生效；项目库/审核点库无 category 过滤时退回普通检索。
 
         case_id 非空时（常用于 category=project_case）：尽量按 metadata.case_id 过滤；底层不支持时回退为扩大检索后内存过滤。
+        显式按 internal_control 检索时允许命中（文控等场景）。
         """
         if self.project_id or self.is_checkpoint:
             return self.vectorstore.similarity_search(query, k=top_k)
+        cat = (category or "").strip()
         if case_id is None:
             try:
-                return self.vectorstore.similarity_search(query, k=top_k, filter={"category": category})
+                return self.vectorstore.similarity_search(query, k=top_k, filter={"category": cat})
             except TypeError:
-                return self.vectorstore.similarity_search(query, k=top_k)
+                pool = self.vectorstore.similarity_search(query, k=min(max(top_k * 3, 24), 80))
+                return [
+                    d
+                    for d in pool
+                    if str((getattr(d, "metadata", None) or {}).get("category") or "") == cat
+                ][:top_k]
 
         def _match_case(doc: Document) -> bool:
             md = getattr(doc, "metadata", None) or {}
-            if str(md.get("category") or "") != str(category):
+            if str(md.get("category") or "") != str(cat):
                 return False
             try:
                 return int(md.get("case_id") or -1) == int(case_id)
@@ -360,8 +422,8 @@ class KnowledgeBase:
         over_k = min(max(int(top_k) * 8, 24), 120)
         # 1) 复合 where（部分 Chroma 版本支持）
         for flt in (
-            {"$and": [{"category": category}, {"case_id": int(case_id)}]},
-            {"category": category, "case_id": int(case_id)},
+            {"$and": [{"category": cat}, {"case_id": int(case_id)}]},
+            {"category": cat, "case_id": int(case_id)},
         ):
             try:
                 docs = self.vectorstore.similarity_search(query, k=top_k, filter=flt)
@@ -371,7 +433,7 @@ class KnowledgeBase:
                 continue
         # 2) 仅 category 过滤后内存筛 case_id
         try:
-            pool = self.vectorstore.similarity_search(query, k=over_k, filter={"category": category})
+            pool = self.vectorstore.similarity_search(query, k=over_k, filter={"category": cat})
         except TypeError:
             pool = self.vectorstore.similarity_search(query, k=over_k)
         out = [d for d in pool if _match_case(d)][:top_k]
@@ -389,8 +451,84 @@ class KnowledgeBase:
                 break
         return out[:top_k]
 
-    def search_with_scores(self, query: str, top_k: int = 10):
-        return self.vectorstore.similarity_search_with_relevance_scores(query, k=top_k)
+    def search_with_scores(
+        self,
+        query: str,
+        top_k: int = 10,
+        *,
+        include_internal_control: bool = False,
+    ):
+        if self.project_id or self.is_checkpoint or include_internal_control:
+            return self.vectorstore.similarity_search_with_relevance_scores(query, k=top_k)
+        fetch_k = min(max(int(top_k) * 3, int(top_k) + 8), 40)
+        pairs = self.vectorstore.similarity_search_with_relevance_scores(query, k=fetch_k)
+        out = []
+        for doc, score in pairs or []:
+            md = getattr(doc, "metadata", None) or {}
+            if is_audit_excluded_category(md.get("category")):
+                continue
+            out.append((doc, score))
+            if len(out) >= top_k:
+                break
+        return out
+
+    def migrate_yy_iw_020_to_internal_control(self) -> Dict[str, Any]:
+        """将已入库的 YY-IW-020 / 医疗软件质量合规管理制度 归入 internal_control（MySQL + Chroma）。
+
+        每个 collection 只执行一次：完成后写入 schema_migrations，后续启动直接跳过。
+        """
+        if self.project_id or self.is_checkpoint:
+            return {"ok": False, "message": "仅主知识库可迁移", "files": [], "mysql_rows": 0, "chroma_ids": 0}
+        coll = self.collection_name
+        if is_schema_migration_done(MIGRATION_YY_IW_020_INTERNAL_CONTROL, coll):
+            return {"ok": True, "message": "已迁移过，跳过", "files": [], "mysql_rows": 0, "chroma_ids": 0, "skipped": True}
+        names = list_knowledge_file_names_for_internal_control_migration(coll) or []
+        mysql_rows = 0
+        chroma_ids = 0
+        if names:
+            mysql_rows = migrate_knowledge_docs_category_by_filenames(
+                coll, names, new_category="internal_control"
+            )
+            try:
+                col = self.vectorstore._collection
+                for fn in names:
+                    try:
+                        got = col.get(where={"source_file": fn}, include=["metadatas"])
+                    except Exception:
+                        try:
+                            got = col.get(where={"source_file": {"$eq": fn}}, include=["metadatas"])
+                        except Exception:
+                            got = None
+                    if not got:
+                        continue
+                    ids = list(got.get("ids") or [])
+                    metas = list(got.get("metadatas") or [])
+                    if not ids:
+                        continue
+                    new_metas = []
+                    for m in metas:
+                        md = dict(m or {})
+                        md["category"] = "internal_control"
+                        new_metas.append(md)
+                    try:
+                        col.update(ids=ids, metadatas=new_metas)
+                        chroma_ids += len(ids)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        # 无论是否有文件可迁，都标记完成，避免每次重启重复扫描
+        try:
+            mark_schema_migration_done(MIGRATION_YY_IW_020_INTERNAL_CONTROL, coll)
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "message": (f"已迁移 {len(names)} 个文件" if names else "无需迁移（已标记完成）"),
+            "files": names,
+            "mysql_rows": int(mysql_rows or 0),
+            "chroma_ids": int(chroma_ids or 0),
+        }
 
     def get_collection_stats(self) -> dict:
         client = _get_chroma_client()
@@ -434,20 +572,36 @@ class KnowledgeBase:
 
     def delete_documents_by_file_name(self, file_name: str, case_id: Optional[int] = None) -> None:
         """按文件名删除该知识库下对应文档的所有块（Chroma + MySQL），用于覆盖前清理。
-        当 case_id 有值时仅删除该案例下的记录（项目案例覆盖时用）。"""
+        当 case_id 有值时仅删除该案例下的记录（项目案例覆盖时用）。
+        同一文件可多次训练：先删旧块再写入，即最新版覆盖旧版。"""
+        fn = (file_name or "").strip()
+        if not fn:
+            return
+        # Chroma metadata 的 case_id 在不同版本可能是 int/str/float，多试几种 where
         try:
+            col = self.vectorstore._collection
             if case_id is not None:
-                self.vectorstore._collection.delete(where={"source_file": file_name, "case_id": case_id})
+                cid = int(case_id)
+                for where in (
+                    {"$and": [{"source_file": fn}, {"case_id": cid}]},
+                    {"$and": [{"source_file": fn}, {"case_id": str(cid)}]},
+                    {"source_file": fn, "case_id": cid},
+                    {"source_file": fn, "case_id": str(cid)},
+                ):
+                    try:
+                        col.delete(where=where)
+                    except Exception:
+                        continue
             else:
-                self.vectorstore._collection.delete(where={"source_file": file_name})
+                col.delete(where={"source_file": fn})
         except Exception:
             pass
         if self.project_id:
-            delete_project_knowledge_docs_by_file(self.project_id, file_name)
+            delete_project_knowledge_docs_by_file(self.project_id, fn)
         elif self.is_checkpoint:
-            delete_checkpoint_docs_by_file(self.base_collection, file_name)
+            delete_checkpoint_docs_by_file(self.base_collection, fn)
         else:
-            delete_knowledge_docs_by_file(self.collection_name, file_name, case_id=case_id)
+            delete_knowledge_docs_by_file(self.collection_name, fn, case_id=case_id)
 
     def delete_documents_by_case_id(self, case_id: int) -> None:
         """删除主知识库中某项目案例（project_cases）下的全部向量与 MySQL 块。仅用于 category=project_case 的入库数据。"""

@@ -587,6 +587,10 @@ def init_agent():
     if "agent" not in st.session_state or st.session_state.get("_col") != collection:
         st.session_state.agent = ReviewAgent(collection)
         st.session_state._col = collection
+        try:
+            st.session_state.agent.kb.migrate_yy_iw_020_to_internal_control()
+        except Exception:
+            pass
     return st.session_state.agent
 
 
@@ -1526,8 +1530,14 @@ def _render_loading_overlay():
 
 
 # 文件分类：界面显示 <-> 数据库/代码
-CATEGORY_LABELS = {"regulation": "法规文件", "program": "程序文件", "project_case": "项目案例文件", "glossary": "词条"}
-CATEGORY_VALUES = {"法规文件": "regulation", "程序文件": "program", "项目案例文件": "project_case", "词条": "glossary"}
+CATEGORY_LABELS = {
+    "regulation": "法规文件",
+    "program": "程序文件",
+    "project_case": "项目案例文件",
+    "glossary": "词条",
+    "internal_control": "内部管控文件",
+}
+CATEGORY_VALUES = {v: k for k, v in CATEGORY_LABELS.items()}
 
 _TRAIN_CHUNKED_JOB_KEY = "_train_embed_chunked_job"
 
@@ -1934,10 +1944,10 @@ def render_step1_page():
             and st.session_state.get("train_queue_source") == "directory"
             and st.session_state.get("train_queue_index", 0) < len(st.session_state["train_queue"])
         ):
-            st.info("当前正在从目录训练，请点击上方 **「从目录训练」** 标签页查看进度。")
+            st.info("当前正在从目录训练，进度见下方「从服务器目录训练」。")
         file_category_label = st.selectbox(
             "文件分类",
-            ["法规文件", "程序文件", "项目案例文件", "词条"],
+            ["法规文件", "程序文件", "项目案例文件", "词条", "内部管控文件"],
             key="train_upload_category",
             help="选择本批上传文件的类型，用于知识库分类与统计",
         )
@@ -2575,7 +2585,7 @@ def render_step1_page():
 
         file_category_label_dir = st.selectbox(
             "文件分类",
-            ["法规文件", "程序文件", "项目案例文件", "词条"],
+            ["法规文件", "程序文件", "项目案例文件", "词条", "内部管控文件"],
             key="train_dir_category",
             help="选择本目录下文件的类型",
         )
@@ -2863,7 +2873,7 @@ def render_step1_page():
         _kb_stats = _cached_knowledge_stats(collection)
         reg_count = _kb_stats.get("total_chunks", 0)
         if reg_count == 0:
-            st.warning("⚠️ 法规知识库为空，请先在「上传文件训练」或「从目录训练」中导入法规/程序文件。")
+            st.warning("⚠️ 法规知识库为空，请先在「文件训练」中导入法规/程序文件。")
 
         # 生成审核点提示词配置：默认填充已有（数据库或内置），支持修改；仅本次生效，也可保存为默认
         with st.expander("📝 生成审核点提示词（可修改，生成时使用当前内容；可保存为默认）", expanded=False):
@@ -3031,12 +3041,21 @@ def render_step1_page():
                         )
                     st.code(traceback.format_exc(), language="text")
 
-    _step1_tab_labels = ["📤 上传文件训练", "📂 从目录训练", "📝 生成审核点"]
+
+    def _step1_tab_files():
+        """文件训练：上传 + 目录。"""
+        _step1_tab_upload()
+        st.markdown("---")
+        st.subheader("从服务器目录训练")
+        st.caption("目录须为本机/文档服务可访问路径；分类与上传训练相同。")
+        _step1_tab_directory()
+
+    _step1_tab_labels = ["📤 文件训练", "📝 生成审核点"]
     _st_run_tabs_or_pick(
         _step1_tab_labels,
         radio_label="第一步子功能",
         session_key="step1_tabs",
-        tab_bodies=[_step1_tab_upload, _step1_tab_directory, _step1_tab_generate],
+        tab_bodies=[_step1_tab_files, _step1_tab_generate],
     )
 
 
@@ -4318,46 +4337,16 @@ def render_step3_page():
                     st.info(
                         f"已匹配到过往项目案例：**{matched_case.get('case_name')}**"
                         f"（产品名称：{matched_case.get('product_name') or '—'}）"
-                        f"，案例经验将纳入审核上下文。"
+                        f"，案例通用经验将纳入审核上下文（版本信息不以案例为准）。"
                     )
-                    # 将案例元数据注入 review_context
+                    # 将案例元数据注入 review_context（与 integration 共用 build_case_context_text）
                     if review_context is None:
                         review_context = {}
-                    _case_lang = matched_case.get("document_language") or ""
-                    _case_lang_label = DOC_LANG_VALUE_TO_LABEL.get(_case_lang, "不指定")
-                    case_ctx = (
-                        f"\n\n【过往项目案例参考】\n"
-                        f"案例文档语言：{_case_lang_label}\n"
-                        f"案例名称：{matched_case.get('case_name', '')}\n"
-                        f"案例名称（英文）：{matched_case.get('case_name_en', '')}\n"
-                        f"产品名称：{matched_case.get('product_name', '')}\n"
-                        f"产品名称（英文）：{matched_case.get('product_name_en', '')}\n"
-                        f"注册国家：{matched_case.get('registration_country', '')}\n"
-                        f"注册国家（英文）：{matched_case.get('registration_country_en', '')}\n"
-                        f"注册类别：{matched_case.get('registration_type', '')}\n"
-                        f"注册组成：{matched_case.get('registration_component', '')}\n"
-                        f"项目形态：{matched_case.get('project_form', '')}\n"
+                    from src.core.audit_review_context import build_case_context_text
+
+                    review_context["case_context_text"] = build_case_context_text(
+                        collection, matched_case
                     )
-                    scope = (matched_case.get("scope_of_application") or "").strip()
-                    if scope:
-                        case_ctx += f"产品适用范围：{scope}\n"
-                    # 文档内容完整性：从历史案例库提取章节结构，供审核时对比待审文档是否缺章
-                    try:
-                        case_chunks = get_knowledge_docs_by_case_id(collection, matched_case["id"], limit=500)
-                        if case_chunks:
-                            outline = extract_section_outline_from_texts([c.get("content") or "" for c in case_chunks])
-                            if outline.strip():
-                                case_ctx += "\n【历史案例文档章节参考】\n以下为案例库中该案例文档的章节结构，请据此检查待审文档是否具备应有章节；缺失的章节须作为「文档内容完整性」审核点列出，并指明应补充的章节名称或位置。\n\n" + outline.strip() + "\n"
-                                # P-4.6（不改顺序）：章节参考段落后强化逐条对照要求
-                                case_ctx += (
-                                    "\n**完整性审核执行要求**：请按上表章节**逐条**在待审文档中查找对应或等价章节；"
-                                    "每发现一处缺失或标题/层级明显不一致，单列一条审核点，不得合并为多处以「若干章节缺失」一笔带过。"
-                                    "location 须写清缺失章节名称或待审文档中应出现的位置。\n"
-                                )
-                    except Exception:
-                        pass
-                    case_ctx += "\n请参考上述案例经验审核当前文档，如有类似问题请重点关注。"
-                    review_context["case_context_text"] = case_ctx
                 else:
                     st.caption("未匹配到过往项目案例，将按通用知识库审核。")
 

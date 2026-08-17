@@ -100,7 +100,8 @@ def _run_train_job(job_id: str) -> None:
                 )
                 continue
             try:
-                if display_name in existing and overwrite_mode == "overwrite":
+                was_existing = display_name in existing
+                if was_existing and overwrite_mode == "overwrite":
                     try:
                         agent.kb.delete_documents_by_file_name(display_name)
                     except Exception:
@@ -134,6 +135,7 @@ def _run_train_job(job_id: str) -> None:
                         "status": "success",
                         "original_filename": display_name,
                         "chunks_added": int(n or 0),
+                        "overwritten": bool(was_existing and overwrite_mode == "overwrite"),
                     }
                 )
             except Exception as exc:

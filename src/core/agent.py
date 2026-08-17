@@ -14,6 +14,7 @@ from .checklist_generator import ChecklistGenerator
 from .db import (
     get_project,
     get_knowledge_stats,
+    get_knowledge_stats_by_category,
     get_checkpoint_stats,
     get_project_knowledge_text,
     update_project_basic_info,
@@ -535,20 +536,29 @@ class ReviewAgent:
         reg_stats = get_knowledge_stats(self.collection_name)
         cp_stats = get_checkpoint_stats(self.collection_name)
         fb_stats = get_knowledge_stats(self.audit_feedback_collection)
+        by_cat = get_knowledge_stats_by_category(self.collection_name) or {}
         return {
             "agent_name": "注册文档审核Agent",
             "collection_name": self.collection_name,
             "regulations_kb": {
                 "collection_name": self.collection_name,
                 "document_count": reg_stats.get("total_chunks", 0),
+                "file_count": reg_stats.get("total_files", 0),
             },
             "checkpoints_kb": {
                 "collection_name": self.checkpoint_collection,
                 "document_count": cp_stats.get("total_chunks", 0),
+                "file_count": cp_stats.get("total_files", 0),
             },
             "audit_feedback_kb": {
                 "collection_name": self.audit_feedback_collection,
                 "document_count": fb_stats.get("total_chunks", 0),
+                "file_count": fb_stats.get("total_files", 0),
+            },
+            "knowledge_stats": {
+                "total_files": by_cat.get("total_files", 0),
+                "total_chunks": by_cat.get("total_chunks", 0),
+                "by_category": by_cat.get("by_category") or {},
             },
             "capabilities": [
                 "第一步：法规/程序/案例训练 + 生成审核点",

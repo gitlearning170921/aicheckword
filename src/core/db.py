@@ -264,6 +264,29 @@ def _init_db_schema_locked() -> None:
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """)
                 cur.execute("""
+                    CREATE TABLE IF NOT EXISTS project_kb_sync_status (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        collection VARCHAR(128) NOT NULL DEFAULT '',
+                        project_id VARCHAR(64) NOT NULL DEFAULT '',
+                        document_number VARCHAR(128) NOT NULL DEFAULT '',
+                        normalized_document_number VARCHAR(128) NOT NULL DEFAULT '',
+                        document_version VARCHAR(64) NOT NULL DEFAULT '',
+                        source_event_id VARCHAR(64) NOT NULL DEFAULT '',
+                        status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                        retry_count INT NOT NULL DEFAULT 0,
+                        checksum VARCHAR(128) NOT NULL DEFAULT '',
+                        message VARCHAR(512) DEFAULT '',
+                        file_name VARCHAR(512) DEFAULT '',
+                        metadata_json LONGTEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY uq_pkb_sync_event (collection, source_event_id),
+                        INDEX idx_pkb_sync_proj (collection, project_id),
+                        INDEX idx_pkb_sync_doc (collection, normalized_document_number),
+                        INDEX idx_pkb_sync_status (status)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS checkpoint_docs (
                         id BIGINT AUTO_INCREMENT PRIMARY KEY,
                         collection VARCHAR(128) NOT NULL DEFAULT '',
@@ -510,6 +533,14 @@ def _init_db_schema_locked() -> None:
                         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE KEY uq_quiz_fav_user_q (collection, user_id, question_id),
                         INDEX idx_quiz_fav_user (user_id, created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                        migration_id VARCHAR(128) NOT NULL,
+                        collection VARCHAR(128) NOT NULL DEFAULT '',
+                        applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (migration_id, collection)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """)
                 _add_column_if_missing(cur, "project_cases", "case_name_en", "VARCHAR(512) DEFAULT '' COMMENT '案例名称英文'")
@@ -1391,6 +1422,166 @@ def get_knowledge_docs(
         conn.close()
 
 
+
+def is_schema_migration_done(migration_id: str, collection: str = "") -> bool:
+    mid = (migration_id or "").strip()
+    coll = (collection or "").strip()
+    if not mid:
+        return False
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM schema_migrations WHERE migration_id = %s AND collection = %s LIMIT 1",
+                (mid, coll),
+            )
+            return bool(cur.fetchone())
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def mark_schema_migration_done(migration_id: str, collection: str = "") -> None:
+    mid = (migration_id or "").strip()
+    coll = (collection or "").strip()
+    if not mid:
+        return
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT IGNORE INTO schema_migrations (migration_id, collection)
+                   VALUES (%s, %s)""",
+                (mid, coll),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+MIGRATION_YY_IW_020_INTERNAL_CONTROL = "yy_iw_020_to_internal_control"
+
+
+def migrate_knowledge_docs_category_by_filenames(
+    collection: str,
+    file_names: List[str],
+    new_category: str = "internal_control",
+) -> int:
+    """将指定 collection 下若干 file_name 的 MySQL category 批量改为 new_category。"""
+    coll = (collection or "").strip()
+    names = [str(n or "").strip() for n in (file_names or []) if str(n or "").strip()]
+    cat = (new_category or "").strip()
+    if not coll or not names or not cat:
+        return 0
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            updated = 0
+            for fn in names:
+                cur.execute(
+                    """UPDATE knowledge_docs
+                       SET category = %s
+                       WHERE collection = %s AND file_name = %s
+                         AND (category IS NULL OR category = '' OR category <> %s)""",
+                    (cat, coll, fn, cat),
+                )
+                updated += int(cur.rowcount or 0)
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
+def list_knowledge_file_names_for_internal_control_migration(collection: str) -> list:
+    """列出应按文件名迁入 internal_control 的已入库文件名。"""
+    from src.core.knowledge_categories import is_internal_control_filename
+
+    coll = (collection or "").strip()
+    if not coll:
+        return []
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT DISTINCT file_name, category FROM knowledge_docs
+                   WHERE collection = %s AND file_name IS NOT NULL AND file_name != ''""",
+                (coll,),
+            )
+            out = []
+            for r in cur.fetchall() or []:
+                fn = str(r.get("file_name") or "").strip()
+                cat = str(r.get("category") or "").strip()
+                if fn and is_internal_control_filename(fn) and cat != "internal_control":
+                    out.append(fn)
+            return out
+    finally:
+        conn.close()
+
+
+def list_knowledge_files_matching(
+    collection: str,
+    needles: Optional[List[str]] = None,
+    limit: int = 80,
+) -> list:
+    """按文件名模糊匹配，返回 file_name + 最新入库时间 + 块数。"""
+    coll = (collection or "").strip()
+    if not coll:
+        return []
+    patterns = [str(n or "").strip() for n in (needles or []) if str(n or "").strip()]
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = (
+                "SELECT file_name, MAX(created_at) AS created_at, COUNT(*) AS chunks, "
+                "MAX(id) AS max_id FROM knowledge_docs "
+                "WHERE collection = %s AND file_name IS NOT NULL AND file_name != ''"
+            )
+            params: List[Any] = [coll]
+            if patterns:
+                ors = " OR ".join(["file_name LIKE %s"] * len(patterns))
+                sql += f" AND ({ors})"
+                params.extend([f"%{p}%" for p in patterns])
+            sql += " GROUP BY file_name ORDER BY created_at DESC, max_id DESC LIMIT %s"
+            params.append(int(limit))
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_knowledge_docs_for_file(
+    collection: str,
+    file_name: str,
+    limit: int = 4000,
+) -> list:
+    """按 chunk_index 升序取某一文件的全部块，用于重建制度原文。"""
+    coll = (collection or "").strip()
+    fn = (file_name or "").strip()
+    if not coll or not fn:
+        return []
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT file_name, chunk_index, content, category, created_at
+                   FROM knowledge_docs
+                   WHERE collection = %s AND file_name = %s
+                   ORDER BY chunk_index ASC, id ASC
+                   LIMIT %s""",
+                (coll, fn, int(limit)),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def search_knowledge_docs_by_content_keywords(
     *,
     collection: str,
@@ -1457,7 +1648,7 @@ def get_knowledge_stats_by_category(collection: Optional[str] = None) -> Dict[st
         for r in rows:
             cat = r.get("category") or "regulation"
             by_category[cat] = {"chunks": r["chunks"], "files": r["files"]}
-        for cat in ("regulation", "program", "project_case", "glossary"):
+        for cat in ("regulation", "program", "project_case", "glossary", "internal_control"):
             if cat not in by_category:
                 by_category[cat] = {"chunks": 0, "files": 0}
         return {
@@ -2897,3 +3088,115 @@ def update_knowledge_docs_case_id(collection: str, file_name: str, case_id: int)
         conn.commit()
     finally:
         conn.close()
+
+
+def upsert_project_kb_sync_status(
+    *,
+    collection: str,
+    project_id: str,
+    document_number: str,
+    normalized_document_number: str,
+    document_version: str,
+    source_event_id: str,
+    status: str,
+    retry_count: int = 0,
+    checksum: str = "",
+    message: str = "",
+    file_name: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO project_kb_sync_status (
+                    collection,
+                    project_id,
+                    document_number,
+                    normalized_document_number,
+                    document_version,
+                    source_event_id,
+                    status,
+                    retry_count,
+                    checksum,
+                    message,
+                    file_name,
+                    metadata_json
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    project_id = VALUES(project_id),
+                    document_number = VALUES(document_number),
+                    normalized_document_number = VALUES(normalized_document_number),
+                    document_version = VALUES(document_version),
+                    status = VALUES(status),
+                    retry_count = VALUES(retry_count),
+                    checksum = VALUES(checksum),
+                    message = VALUES(message),
+                    file_name = VALUES(file_name),
+                    metadata_json = VALUES(metadata_json),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    str(collection or "").strip(),
+                    str(project_id or "").strip(),
+                    str(document_number or "").strip(),
+                    str(normalized_document_number or "").strip(),
+                    str(document_version or "").strip(),
+                    str(source_event_id or "").strip(),
+                    str(status or "pending").strip(),
+                    max(0, int(retry_count or 0)),
+                    str(checksum or "").strip(),
+                    str(message or "")[:512],
+                    str(file_name or "").strip()[:512],
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_project_kb_sync_status(
+    *,
+    collection: str,
+    project_id: str = "",
+    normalized_document_number: str = "",
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    init_db()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = (
+                "SELECT collection, project_id, document_number, normalized_document_number, "
+                "document_version, source_event_id, status, retry_count, checksum, message, "
+                "file_name, metadata_json, created_at, updated_at "
+                "FROM project_kb_sync_status WHERE collection = %s"
+            )
+            params: List[Any] = [str(collection or "").strip()]
+            pid = str(project_id or "").strip()
+            if pid:
+                sql += " AND project_id = %s"
+                params.append(pid)
+            doc = str(normalized_document_number or "").strip()
+            if doc:
+                sql += " AND normalized_document_number = %s"
+                params.append(doc)
+            sql += " ORDER BY updated_at DESC, id DESC LIMIT %s"
+            params.append(max(1, min(int(limit or 100), 500)))
+            cur.execute(sql, params)
+            rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        meta_raw = row.pop("metadata_json", None)
+        try:
+            row["metadata"] = json.loads(meta_raw) if meta_raw else {}
+        except Exception:
+            row["metadata"] = {}
+        out.append(row)
+    return out

@@ -70,7 +70,11 @@ def match_project_case_for_review(
 
 
 def build_case_context_text(collection: str, matched_case: dict) -> str:
-    """构建与 Streamlit 审核页相同的 case_context_text。"""
+    """构建与 Streamlit 审核页相同的 case_context_text。
+
+    案例仅复用通用信息（产品/注册维度/适用范围/章节结构）；
+    软件/文件/发布等版本类信息不得以案例为准（案例为历史版本）。
+    """
     case_lang = matched_case.get("document_language") or ""
     case_lang_label = _DOC_LANG_VALUE_TO_LABEL.get(case_lang, "不指定")
     case_ctx = (
@@ -112,7 +116,14 @@ def build_case_context_text(collection: str, matched_case: dict) -> str:
                 )
     except Exception:
         pass
-    case_ctx += "\n请参考上述案例经验审核当前文档，如有类似问题请重点关注。"
+    case_ctx += (
+        "\n**版本约束（必须遵守）**：本案例为历史成功注册经验，**仅可复用通用信息**"
+        "（产品/注册国家与类别/组成/项目形态/适用范围、章节结构与通用写法）。"
+        "案例中出现的**软件版本号、文件版本号、修订号、发布版本、基线标识、修订履历版本**等"
+        "属于历史版本数据，**不得**写入或覆盖当前【项目基本信息】，也**不得**因待审文档版本与案例不一致"
+        "而开出一致性审核点。当前版本以【项目基本信息】、项目专属资料与待审文档为准。\n"
+        "\n请参考上述案例的通用经验审核当前文档，如有类似问题请重点关注。"
+    )
     return case_ctx
 
 

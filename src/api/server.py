@@ -6,6 +6,7 @@ import logging
 import re
 import time
 import uuid
+import base64
 from pathlib import Path
 
 _root = Path(__file__).resolve().parent.parent.parent
@@ -59,6 +60,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from config import settings
 from src.core.agent import ReviewAgent
+from src.core.knowledge_base import KnowledgeBase
 from src.core.db import (
     get_dimension_options,
     REGISTRATION_TYPES,
@@ -73,6 +75,8 @@ from src.core.db import (
     upsert_company_mapping,
     delete_company_by_aiword_id,
     CompanyMappingConflictError,
+    upsert_project_kb_sync_status,
+    get_project_kb_sync_status,
 )
 from src.core.project_option_label import format_project_option_label
 from src.core.document_loader import (
@@ -81,6 +85,7 @@ from src.core.document_loader import (
     load_single_file,
     split_documents,
 )
+from src.core.langchain_compat import Document
 from config.runtime_settings import apply_runtime_config_dict, sync_cursor_overrides_from_settings
 from src.core.db import load_app_settings
 from src.core.quiz import service as quiz_service
@@ -359,6 +364,10 @@ def _swagger_ui_html_with_cdn_fallback(
 def get_agent(collection: str = "regulations") -> ReviewAgent:
     if collection not in _agents:
         _agents[collection] = ReviewAgent(collection)
+        try:
+            _agents[collection].kb.migrate_yy_iw_020_to_internal_control()
+        except Exception:
+            pass
     return _agents[collection]
 
 
@@ -456,6 +465,42 @@ class DocumentControlReleaseDateSuggestRequest(BaseModel):
     intermediateVersions: list[str] = Field(default_factory=list)
     targetVersion: Optional[str] = None
     registrationCountry: str = ""
+
+
+class DocumentControlVersionTaskRulesRequest(BaseModel):
+    collection: str = "regulations"
+    query: str = ""
+
+
+class ProjectKbSyncRequest(BaseModel):
+    collection: str = "regulations"
+    organizationId: str = ""
+    projectId: str = ""
+    eventId: str = ""
+    eventType: str = "UPSERT"
+    documentNumber: str = ""
+    normalizedDocumentNumber: str = ""
+    title: str = ""
+    version: str = ""
+    status: str = "controlled"
+    fileName: str = ""
+    fileExt: str = ""
+    fileBase64: str = ""
+    contentText: str = ""
+    checksum: str = ""
+    publishedAt: str = ""
+    sourceUpdatedAt: str = ""
+    isLatest: bool = True
+    isDeleted: bool = False
+    retryCount: int = 0
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectKbStatusRequest(BaseModel):
+    collection: str = "regulations"
+    projectId: str = ""
+    normalizedDocumentNumber: str = ""
+    limit: int = 100
 
 
 class IntegrationCreateProjectBody(BaseModel):
@@ -677,6 +722,11 @@ def _normalize_document_number_local(value: str) -> str:
     text = text.replace("—", "-").replace("–", "-").replace("－", "-")
     text = re.sub(r"-{2,}", "-", text)
     return text.strip("-")
+
+
+def _project_kb_collection_name(base_collection: str) -> str:
+    base = str(base_collection or "").strip() or "regulations"
+    return f"{base}_project_kb"
 
 
 def _extract_document_control_meta(file_name: str, text_blob: str) -> Dict[str, Any]:
@@ -2513,6 +2563,30 @@ def admin_companies_sync_delete(aiword_company_id: str):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/train/existing-files")
+def train_existing_files(
+    req: Request,
+    collection: str = "regulations",
+    category: str = "regulation",
+    case_id: Optional[int] = None,
+):
+    """返回知识库中已存在的文件名（供训练前覆盖确认）。"""
+    collection = _resolve_request_collection(req, collection or "regulations")
+    cat = (category or "regulation").strip() or "regulation"
+    cid = int(case_id) if case_id is not None else None
+    if cat == "project_case" and cid is not None:
+        names = get_existing_file_names(collection, category="project_case", case_id=cid) or []
+    else:
+        names = get_existing_file_names(collection, category=cat) or []
+    return {
+        "ok": True,
+        "collection": collection,
+        "category": cat,
+        "case_id": cid,
+        "file_names": list(names),
+    }
+
+
 @app.post("/train/upload")
 async def train_upload(
     req: Request,
@@ -2538,7 +2612,8 @@ async def train_upload(
             tmp_path = tmp.name
 
         try:
-            if display_name in existing and mode == "skip":
+            was_existing = display_name in existing
+            if was_existing and mode == "skip":
                 results.append(
                     {
                         "status": "skipped",
@@ -2548,7 +2623,7 @@ async def train_upload(
                     }
                 )
                 continue
-            if display_name in existing and mode == "overwrite":
+            if was_existing and mode == "overwrite":
                 try:
                     agent.kb.delete_documents_by_file_name(display_name)
                 except Exception:
@@ -2556,6 +2631,7 @@ async def train_upload(
                 existing.discard(display_name)
             result = agent.train(tmp_path, category=category, display_name=display_name)
             result["original_filename"] = display_name
+            result["overwritten"] = bool(was_existing and mode == "overwrite")
             results.append(result)
             if result.get("status") == "success":
                 existing.add(display_name)
@@ -2583,13 +2659,75 @@ def train_directory(
     dir_path: str = Form(...),
     collection: str = Form("regulations"),
     category: str = Form("regulation"),
+    overwrite_mode: str = Form("overwrite"),
 ):
-    if not Path(dir_path).exists():
+    """按目录逐文件训练。同名文件默认覆盖旧版，避免重复入库混新旧内容。"""
+    root = Path(dir_path)
+    if not root.exists():
         raise HTTPException(status_code=404, detail=f"目录不存在：{dir_path}")
     collection = _resolve_request_collection(req, collection)
+    category = (category or "regulation").strip() or "regulation"
+    mode = (overwrite_mode or "overwrite").strip().lower()
+    if mode not in ("overwrite", "skip"):
+        mode = "overwrite"
     agent = get_agent(collection)
-    result = agent.train(dir_path, category=category)
-    return result
+    from src.core.document_loader import SUPPORTED_DOC_EXTENSIONS, is_deprecated_path
+
+    existing = set(get_existing_file_names(collection, category=category) or [])
+    details = []
+    total_chunks = 0
+    file_paths = []
+    if root.is_file():
+        file_paths = [root]
+    else:
+        for ext in SUPPORTED_DOC_EXTENSIONS:
+            for fp in root.rglob(f"*{ext}"):
+                if fp.is_file() and not is_deprecated_path(fp):
+                    file_paths.append(fp)
+    for fp in file_paths:
+        display_name = fp.name
+        was_existing = display_name in existing
+        try:
+            if was_existing and mode == "skip":
+                details.append(
+                    {
+                        "status": "skipped",
+                        "original_filename": display_name,
+                        "message": "已存在，按 skip 跳过",
+                        "chunks_added": 0,
+                    }
+                )
+                continue
+            if was_existing and mode == "overwrite":
+                try:
+                    agent.kb.delete_documents_by_file_name(display_name)
+                except Exception:
+                    pass
+                existing.discard(display_name)
+            result = agent.train(str(fp), category=category, display_name=display_name)
+            result["original_filename"] = display_name
+            result["overwritten"] = bool(was_existing and mode == "overwrite")
+            details.append(result)
+            if result.get("status") == "success":
+                existing.add(display_name)
+                total_chunks += int(result.get("chunks_added") or 0)
+        except Exception as e:
+            details.append(
+                {
+                    "status": "error",
+                    "original_filename": display_name,
+                    "message": str(e),
+                }
+            )
+    return {
+        "status": "success",
+        "source": str(root),
+        "category": category,
+        "overwrite_mode": mode,
+        "files_processed": len(details),
+        "total_chunks_added": total_chunks,
+        "details": details,
+    }
 
 
 @app.post("/train/project-cases/create")
@@ -2641,40 +2779,67 @@ async def train_project_case_upload(
     files: List[UploadFile] = File(...),
     collection: str = Form("regulations"),
     case_id: int = Form(...),
+    overwrite_mode: str = Form("overwrite"),
 ):
+    """项目案例文档训练。同名文件默认覆盖旧版（可多次训练同一文件）。"""
     collection = _resolve_request_collection(req, collection)
     case = get_project_case(int(case_id))
     if not case or str(case.get("collection") or "").strip() != collection:
         raise HTTPException(status_code=404, detail="case_id 不存在或不属于当前 collection")
+    mode = (overwrite_mode or "overwrite").strip().lower()
+    if mode not in ("overwrite", "skip"):
+        mode = "overwrite"
+    cid = int(case_id)
     agent = get_agent(collection)
+    existing = set(get_existing_file_names(collection, category="project_case", case_id=cid) or [])
     results = []
     for f in files:
-        suffix = Path(str(f.filename or "")).suffix
+        display_name = Path(str(f.filename or "upload.bin")).name
+        suffix = Path(display_name).suffix
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             raw = await f.read()
             tmp.write(raw)
             tmp_path = tmp.name
         try:
+            was_existing = display_name in existing
+            if was_existing and mode == "skip":
+                results.append(
+                    {
+                        "status": "skipped",
+                        "original_filename": display_name,
+                        "message": "已存在，按 skip 跳过",
+                        "chunks_added": 0,
+                    }
+                )
+                continue
+            if was_existing and mode == "overwrite":
+                try:
+                    agent.kb.delete_documents_by_file_name(display_name, case_id=cid)
+                except Exception:
+                    pass
+                existing.discard(display_name)
             docs = load_single_file(tmp_path)
             chunks = split_documents(docs)
             n = agent.kb.add_documents(
                 chunks,
-                file_name=str(f.filename or Path(tmp_path).name),
+                file_name=display_name,
                 category="project_case",
-                case_id=int(case_id),
+                case_id=cid,
             )
+            existing.add(display_name)
             results.append(
                 {
                     "status": "success",
-                    "original_filename": str(f.filename or ""),
+                    "original_filename": display_name,
                     "chunks_added": int(n or 0),
+                    "overwritten": bool(was_existing and mode == "overwrite"),
                 }
             )
         except Exception as e:
             results.append(
                 {
                     "status": "error",
-                    "original_filename": str(f.filename or ""),
+                    "original_filename": display_name,
                     "message": str(e),
                 }
             )
@@ -2684,7 +2849,8 @@ async def train_project_case_upload(
         "ok": True,
         "data": {
             "collection": collection,
-            "case_id": int(case_id),
+            "case_id": cid,
+            "overwrite_mode": mode,
             "files_processed": len(results),
             "total_chunks_added": sum(int(x.get("chunks_added") or 0) for x in results),
             "details": results,
@@ -2940,6 +3106,235 @@ def integration_document_control_parse_numbering_rules(
         "ruleCount": len(rules),
         "sourceFile": source_file,
         "message": message,
+    }
+
+
+@app.post("/api/integration/document-control/version-task-rules")
+def integration_document_control_version_task_rules(
+    req: Request,
+    body: DocumentControlVersionTaskRulesRequest,
+):
+    """按文号匹配知识库中最新《医疗软件质量合规管理制度》（YY-IW-020），解析归档表供任务清单使用。"""
+    body.collection = _resolve_request_collection(req, body.collection or "regulations")
+    from src.core.db import get_knowledge_docs_for_file, list_knowledge_files_matching
+    from src.core.version_task_rule_extract import (
+        extract_from_text,
+        extract_version_label,
+        is_yy_iw_020_filename,
+        pick_latest_rule_file,
+    )
+
+    needles = ["IW-020", "IW020", "医疗软件质量合规管理"]
+    extra_q = str(body.query or "").strip()
+    if extra_q:
+        needles.append(extra_q)
+    try:
+        listed = list_knowledge_files_matching(body.collection, needles=needles, limit=80)
+    except Exception as exc:
+        logger.warning("version-task-rules list files failed: %s", exc)
+        listed = []
+    candidates: List[Dict[str, Any]] = []
+    for row in listed or []:
+        name = str(row.get("file_name") or "").strip()
+        if not name:
+            continue
+        if not is_yy_iw_020_filename(name) and extra_q not in name:
+            continue
+        candidates.append(
+            {
+                "file_name": name,
+                "created_at": str(row.get("created_at") or ""),
+                "chunks": row.get("chunks"),
+                "source_version": extract_version_label(name),
+            }
+        )
+    # 封面版次可能与文件名不一致（如文件名仍写 V2.1、正文已升 V2.2），读前几块补版本
+    for cand in candidates:
+        try:
+            head_rows = get_knowledge_docs_for_file(
+                body.collection, str(cand["file_name"]), limit=8
+            )
+        except Exception:
+            head_rows = []
+        head = "\n".join(str(r.get("content") or "") for r in (head_rows or []))
+        text_ver = extract_version_label(head, str(cand.get("file_name") or ""))
+        if text_ver:
+            cand["text_version"] = text_ver
+            cand["source_version"] = text_ver
+    picked = pick_latest_rule_file(candidates)
+    if not picked:
+        payload = extract_from_text(
+            "",
+            source_file="",
+            matched_by="knowledge_base",
+            candidates=candidates,
+        )
+        payload["ok"] = False
+        payload["collection"] = body.collection
+        payload["message"] = (
+            "知识库未命中 YY-IW-020《医疗软件质量合规管理制度》，请先在公司知识库训练该制度"
+        )
+        return payload
+    try:
+        chunks = get_knowledge_docs_for_file(
+            body.collection, str(picked.get("file_name") or ""), limit=4000
+        )
+    except Exception as exc:
+        logger.warning("version-task-rules load file failed: %s", exc)
+        chunks = []
+    blob = "\n\n".join(str(r.get("content") or "") for r in (chunks or []) if str(r.get("content") or "").strip())
+    payload = extract_from_text(
+        blob,
+        source_file=str(picked.get("file_name") or ""),
+        matched_by="knowledge_base",
+        source_date=str(picked.get("created_at") or ""),
+        candidates=candidates,
+    )
+    payload["collection"] = body.collection
+    if not payload.get("ok"):
+        payload["message"] = (
+            f"已匹配到《{picked.get('file_name') or ''}》，但未解析出归档表；"
+            "请确认训练时保留了 Word 表格摘录"
+        )
+    return payload
+
+
+@app.post("/api/integration/project-kb/sync")
+def integration_project_kb_sync(
+    req: Request,
+    body: ProjectKbSyncRequest,
+):
+    body.collection = _resolve_request_collection(req, body.collection or "regulations")
+    project_id = str(body.projectId or "").strip()
+    if not project_id:
+        raise HTTPException(status_code=400, detail="projectId 必填")
+    event_id = str(body.eventId or "").strip() or str(uuid.uuid4())
+    normalized_doc = _normalize_document_number_local(body.normalizedDocumentNumber or body.documentNumber or "")
+    doc_number = str(body.documentNumber or "").strip() or normalized_doc
+    doc_version = str(body.version or "").strip()
+    checksum = str(body.checksum or "").strip()
+    file_name = str(body.fileName or "").strip()
+    if not file_name:
+        suffix = str(body.fileExt or "").strip() or ".txt"
+        if suffix and not suffix.startswith("."):
+            suffix = "." + suffix
+        stem = normalized_doc or re.sub(r"\s+", "_", str(body.title or "").strip()) or "project_kb_doc"
+        file_name = f"{stem}{suffix}"
+
+    meta = dict(body.metadata or {})
+    meta.update(
+        {
+            "kb_namespace": "project_kb",
+            "project_id": project_id,
+            "document_number": doc_number,
+            "normalized_document_number": normalized_doc,
+            "document_version": doc_version,
+            "source_event_id": event_id,
+            "is_latest_snapshot": bool(body.isLatest),
+            "source_status": str(body.status or "").strip(),
+        }
+    )
+    event_type = str(body.eventType or "UPSERT").strip().upper()
+    is_deleted = bool(getattr(body, "isDeleted", False)) or event_type == "DELETE"
+    status = "synced"
+    message = ""
+    retry_count = max(0, int(body.retryCount or 0))
+    docs: List[Document] = []
+    tmp_path: Optional[Path] = None
+    try:
+        file_b64 = str(body.fileBase64 or "").strip()
+        if file_b64:
+            raw = base64.b64decode(file_b64)
+            suffix = Path(file_name).suffix or ".bin"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(raw)
+                tmp_path = Path(tmp.name)
+            loaded = load_single_file(tmp_path)
+            docs = split_documents(loaded)
+        else:
+            content_text = str(body.contentText or "").strip()
+            if content_text:
+                docs = split_documents([Document(page_content=content_text, metadata={})])
+        target_collection = f"{body.collection}_project_{project_id}"
+        kb = KnowledgeBase(target_collection)
+        kb.delete_documents_by_file_name(file_name)
+        if not is_deleted:
+            if not docs:
+                fallback_text = "\n".join(
+                    [
+                        f"文件标题：{str(body.title or '').strip()}",
+                        f"文件编号：{doc_number}",
+                        f"版本：{doc_version}",
+                        f"状态：{str(body.status or '').strip()}",
+                        f"发布时间：{str(body.publishedAt or '').strip()}",
+                    ]
+                ).strip()
+                docs = [Document(page_content=fallback_text, metadata={})]
+            for d in docs:
+                d.metadata = dict(getattr(d, "metadata", None) or {})
+                d.metadata.update(meta)
+            kb.add_documents(docs, file_name=file_name, category="project_kb")
+            promote_to_historical = bool(meta.get("promoteToHistorical"))
+            if promote_to_historical:
+                hist_kb = KnowledgeBase(body.collection)
+                hist_kb.delete_documents_by_file_name(file_name)
+                hist_kb.add_documents(docs, file_name=file_name, category="project_case")
+    except Exception as exc:
+        status = "failed"
+        message = str(exc)[:500]
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+    upsert_project_kb_sync_status(
+        collection=body.collection,
+        project_id=project_id,
+        document_number=doc_number,
+        normalized_document_number=normalized_doc,
+        document_version=doc_version,
+        source_event_id=event_id,
+        status=status,
+        retry_count=retry_count,
+        checksum=checksum,
+        message=message,
+        file_name=file_name,
+        metadata=meta,
+    )
+    if status != "synced":
+        raise HTTPException(status_code=500, detail=f"project-kb 同步失败：{message or '未知错误'}")
+    return {
+        "ok": True,
+        "collection": body.collection,
+        "projectKbCollection": f"{body.collection}_project_{project_id}",
+        "projectId": project_id,
+        "eventId": event_id,
+        "documentNumber": doc_number,
+        "normalizedDocumentNumber": normalized_doc,
+        "version": doc_version,
+        "fileName": file_name,
+        "chunkCount": len(docs),
+        "status": status,
+    }
+
+
+@app.get("/api/integration/project-kb/status")
+def integration_project_kb_status(
+    req: Request,
+    collection: str = Query("regulations"),
+    project_id: str = Query("", alias="projectId"),
+    normalized_document_number: str = Query("", alias="normalizedDocumentNumber"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    coll = _resolve_request_collection(req, collection or "regulations")
+    rows = get_project_kb_sync_status(
+        collection=coll,
+        project_id=project_id,
+        normalized_document_number=normalized_document_number,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "collection": coll,
+        "items": rows,
     }
 
 
@@ -4342,6 +4737,8 @@ def train_checklist(
     req: Request,
     collection: str = Form("regulations"),
     checklist_json: str = Form(...),
+    overwrite_mode: str = Form("overwrite"),
+    file_name: str = Form("审核点清单"),
 ):
     import json
     try:
@@ -4350,8 +4747,41 @@ def train_checklist(
         raise HTTPException(status_code=400, detail=f"JSON 解析失败：{e}")
     collection = _resolve_request_collection(req, collection)
     agent = get_agent(collection)
-    count = agent.train_checklist(checklist)
-    return {"status": "success", "chunks_added": count, "total_points": len(checklist)}
+    name = (file_name or "审核点清单").strip() or "审核点清单"
+    mode = (overwrite_mode or "overwrite").strip().lower()
+    if mode not in ("overwrite", "skip"):
+        mode = "overwrite"
+    overwritten = False
+    if mode == "overwrite":
+        try:
+            agent.checkpoint_kb.delete_documents_by_file_name(name)
+            overwritten = True
+        except Exception:
+            pass
+    elif mode == "skip":
+        # 审核点库同名已存在时跳过：简单探测 — 有块则视为已存在
+        try:
+            from src.core.db import get_existing_checkpoint_file_names
+
+            existing = set(get_existing_checkpoint_file_names(collection) or [])
+            if name in existing:
+                return {
+                    "status": "skipped",
+                    "chunks_added": 0,
+                    "total_points": len(checklist) if isinstance(checklist, list) else 0,
+                    "message": "已存在，按 skip 跳过",
+                    "file_name": name,
+                }
+        except Exception:
+            pass
+    count = agent.train_checklist(checklist, file_name=name)
+    return {
+        "status": "success",
+        "chunks_added": count,
+        "total_points": len(checklist) if isinstance(checklist, list) else 0,
+        "file_name": name,
+        "overwritten": overwritten,
+    }
 
 
 @app.get("/knowledge/collections")

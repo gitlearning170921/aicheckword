@@ -797,5 +797,81 @@ def list_deficiency_assets(record_id: int) -> List[Dict[str, Any]]:
         conn.close()
 
 
+def get_deficiency_asset(asset_id: int) -> Optional[Dict[str, Any]]:
+    ensure_deficiency_tables()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM deficiency_assets WHERE id=%s", (int(asset_id),))
+            row = cur.fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            if d.get("created_at") is not None:
+                d["created_at"] = str(d["created_at"])
+            return d
+    finally:
+        conn.close()
+
+
+def update_deficiency_asset(
+    asset_id: int,
+    *,
+    display_name: Optional[str] = None,
+    storage_path: Optional[str] = None,
+    text_excerpt: Optional[str] = None,
+) -> None:
+    ensure_deficiency_tables()
+    fields: Dict[str, Any] = {}
+    if display_name is not None:
+        fields["display_name"] = (display_name or "").strip()
+    if storage_path is not None:
+        fields["storage_path"] = storage_path or ""
+    if text_excerpt is not None:
+        fields["text_excerpt"] = text_excerpt or ""
+    if not fields:
+        return
+    cols = ", ".join(f"`{k}`=%s" for k in fields)
+    vals = list(fields.values()) + [int(asset_id)]
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE deficiency_assets SET {cols} WHERE id=%s", vals)
+            cur.execute(
+                "SELECT record_id FROM deficiency_assets WHERE id=%s",
+                (int(asset_id),),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        if row:
+            rid = int(row["record_id"] if isinstance(row, dict) else row[0])
+            update_deficiency_record(rid, {"train_status": "stale"})
+    finally:
+        conn.close()
+
+
+def delete_deficiency_asset(asset_id: int) -> Optional[Dict[str, Any]]:
+    """删除附件行并返回旧记录（含 storage_path，供调用方删文件）。"""
+    ensure_deficiency_tables()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM deficiency_assets WHERE id=%s", (int(asset_id),))
+            row = cur.fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            cur.execute("DELETE FROM deficiency_assets WHERE id=%s", (int(asset_id),))
+            rid = int(d.get("record_id") or 0)
+        conn.commit()
+        if rid:
+            update_deficiency_record(rid, {"train_status": "stale"})
+        if d.get("created_at") is not None:
+            d["created_at"] = str(d["created_at"])
+        return d
+    finally:
+        conn.close()
+
+
 def archive_deficiency_record(record_id: int) -> None:
     update_deficiency_record(int(record_id), {"status": "archived"})

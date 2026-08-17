@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse
 from langchain_core.documents import Document
 from pydantic import BaseModel
 
@@ -17,10 +18,13 @@ from src.core.deficiency_store import (
     create_deficiency_record,
     create_deficiency_records_batch,
     deficiency_import_fingerprint,
+    delete_deficiency_asset,
     find_duplicates_by_opinion,
+    get_deficiency_asset,
     get_deficiency_record,
     list_deficiency_assets,
     list_deficiency_records,
+    update_deficiency_asset,
     update_deficiency_record,
     upsert_deficiency_records_batch,
 )
@@ -274,6 +278,108 @@ async def upload_assets(
         )
         saved.append({"id": aid, "display_name": display_name, "role": role})
     return {"ok": True, "data": {"assets": saved, "record": get_deficiency_record(int(record_id))}}
+
+
+def _assert_asset_belongs(record_id: int, collection: str, asset_id: int) -> Dict[str, Any]:
+    row = get_deficiency_record(int(record_id))
+    if not row or str(row.get("collection") or "") != collection:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    asset = get_deficiency_asset(int(asset_id))
+    if not asset or int(asset.get("record_id") or 0) != int(record_id):
+        raise HTTPException(status_code=404, detail="附件不存在")
+    return asset
+
+
+@router.get("/records/{record_id}/assets/{asset_id}/download")
+def download_asset(
+    req: Request,
+    record_id: int,
+    asset_id: int,
+    collection: str = Query("regulations"),
+):
+    collection = _resolve_collection(req, collection)
+    asset = _assert_asset_belongs(record_id, collection, asset_id)
+    path = Path(str(asset.get("storage_path") or "").strip())
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="附件文件已丢失")
+    display = str(asset.get("display_name") or path.name).strip() or path.name
+    return FileResponse(
+        path=str(path),
+        filename=display,
+        media_type="application/octet-stream",
+    )
+
+
+@router.post("/records/{record_id}/assets/{asset_id}/replace")
+async def replace_asset(
+    req: Request,
+    record_id: int,
+    asset_id: int,
+    file: UploadFile = File(...),
+    collection: str = Form("regulations"),
+):
+    collection = _resolve_collection(req, collection)
+    asset = _assert_asset_belongs(record_id, collection, asset_id)
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="文件为空")
+    display_name = Path(str(file.filename or asset.get("display_name") or "upload.bin")).name
+    root = Path(settings.uploads_path) / "deficiency" / collection / str(record_id)
+    root.mkdir(parents=True, exist_ok=True)
+    dest = root / f"{uuid.uuid4().hex[:8]}_{display_name}"
+    dest.write_bytes(raw)
+    text_excerpt = ""
+    try:
+        chunks = load_and_split(str(dest))
+        text_excerpt = "\n".join((c.page_content or "")[:2000] for c in (chunks or [])[:3])[:8000]
+    except Exception:
+        text_excerpt = ""
+    old_path = Path(str(asset.get("storage_path") or "").strip())
+    update_deficiency_asset(
+        int(asset_id),
+        display_name=display_name,
+        storage_path=str(dest),
+        text_excerpt=text_excerpt,
+    )
+    if old_path.is_file() and old_path.resolve() != dest.resolve():
+        try:
+            old_path.unlink()
+        except OSError:
+            pass
+    refreshed = get_deficiency_asset(int(asset_id)) or {}
+    return {
+        "ok": True,
+        "data": {
+            "asset": {
+                "id": int(asset_id),
+                "display_name": refreshed.get("display_name") or display_name,
+                "role": refreshed.get("role") or asset.get("role"),
+                "storage_path": refreshed.get("storage_path") or str(dest),
+            },
+            "record": get_deficiency_record(int(record_id)),
+        },
+    }
+
+
+@router.delete("/records/{record_id}/assets/{asset_id}")
+def remove_asset(
+    req: Request,
+    record_id: int,
+    asset_id: int,
+    collection: str = Query("regulations"),
+):
+    collection = _resolve_collection(req, collection)
+    _assert_asset_belongs(record_id, collection, asset_id)
+    deleted = delete_deficiency_asset(int(asset_id))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="附件不存在")
+    path = Path(str(deleted.get("storage_path") or "").strip())
+    if path.is_file():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return {"ok": True, "data": {"deletedId": int(asset_id), "record": get_deficiency_record(int(record_id))}}
 
 
 def _build_train_documents(row: Dict[str, Any], assets: List[Dict[str, Any]]) -> List[Document]:
