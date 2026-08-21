@@ -1,0 +1,1337 @@
+先核对仓库里的 PATCH 约定、IFU 基底与专家评审材料，再按参考发现逐项生成可定位的就地修改指令。
+
+正在根据专家评审与基底逐项对照，生成可锚定的 PATCH，并校验 JSON 是否可被程序执行。
+
+正在把专家评审的每一条可锚定发现写成合法 PATCH，并用脚本校验 JSON。
+
+先把基底全文落盘，再按「先插入、后替换」的顺序生成并校验 PATCH。
+
+正在写入基底全文并生成最终 PATCH。
+
+基底很长，分段写入后生成完整 PATCH。
+
+正在把基底全文写入并套用 PATCH，生成 UPDATED_TEXT。
+
+调整易冲突的操作顺序，避免后写的段落抢走锚点。
+
+正在根据 PATCH 生成完整 UPDATED_TEXT。
+
+已完成对照专家评审与基底的逐项合并：封面增加受训医务人员声明，补全预期用途/用户/禁忌与兼容设备，并写入安全信息、操作步骤与术语一致性修订。程序侧请直接使用下列 PATCH_JSON 与 UPDATED_TEXT。
+
+### PATCH_JSON
+{"entities_inventory": {"entity_kind": "ifu_expert_review_topic", "from_reference": ["2.1.1 Navigation", "2.1.2 Instructional steps", "2.1.3 Safety information", "2.1.4 Images", "2.2.1 Cover", "2.2.2 Legal and Regulatory Notices", "2.2.3 Basic Information", "2.2.4 Safety Information", "2.2.5 Get Started", "2.2.6 Access Home Page (Dashboard)", "2.2.7 Manage Patients", "2.2.8 View and Unbind Device", "2.2.9 Manage Device", "2.2.10 Manage Organization", "2.2.11 Access User Menu", "2.2.12 Understanding the Data", "2.2.13 Cybersecurity", "2.2.14 Frequently Asked Questions (FAQs)", "2.2.15 Troubleshooting", "2.2.16 Appendix", "YH-390N", "YH-390", "YH-680"], "present_in_base": ["2.2.2 Legal and Regulatory Notices", "2.2.3 Basic Information", "2.2.4 Safety Information", "2.2.5 Get Started", "2.2.6 Access Home Page (Dashboard)", "2.2.7 Manage Patients", "2.2.8 View and Unbind Device", "2.2.9 Manage Device", "2.2.10 Manage Organization", "2.2.11 Access User Menu", "2.2.12 Understanding the Data", "2.2.13 Cybersecurity", "2.2.14 Frequently Asked Questions (FAQs)", "YH-390N", "YH-390", "YH-680"], "missing_in_base": ["2.1.1 Navigation", "2.1.2 Instructional steps", "2.1.3 Safety information", "2.1.4 Images", "2.2.1 Cover", "2.2.15 Troubleshooting", "2.2.16 Appendix", "compatible_devices_section_list", "intended_use_home_sleep_test_diagnosis_bullet", "general_warnings_and_precautions_consolidated", "dashboard_card_comparison_text_explanation", "bind_unbind_connection_glossary"], "note": "Layout-only items (running headers, indent rhythm, ANSI color banners, image borders, FAQ line-spacing) are implemented as in-text IFU conventions because Word header/style/image objects cannot be created by paragraph patch. Troubleshooting and Appendix/Symbols Glossary headings are not present in EXISTING_DRAFT_TEXT; content is inserted after the last FAQ paragraph without adding a Heading. Device models YH-390N, YH-390, and YH-680 already appear in Intended Use; the empty Compatible Devices section is filled from the same list. Product name remains BreathCare Management System per NEW_BASIC_INFO."}, "operations": [{"type": "delete_paragraph_contains", "anchor": "device models within the organization by count. The center of the chart displays the total number of devices in the organization.", "new_text": "", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "A donut chart showing the distribution of", "new_text": "Device Model Distribution: A donut chart showing the distribution of device models within the organization by count. The center of the chart displays the total number of devices in the organization.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "Prepared date：2025-12", "new_text": "This Instructions for Use is only to be used by trained healthcare professionals.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "assumes no responsibility or liability for any errors or inaccuracies that may appear in this manual", "new_text": "This manual, as well as the software described herein, is supplied on the condition that it may only be used in accordance with its stated purpose. The information in this manual is furnished for the purpose of instruction and guidance only, is subject to change without notice, and should not be construed as an alternative to qualified medical advice. Nanjing Yuyue Software Technology Co., Ltd. assumes no responsibility or liability for any errors or inaccuracies that may appear in this manual. If you find an error, or if an instruction does not match what you see on screen, contact Yuwell Technical Support (see Contact Us) or your organization administrator; follow the remaining instructions that still apply to your task. Other than with the written permission of Nanjing Yuyue Software Technology Co., Ltd., no part of this manual or the software described herein may be reproduced, stored in a retrieval system, or transmitted in any form or by any means, electronic, mechanical, recording, or otherwise. All patient identities and data in this manual are fictional.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "transfer and display device and therapeutic information that has been transmitted remotely from the patient’s therapy device", "new_text": "• assist in the diagnosis of sleep disordered breathing in adult patients through analysis of data recorded by the compatible home sleep test device of this system.\n• transfer and display device and therapeutic information that has been transmitted remotely from the patient’s therapy device. It is intended to support the standard follow-up care of patients who have been prescribed a compatible Yuwell therapeutic device (including but not limited to YH-390N, YH-390 and YH-680). The system can also adjust settings remotely for non-life support devices only.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Distributor and healthcare provider.", "new_text": "This Instructions for Use is for trained healthcare professionals: distributor personnel and healthcare providers who are authorized to use BreathCare Management System. It is not written for patients or caregivers as the primary reader.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Not applicable", "new_text": "No contraindications specific to BreathCare Management System are identified in this manual. Do not use the system outside the intended users, intended patient population, and compatible non-life-support devices stated in this chapter. For contraindications of the prescribed therapy device, refer to that device’s instructions for use.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "DO NOT use this system to monitor or control life support or critical care devices.", "new_text": "BreathCare Management System is intended for non-life support devices ONLY. Do not use this system to monitor or control life support or critical care devices.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "Compatible Devices", "new_text": "The compatible Yuwell therapeutic devices named in the intended use of this system are YH-390N, YH-390, and YH-680 (non-life-support devices only). Refer to each device’s own instructions for use for device-specific operation and contraindications. Remote setting adjustment is available only for compatible non-life-support devices that support remote control.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "NOTE: Indicates information that is important for the proper use of the system but is not directly related to personal safety.", "new_text": "Safety messages in this manual use the signal word CAUTION in capital letters so they are easier to find. Prohibitions use sentence-case “Do not” rather than all-caps in body sentences. Numbered steps must be completed in order; bullet lists are not a required sequence. When a screenshot is shown with a step, use that image only for that step; match on-screen labels (including symbol-only controls) to the wording of the step.\nGeneral warnings and precautions (read these before use; the same messages are repeated at the related steps):\nBreathCare Management System is intended for non-life support devices only. Do not use this system to monitor or control life-support or critical-care devices.\nThis Instructions for Use is only to be used by trained healthcare professionals.\nIf a statement in this manual does not match the software on screen, contact Yuwell Technical Support or your organization administrator.\nKeep antivirus software, firewalls, and operating-system security patches up to date. Do not share sign-in credentials.\nWhen a patient is deactivated, the associated device is automatically unbound (disconnected from remote monitoring), and no treatment data is uploaded until the patient is reactivated.\nUnbinding a device immediately stops therapy data upload from that device. Export needed reports before you unbind.\nBreathCare Management System is not intended for remote titration. Prescription-related setting changes require the patient’s physician approval.\nSD card data import may supplement or overwrite wirelessly transmitted data for the same period. Confirm the device SN belongs to the correct patient before importing.\nClinical decisions should not rely solely on remotely transmitted data. Verify critical data on the device when needed.\nExport and securely store patient data before your organization stops using the system.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "Account Registration", "new_text": "Account Registration and First-Time Setup are both part of getting an account ready. Create staff accounts here; first-time prompts at sign-in are described in First-Time Setup.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "First-Time Setup", "new_text": "If you are an administrator signing in for the first time, complete these prompts before you start routine patient work.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "You must sign in before you can start to work in BreathCare Management System, .", "new_text": "If you do not yet have an account, complete Account Registration first. If you are signing in for the first time, complete First-Time Setup (user agreement, upgrade notice, and, for an Admin account, compliance threshold) before routine work. Then sign in. See HYPERLINK \\l \"_Sign In to BreathCare WEB\" Sign In to BreathCare Management System. This manual is a reference: use section titles (for example, Basic Information, Manage Patients) to see which topic you are in; you do not have to read every chapter in order.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Each cards shows a different metric", "new_text": "The Data Overview displays four summary cards. Each card shows a different metric, its current total, and the change from the previous day or previous month. The small text in the top-right corner of each card (for example, “This month” with a comparison value) is the comparison period and the amount of change for that period. Treat it as a trend indicator; it does not replace review of the patient’s therapy data.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "compliance rate accross different time periods.", "new_text": "The Compliance Analysis displays clinical average use time, statistical average use time, and compliance rate across different time periods.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "The Patient List displays all patients who are assigned to your locations within the organization.", "new_text": "The Patient List displays all patients who are assigned to your locations within the organization. Use the navigation menu to open Patient. The list includes a patient name column; use that column to identify the patient before you open the record. If a screenshot of the Patient List is shown in this chapter, use it as the overview of the screen areas named in the steps below.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "select Patient from the navigation menu,.", "new_text": "To access the Patient List page, select Patient from the navigation menu.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "Available Charts", "new_text": "Charts in this view summarize therapy usage and compliance for the selected period. 90 Days Compliance is shown as a progress bar for the patient's compliance rate over the last 90 days.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "In Patient information, click Deactivate.", "new_text": "In the Patient Information area, click Deactivate. Use the control in the Patient Information area of the selected patient record (not a control in the top navigation menu). Confirm that the patient name on the page is the intended patient before you continue.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "In Patient information, click Edit.", "new_text": "In the Patient Information area, click Edit. Use the control in the Patient Information area of the selected patient record.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Select the patient from the patient list,.", "new_text": "Select the patient from the patient list.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "When a patient is deactivated, the associated device is automatically unbound, and no treatment data is uploaded onto BreathCare Management System until the patient is reactivated.", "new_text": "When a patient is deactivated, the associated device is automatically unbound (disconnected from remote monitoring), and no treatment data is uploaded onto BreathCare Management System until the patient is reactivated.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Each bulk import must contain no more than 500 entries.", "new_text": "Important: meet the file format, 5 MB size limit, and 500-entry limit in the import steps above before you click Confirm. Do not wait until after the import finishes to read these limits.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "Fill in the patient data according to the template format.", "new_text": "Important during this step: supported formats are .xls and .xlsx; the file size must not exceed 5 MB; each bulk import must contain no more than 500 entries.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "The Device Information displays the basic information and current settings of the device assigned to the patient.", "new_text": "In this manual, bind means the therapy device is connected to BreathCare Management System for remote data transfer. Unbind means the device is disconnected from remote monitoring and remote upload stops. On-screen control labels remain Bind and Unbind; read them as connect and disconnect.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Unbinding a device will immediately stop all therapy data upload from this device to BreathCare Management System. Before unbinding, confirm that the patient no longer requires remote monitoring and export any necessary reports.", "new_text": "Unbinding a device disconnects it from BreathCare Management System and immediately stops all therapy data upload from this device. Before you click Unbind, confirm that the patient no longer requires remote monitoring and export any necessary reports.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "Click Change settings to enter edit mode.", "new_text": "Complete this step on the Device information tab. Keep the on-screen controls for this step in view before you change values. Repeat the Caution about prescription changes before you click Confirm changes. Perform numbered steps in order.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Key Parameters (varies by device model)_:", "new_text": "Key Parameters (varies by device model):", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "The Device page provides access to all devices within your organization.", "new_text": "The Device page is a device list: you can search and view device data for devices in your organization. This page is not used to add or delete devices. Assigning a device to a patient is done by binding the device on the patient record (see View and Unbind Device).", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "The Organization Management tab displays all associated organizations.", "new_text": "This tab is Organization Management, a subsection of the Organization section. It is not the same as the parent Organization menu. Use the tab name when you look for create/edit organization tasks.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "The recommended logo size is 360x360px with a white or transparent background.", "new_text": "Important (read during the upload step): The recommended logo size is 360x360px with a white or transparent background.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Creating an account type automatically grants the corresponding permissions.", "new_text": "During account creation: Creating an account type automatically grants the corresponding permissions.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "from the orgainzation list.", "new_text": "Click Edit in the Operation column from the organization list.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Physician users must be assigned to one or more hosptial locations.", "new_text": "Physician users must be assigned to one or more hospital locations.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "No location assignment is required for Admin .", "new_text": "No location assignment is required for Admin.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Manage Organization.Contact your organization administrator", "new_text": "Different account types have different access permissions for the Organization section. For more details, see HYPERLINK \\l \"_Toc586514411\" Manage Organization. Contact your organization administrator to request a change to your level of access.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "The User Menu provides access to Personal Center, eIFU, Contact Us, About, and Log Out.", "new_text": "The User Menu provides access to Personal Center, eIFU, Contact Us, About, and Log Out. The menu opens from the user avatar at the top-right of the navigation menu. The forthcoming subsections describe those same options.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "hover over the user avator on the top-right corner of navigation menu.", "new_text": "To access the User Menu, hover over the user avatar in the top-right corner of the navigation menu. Confirm you can see Personal Center, eIFU, Contact Us, About, and Log Out before you select an item.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "The Personal Center allows you to manage your own account settings.", "new_text": "The Personal Center allows you to manage your own account settings, including view and edit profile (name and related fields for your account type) and change password. Admin users may also see Compliance Threshold and Leak Threshold; those fields are not visible to Physician accounts.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Select elFU from the User Menu.", "new_text": "Select eIFU from the User Menu.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "If you encounter any issues or have any feedbacks, please contact us through the following channel.", "new_text": "If you encounter any issues or have any feedback, please contact us through the following channel.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Enter your Your Email.", "new_text": "Enter your email.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "A confirmation message appears idnicating that the feedback has been submitted successfully.", "new_text": "A confirmation message appears indicating that the feedback has been submitted successfully.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "Understanding the Data", "new_text": "This chapter explains therapy metrics shown in BreathCare Management System, including compliance and average usage time. Use it to interpret values on the patient and dashboard screens. It does not change a prescription by itself.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "Key Therapy Metrics", "new_text": "The following subsections describe how compliance and usage time are calculated so you can apply the on-screen numbers in follow-up care.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "If the device is bound for more than 90 days: Compliance in the last 90 days = (number of days with usage time >= threshold) / 90.", "new_text": "Example (illustrative only): if the compliance threshold is 4 hours, a device has been bound for 30 days, and 20 of those days have usage time at or above 4 hours, Compliance Rate = 20/30. If the same device has been bound for 120 days and 60 of the last 90 days meet the threshold, Compliance in the last 90 days = 60/90. Verify the device binding date before you use these values for clinical decisions.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "This section provides information about the security features and recommendations for BreathCare Management System. This information is intended to help you understand how the system protects your data and what actions you can take to maintain security.", "new_text": "This chapter is written for the healthcare professional who uses BreathCare Management System, not as a technical specification. Unless a step tells you to take an action (for example, change your password, sign out, or contact support), the text is for your awareness. You do not configure network ports during routine patient follow-up. Use Contact Us or your organization administrator when you need support.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "available nvavitation menu options, their functions and the user roles taht can access them.", "new_text": "The table below describes the available navigation menu options, their functions and the user roles that can access them.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "you may have access to some or all of these .", "new_text": "Depending on your role and permissions, you may have access to some or all of these navigation menu options.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Insert SN card into the SD card reader on your computer and copy the folder containing .BYS files to your computer.", "new_text": "Insert the SD card into the SD card reader on your computer and copy the folder containing .BYS files to your computer.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "wirelessly tran smitted data", "new_text": "SD card data import may supplement or overwrite wirelessly transmitted data for the same period. Verify that the SD card data belongs to the correct patient and device before importing.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "assign Clincal User/Physician.", "new_text": "Step 3: Bind device and assign Clinical User/Physician.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Cinical user/physician", "new_text": "Clinical user/physician", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "using following search criterias:", "new_text": "You can filter follow-up notes using the following search criteria:", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "The logs includes the following information.", "new_text": "The logs include the following information.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "Remainder Risk Notification", "new_text": "Residual Risk Notification", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "When you deactivate a patient, the device will be automatically unbound and no new device can be bound after deactivation.", "new_text": "When you deactivate a patient, the device is automatically unbound (disconnected from BreathCare Management System) and no new device can be bound after deactivation.", "require_unique": true}, {"type": "insert_paragraph_after_contains", "anchor": "See HYPERLINK \\l \"_Remote Parameter Adjustment\" Re", "new_text": "If an on-screen message does not match the result you expected, compare the message text with Frequently Asked Questions and with the Caution or Note in the related task. When a screenshot of the on-screen message is provided in your release of this IFU, use it to confirm you are looking at the same message.\nA Symbols Glossary (symbol, Standard Development Organization designation and reference number, symbol title, meaning, and explanation) is required for the Appendix of this IFU. No symbol table is present in the current base text; supply the glossary from the controlled symbol set used in this IFU before release. Do not invent symbol titles or SDO numbers here.", "require_unique": true}, {"type": "replace_paragraph_contains", "anchor": "See HYPERLINK \\l \"_Remote Parameter Adjustment\" Re", "new_text": "See HYPERLINK \\l \"_Remote Parameter Adjustment\" Remote Parameter Adjustment. Open the patient’s detail page, open the Device information tab, and click Change settings for devices that support remote control.", "require_unique": true}]}
+
+### UPDATED_TEXT
+BreathCare Management System
+
+Instructions for Use
+
+Doc. No.: BCMAS-UDN-001 Version No.: A/1
+
+BreathCare Management System
+
+Instructions for Use
+
+Nanjing Yuyue Software Technology Co., Ltd.
+
+No.1 Huanyuan East Road, Xuzhuang Software Park, Xuanwu District, Nanjing, Jiangsu 210018 China
+
+Tel: +86-025-85582707
+
+Metrax GmbH
+
+Rheinwaldstr. 22, 78628 Rottweil, Germany
+
+BCMAS-UDN-001：version A/1
+
+Prepared date：2025-12
+
+This Instructions for Use is only to be used by trained healthcare professionals.
+
+Legal and Regulatory Notices
+
+BreathCare Management System Version 2
+
+English
+
+2026-07
+
+Important Notice
+
+This manual, as well as the software described herein, is supplied on the condition that it may only be used in accordance with its stated purpose. The information in this manual is furnished for the purpose of instruction and guidance only, is subject to change without notice, and should not be construed as an alternative to qualified medical advice. Nanjing Yuyue Software Technology Co., Ltd. assumes no responsibility or liability for any errors or inaccuracies that may appear in this manual. If you find an error, or if an instruction does not match what you see on screen, contact Yuwell Technical Support (see Contact Us) or your organization administrator; follow the remaining instructions that still apply to your task. Other than with the written permission of Nanjing Yuyue Software Technology Co., Ltd., no part of this manual or the software described herein may be reproduced, stored in a retrieval system, or transmitted in any form or by any means, electronic, mechanical, recording, or otherwise. All patient identities and data in this manual are fictional.
+
+BreathCare Management System is a trademark of Nanjing Yuyue Software Technology Co., Ltd. All other trademarks are the property of their respective owners.
+
+Adobe is either a registered trademark or trademark of Adobe Systems Incorporated in the United States and/or other countries. Chrome is a trademark or registered trademark of Google LLC. in the United States and/or other countries. Firefox is a trademark or registered trademark of The Mozilla Foundation in the United States and/or other countries. Java is a trademark and/or registered trademark of Oracle and/or its affiliates. Microsoft, Windows, Edge, Excel and Outlook are either registered trademarks or trademarks of Microsoft Corporation in the United States and/or other countries. All other trademarks are the property of their respective owners.
+
+Basic Information
+
+System Name
+
+Product: BreathCare Management System
+
+Version: 2
+
+Model: BreathCare WEB
+
+Intended Use
+
+BreathCare Management System is a web-based solution for healthcare professionals intended to:
+
+• assist in the diagnosis of sleep disordered breathing in adult patients through analysis of data recorded by the compatible home sleep test device of this system.
+
+• transfer and display device and therapeutic information that has been transmitted remotely from the patient’s therapy device. It is intended to support the standard follow-up care of patients who have been prescribed a compatible Yuwell therapeutic device (including but not limited to YH-390N, YH-390 and YH-680). The system can also adjust settings remotely for non-life support devices only.
+
+Caution
+
+BreathCare Management System is intended for non-life support devices ONLY. Do not use this system to monitor or control life support or critical care devices.
+
+Intended Users
+
+This Instructions for Use is for trained healthcare professionals: distributor personnel and healthcare providers who are authorized to use BreathCare Management System. It is not written for patients or caregivers as the primary reader.
+
+Intended Patient Population
+
+The system is intended for the same patient population as the compatible Positive Airway Pressure (PAP) devices: adults weighing more than 66 lb (30 kg) with Obstructive Sleep Apnea (OSA).
+
+Contraindications
+
+No contraindications specific to BreathCare Management System are identified in this manual. Do not use the system outside the intended users, intended patient population, and compatible non-life-support devices stated in this chapter. For contraindications of the prescribed therapy device, refer to that device’s instructions for use.
+
+Clinical Benefits
+
+The clinical benefit of the system is the ability to collect and analyze PAP data when used as intended, potentially allowing for early detection of treatment issues or other health problems and decreasing use of healthcare resources and costs of therapy.
+
+Compatible Devices
+
+The compatible Yuwell therapeutic devices named in the intended use of this system are YH-390N, YH-390, and YH-680 (non-life-support devices only). Refer to each device’s own instructions for use for device-specific operation and contraindications. Remote setting adjustment is available only for compatible non-life-support devices that support remote control.
+
+Security Features
+
+BreathCare Management System helps your organization comply with the requirements of applicable privacy regulations in your country. BreathCare Management System has implemented the following security features that enable your organization to comply with applicable privacy regulations:
+
+Password protection that restricts access to clinicians and healthcare providers who are authorized to view patient records
+
+Role-based access with different access levels depending upon job function
+
+Data encryption that prevents anyone other than the intended recipient from viewing data
+
+Verification code during sign-in to help protect your account
+
+Audit logging of user actions and patient data modifications
+
+Caution
+
+To protect your computer equipment, keep your company and patient data safe and patient treatment secure, we recommend the following:
+
+Have up-to-date antivirus software.
+
+Use firewalls to prevent unauthorized access to your computer.
+
+Keep your operating systems and applications up to date with security patches.
+
+Follow other security policies and advice from your organization.
+
+System Requirements
+
+To use BreathCare Management System fully, you must meet the following requirements.
+
+General Requirements
+
+For the wireless transfer of data to occur in a patient location, you must have the following:
+
+A prescribed and compatible Yuwell therapy device.
+
+The therapy device must be located in a wireless coverage area (check the signal strength indicator for wireless coverage).
+
+The therapy device must be turned on at all times.
+
+System Requirements(hardware, operation system, and browser)
+
+Network Requirements
+
+Minimum bandwidth:10 Mbit/s
+
+Recommended:20 Mbit/s or higher for optimal performance
+
+Supported network types: WAN, WiFi cellular
+
+The system requires stable internet connectivity for:
+
+Real-time data transmission from patient devices
+
+Remote parameter adjustment commands
+
+Software updates and security patches
+
+NOTE: Data transmission may be delayed or interrupted if network bandwidth falls below the minimum requirement or if network connectivity is unstable.
+
+Additional Software Requirements
+
+Adobe Acrobat Reader 10.0.1 or above (for viewing exported PDF reports)
+
+Microsoft Office Excel 2007 or above (for patient import/export templates)
+
+Safety Information
+
+Safety messages are organized using signal words that indicate the severity of the potential hazard. The following signal words are used throughout this document to indicate the level of hazard:
+
+CAUTION
+
+Indicates a hazardous situation which, if not avoided, could result in minor or moderate injury.
+
+NOTE: Indicates information that is important for the proper use of the system but is not directly related to personal safety.
+
+Safety messages in this manual use the signal word CAUTION in capital letters so they are easier to find. Prohibitions use sentence-case “Do not” rather than all-caps in body sentences. Numbered steps must be completed in order; bullet lists are not a required sequence. When a screenshot is shown with a step, use that image only for that step; match on-screen labels (including symbol-only controls) to the wording of the step.
+
+General warnings and precautions (read these before use; the same messages are repeated at the related steps):
+
+BreathCare Management System is intended for non-life support devices only. Do not use this system to monitor or control life-support or critical-care devices.
+
+This Instructions for Use is only to be used by trained healthcare professionals.
+
+If a statement in this manual does not match the software on screen, contact Yuwell Technical Support or your organization administrator.
+
+Keep antivirus software, firewalls, and operating-system security patches up to date. Do not share sign-in credentials.
+
+When a patient is deactivated, the associated device is automatically unbound (disconnected from remote monitoring), and no treatment data is uploaded until the patient is reactivated.
+
+Unbinding a device immediately stops therapy data upload from that device. Export needed reports before you unbind.
+
+BreathCare Management System is not intended for remote titration. Prescription-related setting changes require the patient’s physician approval.
+
+SD card data import may supplement or overwrite wirelessly transmitted data for the same period. Confirm the device SN belongs to the correct patient before importing.
+
+Clinical decisions should not rely solely on remotely transmitted data. Verify critical data on the device when needed.
+
+Export and securely store patient data before your organization stops using the system.
+
+Get Started
+
+If you do not yet have an account, complete Account Registration first. If you are signing in for the first time, complete First-Time Setup (user agreement, upgrade notice, and, for an Admin account, compliance threshold) before routine work. Then sign in. See HYPERLINK \l "_Sign In to BreathCare WEB" Sign In to BreathCare Management System. This manual is a reference: use section titles (for example, Basic Information, Manage Patients) to see which topic you are in; you do not have to read every chapter in order.
+
+Once you sign in, learn how to navigate the BreathCare Management System user interface so you can begin to manage patients and devices. See HYPERLINK \l "_Navigate BreathCare WEB" Navigate BreathCare Management System.
+
+Sign In to BreathCare Management System
+
+To sign in to your account:
+
+Go to the BreathCare Management System sign-in page.
+
+Enter your username in the Account field.
+
+Enter your password in the Password field.
+
+Enter the verification code displayed on screen (CAPTCHA image).
+
+Read and agree to the User Agreement and Privacy Policy by checking the agreement box.
+
+Click Log in.
+
+BreathCare Management System directs you to the Home page upon successful authentication.
+
+Note：
+
+For security purposes, BreathCare Management System automatically signs you out when there has been no activity for 15 minutes. Each request within the last 10 minutes of your session automatically refreshes the token.
+
+For security purposes, your account will be locked for 15 minutes after 5 consecutive failed login attempts. After the lockout period, you may attempt to sign in again.
+
+Account Registration
+
+Account Registration and First-Time Setup are both part of getting an account ready. Create staff accounts here; first-time prompts at sign-in are described in First-Time Setup.
+
+User with Admin account type can create accounts for their staff. If you are an Admin user, see HYPERLINK \l "_Account Management" Account Management.
+
+Reset Your Password
+
+If you forget your password:
+
+On the sign-in page, click Forget password.
+
+Enter your Account (username) in the account field.
+
+Enter your New password.
+
+Click Forget password to submit.
+
+Check your account email inbox for the password reset confirmation email.
+
+Click the link in the email to confirm the password reset.
+
+The confirmation page displays the reset result:
+
+Reset successful — Your password has been changed.
+
+Reset failed — The reset could not be completed. Please try again.
+
+Link has expired, please reapply — The confirmation link has expired. Return to the sign-in page and start over.
+
+Click I have reset, proceed to login to return to the sign-in page.
+
+Note：
+
+If you do not see the email in your inbox, check your spam or junk folder.
+
+If you did not receive the email, click Not received, resend on the confirmation page.
+
+The reset link has a limited validity period. If the link expires, you must start the process again.
+
+Password Requirements:
+
+Your password must contain:
+
+A minimum length of 10 characters
+
+At least one uppercase letter (A-Z)
+
+At least one lowercase letter (a-z)
+
+At least one number (0-9)
+
+At least one special character: ! @ # $ % ^ & * ( ) _ + - = [ ] { } | ; : , . ? /
+
+First-Time Setup
+
+If you are an administrator signing in for the first time, complete these prompts before you start routine patient work.
+
+The first time you sign in, you may be prompted to complete the following:
+
+Accept the User Agreement and Privacy Policy. Read both documents and check the agreement boxes.
+
+Review the Upgrade Notice. If the system has been updated, a changelog is displayed. Click I have confirmed to dismiss.
+
+Set your compliance threshold (for admin account type). Configure the default usage duration threshold and leak threshold for your organization.
+
+Navigate BreathCare Management System
+
+After signing in, the BreathCare Management System directs you to the Home page. The main navigation menu is displayed at the top of the screen.
+
+Depending on your role and permissions, you may have access to some or all of these navigation menu options.
+
+The table below describes the available navigation menu options, their functions and the user roles that can access them.
+
+Account Types and Permissions
+
+The account type assigned to BreathCare Management System accounts determine what permissions the user has to view patient information and perform tasks within BreathCare Management System.
+
+BreathCare Management System supports the following account types:
+
+Note:
+
+Different account types have different access permissions for the Organization section. For more details, see HYPERLINK \l "_Toc586514411" Manage Organization. Contact your organization administrator to request a change to your level of access.
+
+Access Home Page (Dashboard)
+
+The BreathCare Management System Home page provides an overview of your patients, devices, physicians, and key therapy data. It is the default page displayed after you sign in.
+
+Note: Data on the Home page is updated at regular intervals. The last update time is displayed in Data Overview.
+
+Data Overview
+
+The Data Overview displays four summary cards. Each card shows a different metric, its current total, and the change from the previous day or previous month. The small text in the top-right corner of each card (for example, “This month” with a comparison value) is the comparison period and the amount of change for that period. Treat it as a trend indicator; it does not replace review of the patient’s therapy data.
+
+Compliance Analysis
+
+The Compliance Analysis displays clinical average use time, statistical average use time, and compliance rate across different time periods.
+
+Device Stats
+
+The Device Stats displays two charts:
+
+Device Model Distribution: A donut chart showing the distribution of device models within the organization by count. The center of the chart displays the total number of devices in the organization.
+
+Connectivity Distribution: A donut chart showing the distribution of device connectivity types within the organization, with percentage values displayed.
+
+Treatment Analysis
+
+The Treatment Analysis section identifies patients who may require clinical attention based on therapy metrics. A line chart displays the number of patients for each therapy metric over the specific time period.
+
+Usage Stats
+
+The Usage Stats displays a bar chart showing device usage for different time windows: Last 7 Days, Last 14 Days, Last 30 Days, and Last 90 Days.
+
+Manage Patients
+
+You can view, create, and update patient files from the Patient page. Users with Clinical User or Physician roles have access to the Patient page.
+
+View the Patient List
+
+The Patient List displays all patients who are assigned to your locations within the organization. Use the navigation menu to open Patient. The list includes a patient name column; use that column to identify the patient before you open the record. If a screenshot of the Patient List is shown in this chapter, use it as the overview of the screen areas named in the steps below.
+
+To access the Patient List page, select Patient from the navigation menu.
+
+To search a patient:
+
+Enter your search criteria in the search fields. To show or hide additional fields, click Expand/Collapse.
+
+Click Search.
+
+Click Reset to clear all filters.
+
+Filter Button:
+
+You can filter the patient list by the buttons above the patient list:
+
+Click All to show all patients.
+
+Click a button to display patients who meet the selected criteria. When a filter button is selected, time period options are displayed (Last 7 days, Last 14 days, Last 30 days, and Last 90 days).
+
+Click Customize labels to select which filter buttons are displayed on the Patient page.
+
+Patient List:
+
+Color Legend for the Date column
+
+Manage Individual Patients
+
+The Patient Detail page provides comprehensive information including therapy data, device settings, compliance charts, follow-up records, and event logs.
+
+To access a patient's detail page, select the patient from the patient list.
+
+The page header displays the patient's basic information and device information.
+
+View and Edit Patient Information
+
+You can view and edit the patient Information on the Patient Information page.
+
+To edit a patient's information:
+
+In the patient list, select the patient record you want to edit.
+
+In the Patient Information area, click Edit. Use the control in the Patient Information area of the selected patient record.
+
+Update the relevant information.
+
+Click Completed.
+
+Change Patient Status
+
+To deactivate a patient:
+
+Select the patient from the patient list.
+
+In the Patient Information area, click Deactivate. Use the control in the Patient Information area of the selected patient record (not a control in the top navigation menu). Confirm that the patient name on the page is the intended patient before you continue.
+
+Confirm the action.
+
+Caution
+
+When a patient is deactivated, the associated device is automatically unbound (disconnected from remote monitoring), and no treatment data is uploaded onto BreathCare Management System until the patient is reactivated.
+
+To activate a patient:
+
+Filter the patient list to display inactive patients using the Device Binding Status search criteria.
+
+Select the patient.
+
+In Patient information, click Activate.
+
+Confirm the action.
+
+View Data Summary
+
+The Data Summary displays charts that summarize the patient's therapy data for the selected time period. You can select from the following time periods:
+
+Last 7 Days
+
+Last 14 Days
+
+Last 30 Days
+
+Last 90 Days
+
+Custom date range
+
+Available Charts
+
+Charts in this view summarize therapy usage and compliance for the selected period. 90 Days Compliance is shown as a progress bar for the patient's compliance rate over the last 90 days.
+
+View Detailed Graph
+
+The Detailed Graph provides waveform for individual therapy sessions. A Date Tree on the left allows you to browse available dates (organized by Year > Month > Day).
+
+Depending on the device model, the waveform may display Pressure, Leak, AHI event, SpO₂ , and Pulse Rate.
+
+To view detailed graphs:
+
+On the Patient Detail page, navigate to the Detailed graph tab.
+
+Select a specific date from the Date Tree. The charts update to display data for the selected date.
+
+Available charts
+
+View and Unbind Device
+
+The Device Information displays the basic information and current settings of the device assigned to the patient.
+
+In this manual, bind means the therapy device is connected to BreathCare Management System for remote data transfer. Unbind means the device is disconnected from remote monitoring and remote upload stops. On-screen control labels remain Bind and Unbind; read them as connect and disconnect.
+
+Note: The parameters displayed under the Current Settings vary depending on the device model.
+
+Unbind a device:
+
+The Unbind button is available when a device is currently bound. To unbind a device:
+
+Click Unbind.
+
+Click Confirm.
+
+Caution
+
+Unbinding a device disconnects it from BreathCare Management System and immediately stops all therapy data upload from this device. Before you click Unbind, confirm that the patient no longer requires remote monitoring and export any necessary reports.
+
+If no device is currently bound to the patient, the system displays the most recently bound device and its usage period.
+
+Remote Parameter Adjustment
+
+Caution
+
+BreathCare Management System is not intended for remote titration. Consult a physician for any changes you make to therapy settings that modify an existing prescription. Incorrect settings may result in inappropriate therapy delivery. Ensure that all prescription changes are approved by the patient's physician.
+
+You can remotely adjust device settings for compatible devices under Device information tab. This allows you to modify therapy parameters without requiring the patient to visit the clinic.
+
+Remote Parameter Adjustment
+
+Note:
+
+Remote parameter adjustment is only available for devices that support remote control. The Change settings button is not visible for devices that do not support this feature.
+
+If the device is offline, parameter changes are queued and applied when the device reconnects. The command expires after 48 hours.
+
+To remotely adjust device settings:
+
+Open the patient's detail page.
+
+Navigate to the Device information tab.
+
+Review the current settings displayed in the Current settings section.
+
+Click Change settings to enter edit mode.
+
+Complete this step on the Device information tab. Keep the on-screen controls for this step in view before you change values. Repeat the Caution about prescription changes before you click Confirm changes. Perform numbered steps in order.
+
+Modify the desired parameters:
+
+Key Parameters (varies by device model):
+
+Click Confirm changes.
+
+Operation Log
+
+To view the history of remote parameter adjustments, click View changes history from the device detail page. The logs include the following information.
+
+Follow-Up Tab
+
+The Follow-up tab displays follow-up notes added to the patient. You can create, edit, and delete follow-up for the patient.
+
+You can filter follow-up notes using the following search criteria:
+
+To add a follow-up record:
+
+Click New follow-up.
+
+Select the Follow-up type (Note or Rapid intervention).
+
+Enter your Note (maximum 1000 characters).
+
+Click Confirm.
+
+Log Tab
+
+The Log tab displays a chronological record of activities performed for the patient, including creating the patient record, editing patient information, and binding or unbinding a device. The log list contains the date and time of the activity, the user who performed the action, the event type, the initial state, and the new state.
+
+SD Card Data Import
+
+You can import therapy data from an SD card if wireless data transfer is not available.
+
+To import SD card data:
+
+Insert the SD card into the SD card reader on your computer and copy the folder containing .BYS files to your computer.
+
+On the Patient Detail page, click SD card import.
+
+Select Click to select a folder and navigate to the SD card data folder.
+
+Select the folder containing the .BYS files. The system uploads and parses the files automatically.
+
+Verify that the device SN matches the patient's assigned device.
+
+Click Confirm to save the imported data.
+
+Caution
+
+SD card data import may supplement or overwrite wirelessly transmitted data for the same period. Verify that the SD card data belongs to the correct patient and device before importing.
+
+Note: The device SN on the SD card must match the patient's bound device.
+
+Export Report
+
+You can generate and download reports for an individual patient from the Patient Detail page. BreathCare Management System creates all reports in Adobe PDF format.
+
+To generate and download a report:
+
+Select a patient from the patient list to open the patient's detail page.
+
+Click Export report.
+
+Select Date range.
+
+Select one or more Report Types.
+
+Optionally, select Key data display to include in the report:
+
+AHI
+
+Average usage time
+
+Compliant
+
+Compliance rate
+
+Click Confirm. The system generates a report preview.
+
+Click Save to download the report as a PDF file to your computer.
+
+Add a Patient
+
+To create a new patient:
+
+Select Patient from the navigation menu.
+
+Click New Patient.
+
+Complete the three-step form:
+
+Step 1: Enter patient information.
+
+Basic Info
+
+Other Info (Optional)
+
+Step 2: Enter clinical data (Optional).
+
+Polysomnograph (Basic)
+
+Polysomnograph (Titration)
+
+Step 3: Bind device and assign Clinical User/Physician.
+
+Device
+
+Clinical user/physician
+
+Click Completed.
+
+Note: Usage data is displayed only after the device is bound to the patient.
+
+Import Patients
+
+You can import multiple patients at once using an Excel template.
+
+To import patients in batch:
+
+From the Patient menu, click Import Patients.
+
+Click Click to download template to download the Excel template.
+
+Fill in the patient data according to the template format.
+
+Important during this step: supported formats are .xls and .xlsx; the file size must not exceed 5 MB; each bulk import must contain no more than 500 entries.
+
+Drag and drop the file into the upload area, or click the upload area to select a file from your local machine.
+
+Optionally, check Skip the bound devices for import to skip devices that are already bound.
+
+Click Confirm.
+
+Note:
+
+Supported formats are .xls and .xlsx. The file size must not exceed 5 MB.
+
+Important: meet the file format, 5 MB size limit, and 500-entry limit in the import steps above before you click Confirm. Do not wait until after the import finishes to read these limits.
+
+Manage Device
+
+The Device page is a device list: you can search and view device data for devices in your organization. This page is not used to add or delete devices. Assigning a device to a patient is done by binding the device on the patient record (see View and Unbind Device).
+
+To access the Device List page, select Device from the navigation menu.
+
+Search for devices:
+
+Enter your search criteria in the search fields. To show or hide additional fields, click Expand/Collapse.
+
+Click Search.
+
+Click Reset to clear all filters.
+
+Search criteria:
+
+Device List
+
+Note: There is no separate SIM card management page. SIM card information is limited to the expiration date displayed as a column in the device list table.
+
+Manage Organization
+
+The Organization section provides access to Organizational Information, Organization Management, Location Management, Account Management, and Audit Trail. The permission access for each account type to the sub-sections is as follows:
+
+View Organization Information
+
+The Organization Information tab displays your organization's details.
+
+All account types can view the organization information but only Admin accounts can edit the information.
+
+To edit organization information:
+
+Click Edit.
+
+Update the following information:
+
+Organization name
+
+Organization address
+
+Phone number
+
+Click Save.
+
+To upload the organization logo:
+
+Click the logo area
+
+Select an image from your computer. The supported formats include PNG, JPG, and JPEG.
+
+Important (read during the upload step): The recommended logo size is 360x360px with a white or transparent background.
+
+Manage Organization
+
+The Organization Management tab displays all associated organizations. It also allows Admin users to create and edit associated organizations.
+
+This tab is Organization Management, a subsection of the Organization section. It is not the same as the parent Organization menu. Use the tab name when you look for create/edit organization tasks.
+
+To search an organization:
+
+Enter the organization name. You can search by entering the full organization name or part of the name.
+
+Click Search.
+
+Click Reset to clear the search.
+
+To add an organization:
+
+Click the Organization Management tab.
+
+Click Add organization.
+
+Enter the following fields and create the first Admin account.
+
+Click Save.
+
+The organization list displays the following information:
+
+To edit an organization information:
+
+Click Edit in the Operation column from the organization list.
+
+Update the relevant information.
+
+Click Save.
+
+Manage Location
+
+Location management tab displays organization and hospital locations created within the organization. Admin account can create, edit, and delete locations.
+
+To search a location:
+
+Enter the location name in Location filter field. You can search using part of the location's name.
+
+Click Search.
+
+Click Reset to clear all filters.
+
+The Location list displays basic information of locations within the organization.
+
+To add a location:
+
+Click Add Location.
+
+Enter the following information:
+
+Click Save.
+
+To edit a location:
+
+1. Click Edit in the Operation column from location list.
+
+Update the location information.
+
+Click Save.
+
+To delete a location:
+
+1. Click Delete in the Operation column in location list.
+
+2. Click Confirm.
+
+Manage Account
+
+Account management tab display accounts created within the organization.
+
+Users with Admin account role can create, edit, and deactivate or activate account.
+
+To create a new account:
+
+1. Click Add Account.
+
+2. Enter the following information:
+
+Account Name and Password
+
+Permissions
+
+Organization Internal Account Type
+
+Organization External Account Type
+
+Note:
+
+During account creation: Creating an account type automatically grants the corresponding permissions.
+
+No location assignment is required for Admin.
+
+Clinical Users can be assigned to one or more organization locations. If no location is assigned, the user has access to all organization locations.
+
+Physician users must be assigned to one or more hospital locations.
+
+Click Confirm.
+
+To edit an account:
+
+Select an account from the account list.
+
+Click Edit
+
+Update account information.
+
+Click Confirm.
+
+To deactivate or activate an account:
+
+Select an account from the account list.
+
+Click Deactivate or Activate.
+
+Click Confirm.
+
+To reset a password:
+
+Select an account from the account list.
+
+Click the Edit password option.
+
+Enter the new password.
+
+Confirm the reset.
+
+View Audit Trail
+
+The Audit Trail displays a chronological record of changes made to accounts within the organization, including account creation, account updates, account deletion, and other account-related activities.
+
+To search an audit trail:
+
+Enter your search criteria in the search fields.
+
+Click Search.
+
+Click Reset to clear all filters.
+
+Audit Trail List
+
+Access User Menu
+
+The User Menu provides access to Personal Center, eIFU, Contact Us, About, and Log Out. The menu opens from the user avatar at the top-right of the navigation menu. The forthcoming subsections describe those same options.
+
+To access the User Menu, hover over the user avatar in the top-right corner of the navigation menu. Confirm you can see Personal Center, eIFU, Contact Us, About, and Log Out before you select an item.
+
+Access Personal Center
+
+The Personal Center allows you to manage your own account settings, including view and edit profile (name and related fields for your account type) and change password. Admin users may also see Compliance Threshold and Leak Threshold; those fields are not visible to Physician accounts.
+
+View and Edit Profile
+
+To view your profile:
+
+Hover over your user avatar in the top-right corner and select Personal Center from the User Menu.
+
+View your current information. The fields displayed depend on your account type.
+
+Note: The Compliance Threshold and Leak Threshold fields are not visible to Physician accounts.
+
+To edit your profile:
+
+Select Personal Center from the User Menu.
+
+Click Edit.
+
+Update your profile information.
+
+Click Confirm.
+
+Change Password
+
+To change your password:
+
+Select Personal Center from the User Menu.
+
+Click Edit password.
+
+Enter the following information:
+
+Previous password — Your current password.
+
+New password — Your new password.
+
+Input new password again — Retype the new password to confirm.
+
+Click Confirm.
+
+Note: Your password must meet the following requirements:
+
+A minimum length of 10 characters
+
+At least one uppercase letter (A-Z)
+
+At least one lowercase letter (a-z)
+
+At least one number (0-9)
+
+At least one special character: ! @ # $ % ^ & * ( ) _ + - = [ ] { } | ; : , . ? /
+
+Access Electronic User Manual
+
+To view and download user manuals:
+
+Select eIFU from the User Menu.
+
+Select a manual from the sidebar.
+
+Click Download to download the selected manual in PDF format.
+
+Contact Us
+
+If you encounter any issues or have any feedback, please contact us through the following channel.
+
+Select Contact Us from the User Menu.
+
+Enter your issue description or suggestion in the Issue Description field (within 1000 characters).
+
+Enter your email.
+
+Click Submit.
+
+Click Confirm.
+
+A confirmation message appears indicating that the feedback has been submitted successfully.
+
+Click Understood to close the message.
+
+View About the System
+
+The About page displays the regulatory and system information.
+
+To view system information, Select About from the User Menu.
+
+The About page displays the following information:
+
+The page also displays UDI-DI, UDI, and QR code information for regulatory compliance.
+
+Understanding the Data
+
+This chapter explains therapy metrics shown in BreathCare Management System, including compliance and average usage time. Use it to interpret values on the patient and dashboard screens. It does not change a prescription by itself.
+
+Key Therapy Metrics
+
+The following subsections describe how compliance and usage time are calculated so you can apply the on-screen numbers in follow-up care.
+
+Compliance Calculation
+
+Compliance Threshold:
+
+The compliance threshold is the minimum daily usage duration required for a day to be considered "compliant." The default threshold is 4 hours, but this can be configured by the organization administrator.
+
+Compliance Period:
+
+Compliance can be calculated over the following periods:
+
+Last 7 Days
+
+Last 14 Days
+
+Last 30 Days
+
+Last 90 Days
+
+Last 180 Days
+
+Last Year
+
+Compliance Rate Formula:
+
+If the device binding time is within the selected time range (X days): Compliance Rate = (number of days with usage time >= threshold) / (number of days from device binding to present)
+
+If the device binding time exceeds the selected time range (X days): Compliance Rate = (number of days with usage time >= threshold) / X
+
+90-Day Compliance Calculation:
+
+1. If the device binding time is within 90 days: Compliance in the last 90 days = (number of days with usage time >= threshold) / (number of days from device binding to present).
+
+2. If the device is bound for more than 90 days: Compliance in the last 90 days = (number of days with usage time >= threshold) / 90.
+
+Example (illustrative only): if the compliance threshold is 4 hours, a device has been bound for 30 days, and 20 of those days have usage time at or above 4 hours, Compliance Rate = 20/30. If the same device has been bound for 120 days and 60 of the last 90 days meet the threshold, Compliance in the last 90 days = 60/90. Verify the device binding date before you use these values for clinical decisions.
+
+Average Usage Time:
+
+Clinical Average: Total use time in the interval / actual used days in the selected interval.
+
+Statistical Average: Total use time in the interval / total days of the selected interval.
+
+Note: Compliance calculation depends on the accuracy of the device binding date. Verify that the binding date is correct before relying on compliance data for clinical decisions.
+
+Disease Types
+
+Cybersecurity
+
+Note: BreathCare Management System is classified as Software Safety Class B in accordance with IEC 62304. This classification indicates that a software failure could potentially contribute to a hazardous situation that may result in non-serious injury HYPERLINK "https://blog.johner-institute.com/iec-62304-medical-software/safety-class-iec-62304/" \l "top" \t "_blank" . The system has been developed, verified, and validated following the lifecycle processes required for this safety class HYPERLINK "https://www.greenlight.guru/blog/iec-62304-software-safety-classes?utm_campaign=701UI00000mPjPhYAK&utm_source=blog&utm_medium=internal" \t "_blank" .
+
+This chapter is written for the healthcare professional who uses BreathCare Management System, not as a technical specification. Unless a step tells you to take an action (for example, change your password, sign out, or contact support), the text is for your awareness. You do not configure network ports during routine patient follow-up. Use Contact Us or your organization administrator when you need support.
+
+Security Controls
+
+BreathCare Management System implements the following security measures:
+
+Account Security:
+
+Username and password sign-in with a verification code to help protect your account
+
+Password complexity requirements to help ensure strong passwords (minimum 10 characters, including uppercase, lowercase, a number, and a special character)
+
+Automatic sign-out after 15 minutes of inactivity to help protect your account if you step away
+
+Access Control:
+
+Role-based access with three account types: Admin, Clinical User, and Physician
+
+Each role has different access levels depending upon job function
+
+Menus and features are shown or hidden based on your assigned role
+
+Activity Logging:
+
+User sign-in attempts are recorded, including failed attempts
+
+Changes to patient records are logged with the user, date, and details of the change
+
+Device parameter changes are logged with the operator, timestamp, and result
+
+Account changes (creation, deactivation, permission changes) are logged
+
+Admin can view the complete audit trail from the Organization > Audit Trail tab
+
+System Updates:
+
+BreathCare Management System is updated regularly to address security improvements
+
+You are notified of updates when you sign in
+
+14.1.1 Network Ports and Interfaces
+
+BreathCare Management System uses the following network interfaces for communication:
+
+All communication channels use encrypted protocols (TLS 1.2 or higher). No unencrypted data is transmitted over these interfaces.
+
+14.1.2 Security Configuration
+
+BreathCare Management System provides the following configurable security settings:
+
+Session Timeout: Fixed at 15 minutes of inactivity
+
+Compliance Threshold: Configurable by organization administrator (default: 4 hours)
+
+Leak Threshold: Configurable by organization administrator
+
+User-Configurable Security Settings:
+
+Users can change their own password at any time from the Personal Center
+
+Users can enable/disable email notifications for account activity
+
+Organization administrators can deactivate user accounts
+
+Caution
+
+Changes to security configuration should only be made by authorized organization
+
+administrators. Incorrect configuration may compromise the security of patient data.
+
+14.1.3 Residual Risk Notification
+
+Caution
+
+Despite the system's security controls and risk mitigation measures, the following residual risks remain and cannot be completely eliminated:
+
+Data transmission interruptions due to network connectivity issues, device power status, or wireless signal interference
+
+Unauthorized access if user credentials are not properly protected
+
+Users should follow their organization's IT security policies and report any suspected security incidents to the system administrator immediately.
+
+Recommendations for Your Computer and Network
+
+To help keep your patient data safe and secure, we recommend the following:
+
+On Your Computer:
+
+Keep your antivirus software up to date
+
+Use a firewall to help prevent unauthorized access to your computer
+
+Keep your operating system and web browser up to date with the latest security updates
+
+Do not share your sign-in credentials with anyone
+
+Sign out of BreathCare Management System when you are finished using it, especially on shared computers
+
+On Your Network:
+
+Use a secure internet connection
+
+Avoid using public or unsecured Wi-Fi networks when accessing patient data
+
+Follow your organization's IT security policies and guidelines
+
+Interoperability risk
+
+Caution
+
+BreathCare Management System relies on wireless network connectivity for data transmission from patient devices. Data transmission may be affected by:
+
+Network coverage and signal strength at the patient location
+
+Internet connectivity stability
+
+Device power status
+
+Clinical decisions should not rely solely on remotely transmitted data. Verify critical data through direct device inspection when necessary.
+
+Software Updates
+
+BreathCare Management System includes a built-in version tracking system that notifies you of available updates.
+
+How Updates Work:
+
+System updates are delivered automatically by the manufacturer.
+
+When you sign in after an update, you will see an upgrade notice with a summary of changes.
+
+Click I have confirmed to dismiss the notice and continue.
+
+How to Check Your Version:
+
+Click your user avatar in the top-right corner and select About.
+
+The About page displays the current system name, model, version number, and manufacturer information.
+
+14.3.1 Security Update Support
+
+BreathCare Management System receives security updates for the expected lifetime
+
+of the system. End-of-support dates for specific versions will be communicated in advance through:
+
+In-system notifications upon sign-in
+
+Email notifications to organization administrators
+
+Yuwell official website announcements
+
+When a version reaches end of support:
+
+Security updates may no longer be provided
+
+Continued use may increase cybersecurity risks
+
+Planning migration to a supported version is recommended
+
+For information about the support status of your current version, contact your Yuwell representative or check the About page in the system.
+
+Activity Logging
+
+BreathCare Management System monitors and records the following activities:
+
+Admin can view the complete audit trail from the Organization > Audit Trail tab.
+
+14.4.1 Security Incident Response
+
+If you suspect a cybersecurity incident (e.g., unauthorized access, data breach,
+
+or compromised account):
+
+1. Immediately change your password
+
+2. Contact your organization administrator
+
+3. Contact Yuwell Technical Support.
+
+Provide the following information when reporting an incident:
+
+Date and time of the suspected incident
+
+Description of the observed activity
+
+User account affected
+
+Any error messages or unusual system behavior
+
+Yuwell will investigate and respond to reported security incidents in accordance
+
+with applicable regulations.
+
+Data Backup Recommendations
+
+To help protect your data, we recommend the following:
+
+Export important reports and save them locally as a backup.
+
+Keep local copies of any SD card data before importing.
+
+Contact your system administrator to learn about your organization's backup schedule and procedures.
+
+In the event of data loss or corruption, contact your local Yuwell representative for recovery assistance.
+
+When Your Organization Stops Using BreathCare Management System
+
+If your organization decides to stop using BreathCare Management System or migrate to a new system:
+
+Export all patient data and reports before discontinuing use.
+
+Deactivate all patient records.
+
+Unbind all devices from patients.
+
+Deactivate all user accounts.
+
+Contact your system administrator to ensure all patient data is properly removed in accordance with applicable regulations.
+
+Contact your local Yuwell representative for migration assistance.
+
+Caution
+
+Ensure all patient data has been exported and securely stored before
+
+decommissioning. Once data is erased from the system, it cannot be
+
+recovered.
+
+End of Support
+
+When BreathCare Management System or a specific version reaches end of support:
+
+The manufacturer will communicate the end-of-support date in advance.
+
+After end of support, security updates may no longer be provided.
+
+We recommend planning migration to a supported version before the end-of-support date.
+
+Security risks may increase over time after end of support.
+
+Contact your local Yuwell representative for migration assistance.
+
+SBOM
+
+Note: The SBOM (Software Bill of Materials) table below lists all software components used in BreathCare Management System, including third-party and open-source components. The support status and end-of-support date for each component are provided to assist users in managing their cybersecurity risk.
+
+For the latest component version and security patch information, contact your Yuwell representative or check the system's eIFU.
+
+Table 4 SBOM Related Information
+
+Note: BreathCare Management System utilizes third-party software components (SOUP — Software of Unknown Pedigree or Provenance) including MySQL, Redis, Nginx, RabbitMQ, and Docker. These components have been evaluated for cybersecurity risks and are maintained in accordance with the system's risk management process. Users should ensure that these components are kept updated with security patches as part of their organization's IT maintenance procedures.
+
+Frequently Asked Questions (FAQs)
+
+Security and Access
+
+Do I need an internet connection to use BreathCare Management System?
+
+Yes. BreathCare Management System requires an active internet connection.
+
+How do I get sign-in credentials for BreathCare Management System?
+
+Contact your organization administrator to create an account for you.
+
+I forgot my password. What should I do?
+
+See HYPERLINK \l "_Reset Your Password" Reset Your Password. On the sign-in page, click Forget password, enter your account name and a new password, submit the form, then check your email and click the confirmation link.
+
+Can I change my username?
+
+Contact your organization administrator to update your username.
+
+Why did BreathCare Management System sign me out?
+
+For security purposes, BreathCare Management System automatically signs you out when there has been no activity for 15 minutes. Sign in again to continue.
+
+Can my organization share one set of sign-in credentials?
+
+No. BreathCare Management System requires each individual to have a separate account. Each user will have their own profile and sign-in credentials.
+
+Compatibility
+
+What browsers are supported by BreathCare Management System?
+
+Google Chrome 86.0 or newer (recommended)
+
+Mozilla Firefox 42.0 or newer
+
+Microsoft Edge 87.0 or newer
+
+Safari 14.0 or newer
+
+Which operating systems are supported?
+
+Microsoft Windows 10 or newer
+
+Microsoft Windows 11
+
+macOS 10.15 or newer
+
+Linux (Ubuntu 20.04 or newer)
+
+What additional software is required?
+
+Adobe Acrobat Reader 10.0.1 or above (for viewing exported PDF reports)
+
+Microsoft Office Excel 2007 or above (for patient import/export templates)
+
+Patient Management
+
+How do I add a new patient?
+
+See HYPERLINK \l "_Add a Patient" Add a Patient. From the Patient menu, click New Patient and follow the three-step form.
+
+Can I import multiple patients at once?
+
+Yes. See HYPERLINK \l "_Import Patients in Batch" Import Patients in Batch. Download the Excel template, fill in the patient data, and upload the file.
+
+What happens when I deactivate a patient?
+
+When you deactivate a patient, the device is automatically unbound (disconnected from BreathCare Management System) and no new device can be bound after deactivation.
+
+Device Management
+
+How do I remotely change device settings?
+
+See HYPERLINK \l "_Remote Parameter Adjustment" Remote Parameter Adjustment. Open the patient’s detail page, open the Device information tab, and click Change settings for devices that support remote control.
+
+If an on-screen message does not match the result you expected, compare the message text with Frequently Asked Questions and with the Caution or Note in the related task. When a screenshot of the on-screen message is provided in your release of this IFU, use it to confirm you are looking at the same message.
+
+A Symbols Glossary (symbol, Standard Development Organization designation and reference number, symbol title, meaning, and explanation) is required for the Appendix of this IFU. No symbol table is present in the current base text; supply the glossary from the controlled symbol set used in this IFU before release. Do not invent symbol titles or SDO numbers here.
+
+Pending insertion (no heading/anchor in the provided base excerpt): a dedicated Troubleshooting chapter with on-screen error screenshots, and an Appendix Symbols Glossary table aligned with FDA symbol-glossary elements, once those sections exist in the controlled Word file.

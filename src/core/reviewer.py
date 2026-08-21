@@ -1844,8 +1844,7 @@ class DocumentReviewer:
                 # 多文档一致性审核内容多，总超时与单次读超时需更长，避免 ReadTimeout
                 response_content = complete_task(
                     prompt_text,
-                    poll_interval=2.0,
-                    timeout=600,
+                    poll_interval=5.0,
                 )
                 response_content = (response_content or "").strip()
             else:
@@ -1975,8 +1974,7 @@ class DocumentReviewer:
                 from .cursor_agent import complete_task
                 response_content = complete_task(
                     prompt_text,
-                    poll_interval=2.0,
-                    timeout=600,
+                    poll_interval=5.0,
                 )
                 response_content = (response_content or "").strip()
             else:

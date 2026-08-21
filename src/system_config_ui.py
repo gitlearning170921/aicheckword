@@ -192,6 +192,7 @@ def _ai_keys_for_provider(provider: str) -> List[str]:
             "cursor_repository",
             "cursor_ref",
             "cursor_embedding",
+            "cursor_agent_timeout_seconds",
             "ollama_base_url",
         ]
     return ["ollama_base_url"]
@@ -271,6 +272,7 @@ FIELD_LABELS: Dict[str, str] = {
     "cursor_repository": "GitHub 仓库（owner/repo）",
     "cursor_ref": "分支 / ref",
     "cursor_embedding": "Cursor 侧嵌入后端（如 ollama）",
+    "cursor_agent_timeout_seconds": "等待 Cursor Cloud Agent 完成的最长时间（秒，默认 3600；超时后仍会尝试取回已完成回复，避免白烧额度）",
     "llm_verify_ssl": "校验 HTTPS 证书（关闭=不校验，与侧栏一致）",
     "llm_trust_env": "使用系统代理（关闭=直连，与侧栏一致）",
     "llm_http_proxy": "显式 HTTP 代理（如 http://127.0.0.1:7897；国外 AI、DuckDuckGo 发布时间检索、Google Scholar 文献检索共用，国内/内网直连）",

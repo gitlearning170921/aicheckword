@@ -93,6 +93,8 @@ class Settings(BaseSettings):
     cursor_embedding: str = "ollama"
     cursor_verify_ssl: bool = True  # 已废弃，请用 llm_verify_ssl
     cursor_trust_env: bool = True  # 已废弃，请用 llm_trust_env
+    # 等待 Cloud Agent 完成的最长时间（秒）。初稿/长 prompt 常超过 10 分钟，默认 1 小时。
+    cursor_agent_timeout_seconds: int = 3600
 
     # 模型配置
     llm_model: str = "qwen2.5"
