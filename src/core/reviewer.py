@@ -17,6 +17,7 @@ from .document_loader import load_single_file
 from .db import get_dimension_options, get_corrections_for_collection, get_review_extra_instructions
 from .display_filename import is_probable_temp_upload_basename
 from .audit_handoff import _default_action_for_severity
+from .audit_basic_quality import BASIC_QUALITY_PROMPT_BLOCK, scan_basic_quality_issues
 
 
 def _registration_strictness_context(registration_type: str) -> str:
@@ -263,6 +264,11 @@ def _likely_english_document(text: str, declared_lang: str = "") -> bool:
     return False
 
 
+def _is_chunk_segment_name(file_name: str) -> bool:
+    """长文档分块审核时，file_name 形如「xxx.docx (第1/3段)」。"""
+    return bool(re.search(r"\(第\d+/\d+段\)\s*$", file_name or ""))
+
+
 def _extract_ids_by_prefix(text: str, prefix: str) -> set:
     p = (prefix or "").strip().upper()
     if not p:
@@ -339,6 +345,7 @@ REVIEW_SYSTEM_PROMPT = """你是一位资深的注册文档审核专家。你的
 - **引用工具/组件版本与时间逻辑（优先，医疗器械软件）**：文档中引用的**开发、构建、测试、运行环境、现成软件/SOUP、第三方库、操作系统、数据库、中间件、IDE、编译器、自动化测试工具**等若写明**具体版本号**，须核对：该版本**公开发布/GA 时间**是否**早于或等于**文档声称使用该工具/环境的**时间点**（如开发完成日期、测试执行日期、验证日期、报告编制日期、修订履历日期、环境快照日期等）。若某工具版本在文档所述时间点**尚未发布**（或明显不可能在该时间可用），构成**真实性/时间逻辑矛盾**，须作为**准确性或一致性**审核点列出；location 写明工具名、版本号与文档日期位置；suggestion 建议改为该时间点已发布且与项目一致的版本，或修正日期/表述并补充依据。**约束**：版本发布日期须基于**可核对**来源（官方发布说明、发行说明、知识库或上下文提供的 SOUP/工具清单附带日期）；**不得臆造**发布日期。若无法核实但逻辑上高度可疑，可列为 medium 并建议补充官方发布日期证据或调整表述。同类工具/组件在文档多章节、多表格、修订履历中的版本与日期须**自洽**。
 - **需求—开发—测试—风险可追溯性（仅单文档内，医疗器械软件）**：在**当前这一份**待审文档范围内，核查**追溯标识**（用户需求 ID/REQ、软件需求 ID、风险 ID、**CS 编号**、危害编号、测试用例/报告编号、追溯矩阵行/列引用等）是否**自洽、闭环**：正文、表格与矩阵中对**同一 ID** 的表述是否一致，是否存在「有 ID 无对应条目」「同一 ID 在本文档内指向矛盾」「应追溯却断链」。**不得**编造「未上传其他文档」类理由来输出**跨文件**追溯结论；**多份注册文档之间**同一追溯编号是否对齐、是否与《软件可追溯性管理程序》等制度一致，由系统中**「跨文档可追溯性审核」**专项执行，**不在**单文档审核任务中展开。若上下文或知识库提供**可追溯性受控程序文件**摘录，可审核**本文档**中的追溯格式、矩阵必备要素、签批等是否与程序要求相符。
 - **医疗器械软件：器械法规与软件工程双重要求（优先）**：对独立软件/SaMD 相关文档，须**同时**从**医疗器械监管侧**（适用范围与预期用途、风险管理与残余风险、说明书/标签要点、质量管理体系对软件相关活动的受控要求等——以项目资料与参考知识可核对者为准）与**软件生命周期工程侧**（需求、设计、实现、验证与确认、配置与变更、发布、网络安全与数据、现成软件/SOUP 等——以本文档实际涉及章节为准）审视；若明显只覆盖一侧而另一侧存在**关键缺口、矛盾或缺少应有关卡**，须作为合规性/完整性/一致性审核点列出。在 regulation_ref 中引用具体法规或标准条款时，须与上下文或审核点知识库中**可核对**的来源一致，**禁止虚构**条款号或通告号。
+- **基础质量（必须先查）**：序号/章节号/表格序号是否连贯；有无整段重复文案；产品名/型号/版本/适用范围等前后是否同一表述；引用文件清单与正文的文件名、编号、标准年代号是否一致。这类问题即使「浅」也必须列出，不得只写法规结论。
 
 **输出要求**：
 - 每个问题必须指明**在文档中的具体位置**（如「第3章 适用范围」「第5页 技术指标」或引用有问题的那句话/段落），不得笼统写「文档中」「全文」。
@@ -397,7 +404,8 @@ REVIEW_USER_PROMPT = """请根据以下审核点知识对待审核文档进行�
 16. **欧盟/美国注册文档语言（优先）**：若【本次审核维度】中的注册国家包含**欧盟或美国**，须核查待审文档是否为英文版本，或是否提供受控且可追溯的英文版本/翻译件；如仅有中文且无英文受控版本、或中英文关键术语不一致，须作为合规性或一致性审核点列出，并在 suggestion 中写明需补充/统一的英文文档与术语。
 17. **医疗器械软件双重要求（优先）**：对软件类注册文档，核查是否**同时**体现器械监管语境下的安全与风险证据、以及软件工程语境下的生命周期与验证证据；任一侧明显缺失或与另一侧矛盾时须列审核点。法规/标准引用须可核对，禁止虚构条款号。
 18. **验证与确认层次与测试证据（医疗器械软件，优先）**：核查文档中单元/集成/系统/确认等测试层次是否界定清楚、记录是否足以支撑结论（在文档类型范围内）；与需求/风险级别明显不相称时列出审核点。
-19. **引用工具/组件版本与时间逻辑（优先）**：提取文档中出现的**工具、框架、操作系统、数据库、现成软件/SOUP、第三方库**等**具体版本号**，与文档中的**开发/测试/验证/编制/生效/修订**等日期对照：若某版本在所述时间点**尚未公开发布**（或明显不可能可用），须作为**准确性或一致性**审核点列出，写明工具名、版本、文档日期位置及矛盾说明；suggestion 建议改为该时间点已发布的版本、或修正日期/表述并补充可核对依据。**禁止臆造**版本发布日期；无法核实时可建议补充官方发布说明，勿强行下结论为 high。"""
+19. **引用工具/组件版本与时间逻辑（优先）**：提取文档中出现的**工具、框架、操作系统、数据库、现成软件/SOUP、第三方库**等**具体版本号**，与文档中的**开发/测试/验证/编制/生效/修订**等日期对照：若某版本在所述时间点**尚未公开发布**（或明显不可能可用），须作为**准确性或一致性**审核点列出，写明工具名、版本、文档日期位置及矛盾说明；suggestion 建议改为该时间点已发布的版本、或修正日期/表述并补充可核对依据。**禁止臆造**版本发布日期；无法核实时可建议补充官方发布说明，勿强行下结论为 high。
+20. **基础质量（必须先查，禁止跳过）**：须检查并输出——(a) 章节/条款/列表/表格序号跳号或重号；(b) 整段或接近整段的重复文案；(c) 产品名称、型号、版本、适用范围、预期用途等前后表述不一致；(d) 引用文件/参考文献清单与正文引用的文件名、文件编号、标准号及年代号不一致。每类问题单独成条，location 引用原文或章节号。"""
 
 SUMMARY_PROMPT = """请根据以下审核发现，生成一段简洁的审核总结（200字以内）：
 
@@ -435,6 +443,7 @@ CURSOR_REVIEW_TASK = """你是一位资深的注册文档审核专家。请根�
 12. **医疗器械软件双重要求**：同时审视器械监管证据与软件生命周期/验证证据是否齐全、是否自相矛盾；法规引用须可核对。
 13. **验证与确认与测试证据**：测试层次与记录是否足以支撑需求与风险级别。
 14. **引用工具/组件版本与时间逻辑**：文档中写明的工具/SOUP/运行环境等**具体版本号**须与文档**开发/测试/验证/编制/修订**日期对照；若版本在所述时间点尚未公开发布，须作为准确性或一致性审核点列出。发布日期须可核对，禁止臆造。
+15. **基础质量（必须先查）**：序号是否连贯、有无重复文案、关键信息前后是否一致、引用文件/标准号年代是否与清单一致；不得因问题「太浅」而省略。
 """
 
 CURSOR_SUMMARY_TASK = """请根据以下审核发现，用中文生成一段简洁的审核总结（200字以内）。不要修改任何文件，仅输出总结文字。
@@ -454,7 +463,7 @@ MULTI_DOC_CONSISTENCY_PROMPT = """你是一位资深的注册文档审核专家�
 - **同一类信息在多份文档中的一致性（必须逐项核对）**：凡同一类信息在多于一份文档中出现时，须核对这些信息在各文档间是否一致；不一致须作为审核点列出并写明涉及文档与修改建议。重点包括但不限于：**预期用途**、**适用范围**、**预期用户/适用人群**、**工作原理**、**物理拓扑图/网络拓扑**、**体系结构图/软件架构**、**现成软件（含组件、版本、供应商）**、**风险（含风险分析、风险措施）**、**术语/缩略语**、**运行环境（硬件、软件、网络）**、关键技术指标、性能参数、禁忌症、引用标准、日期与版本号等。若某文档缺失本应在多文档中统一表述的条目，或表述与其它文档矛盾，须作为一致性审核点列出。
 - **设备编号与设备设施清单（跨文档）**：各文档中出现的**设备/工装/设施编号**须相互一致，且与**设备设施清单/台账/验证校准设备列表**（任一份本批文档或约定附件）**逐项对齐**；同一编号在不同文档中的设备名称、型号、安装位置、用途描述不得矛盾；不得出现仅在一份文档中出现的「孤立编号」而无法与清单对应的情况（除非文档明确其为临时/外部编号并说明）。
 - **设备编号规则与程序文件（跨文档）**：若本批含**程序文件、质量手册附录或编号管理规定**与**记录类/报告类文档**，须核对记录中出现的设备编号**是否符合程序文件规定的编码规则**（前缀、位数、分段含义等）；程序已废止旧规则而记录仍用旧格式，或不同文档对同一规则理解不一致，须作为一致性或格式规范审核点列出。
-- 日期、版本号、引用标准等是否一致。
+- 日期、版本号、引用标准等是否一致；各文档「引用文件」清单中的文件名、文件编号、标准号及年代号是否互相一致。
 - **岗位与人员（全文）**：各文档中**出现的所有岗位及人员**（含编审批签批栏及正文各章节）与岗位名称对应职责是否一致、是否与组织花名册（或受控人员清单）符合；跨文档间岗位与人员表述是否一致。
 - **签批与图片**：若某文档正文含 Word/Excel/PDF 的**嵌入图像版式检测**说明且指出存在签批相关嵌入图，勿再报该文档「签署空白」；跨文档比较时勿因纯文本未含手写姓名字符而认定未签。
 - **跨文档追溯编号与追溯矩阵（本任务不包含）**：**REQ/软件需求 ID、风险 ID、CS 编号、单元/系统测试用例编号**在各文档间是否**指向同一对象**、追溯矩阵是否闭环、是否符合组织可追溯性管理制度——**不在本「多文档一致性」任务中审核**，以免与专项重复；此类问题**一律不得**写入下方 JSON。跨文档追溯须由系统**「跨文档可追溯性审核」**专项执行。本任务仍可就**风险描述、控制措施文字表述**等与产品信息相关的**语义/数据一致性**在上文「同一类信息」范围内提出审核点，但**不得**展开「同一编号在多文档间是否对齐」式追溯链核对。
@@ -1209,11 +1218,26 @@ class DocumentReviewer:
     ) -> List[AuditPoint]:
         """
         程序级显性检查：补足模型容易漏掉但人眼一眼能看出的错误。
-        当前仅做低风险、通用、误报率低的检查：文件编号是否在正文出现。
+        含序号跳号、重复文案、关键字段前后不一致、引用文件/标准年代号，以及台账文件编号是否出现在正文。
         """
         pts: List[AuditPoint] = []
         fn = (file_name or "").strip()
         blob = (text or "")
+        try:
+            for f in scan_basic_quality_issues(blob, fn):
+                pts.append(
+                    AuditPoint(
+                        category=f.category,
+                        severity=f.severity,
+                        location=f.location,
+                        description=f.description,
+                        regulation_ref=f.regulation_ref,
+                        suggestion=f.suggestion,
+                        modify_docs=list(f.modify_docs or ([] if not fn else [fn])),
+                    )
+                )
+        except Exception:
+            pass
         # 先用台账下发的 document_number（若有），否则回退到文件名提取
         expected = str((review_context or {}).get("document_number") or "").strip()
         if expected:
@@ -1495,6 +1519,7 @@ class DocumentReviewer:
             context += review_context["case_context_text"]
         if review_context and review_context.get("extra_instructions"):
             context += "\n\n【自定义审核要求（请严格遵守）】\n" + (review_context.get("extra_instructions") or "")
+        context += "\n\n【基础质量必查】\n" + BASIC_QUALITY_PROMPT_BLOCK
 
         try:
             from datetime import date as _date
@@ -1594,18 +1619,19 @@ class DocumentReviewer:
             storage_basename=storage_basename,
             multi_doc_mode=False,
         )
-        # 程序级显性检查（补漏）
-        try:
-            audit_points = (
-                self._rule_based_obvious_checks(
-                    text,
-                    eff_display,
-                    review_context=review_context,
-                )
-                or []
-            ) + (audit_points or [])
-        except Exception:
-            pass
+        # 程序级显性检查（补漏）。分块审核只扫本段会漏掉全文序号/重复段，留给整篇合并后再扫。
+        if not _is_chunk_segment_name(file_name):
+            try:
+                audit_points = (
+                    self._rule_based_obvious_checks(
+                        text,
+                        eff_display,
+                        review_context=review_context,
+                    )
+                    or []
+                ) + (audit_points or [])
+            except Exception:
+                pass
         audit_points = self._deduplicate_audit_points(audit_points)
 
         report = AuditReport(file_name=eff_display)
@@ -1757,6 +1783,18 @@ class DocumentReviewer:
             storage_basename=storage_basename,
             multi_doc_mode=False,
         )
+        try:
+            all_points = (
+                self._rule_based_obvious_checks(
+                    text,
+                    file_name,
+                    review_context=review_context,
+                )
+                or []
+            ) + (all_points or [])
+            all_points = self._deduplicate_audit_points(all_points)
+        except Exception:
+            pass
 
         final_report = AuditReport(file_name=file_name)
         final_report.audit_points = all_points
