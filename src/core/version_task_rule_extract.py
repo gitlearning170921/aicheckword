@@ -197,6 +197,7 @@ def _empty_row_buckets() -> dict[str, list[tuple]]:
         "changeNmpa": [],
         "defect": [],
         "release": [],
+        "traceability": [],
     }
 
 
@@ -218,19 +219,6 @@ def _collect_process_hints(text: str) -> dict[str, Any]:
     }
 
 
-def _default_trace_row() -> list[tuple]:
-    return [
-        (
-            "trace",
-            "软件可追溯性分析报告",
-            "版本号X/Y位变更时",
-            "产品经理",
-            "日常软件变更需说明需求、开发、测试对应关系，通过禅道管理或者填写本报告",
-            "",
-        )
-    ]
-
-
 def _payload(
     *,
     rows: dict[str, list[tuple]],
@@ -249,7 +237,19 @@ def _payload(
         key: [list(item) for item in (rows.get(key) or [])]
         for key in ("changeCe", "changeNmpa", "defect", "release")
     }
-    serial_rows["traceability"] = [list(item) for item in _default_trace_row()]
+    trace_rows = [list(item) for item in (rows.get("traceability") or [])]
+    if not any(str((r[1] if len(r) > 1 else "") or "") == "软件可追溯性分析报告" for r in trace_rows):
+        trace_rows = [
+            [
+                "trace",
+                "软件可追溯性分析报告",
+                "版本号X/Y位变更时",
+                "产品经理",
+                "日常软件变更需说明需求、开发、测试对应关系，通过禅道管理或者填写本报告",
+                "",
+            ]
+        ]
+    serial_rows["traceability"] = trace_rows
     ok = any(serial_rows[k] for k in ("changeCe", "changeNmpa", "defect", "release"))
     ver = source_version or "V?"
     src = source_file or "YY-IW-020"
