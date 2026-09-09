@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import List, Optional
 
-from src.core.deficiency_store import list_injectable_deficiency_records
+from src.core.deficiency_store import STATUS_LABELS, list_injectable_deficiency_records
 
 
 def _as_date(val) -> Optional[date]:
@@ -33,7 +33,7 @@ def _priority_label(p: str) -> str:
 
 
 def _status_label(s: str) -> str:
-    return {"open": "未完成", "done": "已完成"}.get(str(s or ""), str(s or ""))
+    return STATUS_LABELS.get(str(s or ""), str(s or ""))
 
 
 def build_deficiency_lessons_context(
@@ -49,7 +49,7 @@ def build_deficiency_lessons_context(
     """构建【发补修正意见】区块。
 
     硬条件：同一 collection + 注册国家 + 注册类别 + issued_on <= as_of_date。
-    open 与 done 均注入；不按所属项目过滤。
+    open 与 in_progress、done 均注入；不按所属项目过滤。
     """
     country = (registration_country or "").strip()
     category = (registration_category or "").strip()

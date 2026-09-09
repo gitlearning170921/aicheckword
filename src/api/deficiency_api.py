@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from config import settings
 from src.core.deficiency_store import (
+    STATUS_LABELS,
     add_deficiency_asset,
     archive_deficiency_record,
     create_deficiency_record,
@@ -397,7 +398,7 @@ def _build_train_documents(row: Dict[str, Any], assets: List[Dict[str, Any]]) ->
         f"发补类型：{row.get('deficiency_type')}",
         f"发补来源：{row.get('deficiency_source') or '—'}",
         f"发补日期：{str(row.get('issued_on') or '')[:10]}",
-        f"整改状态：{row.get('remediation_status')}",
+        f"整改状态：{STATUS_LABELS.get(str(row.get('remediation_status') or ''), row.get('remediation_status'))}",
         f"注册国家：{row.get('registration_country')}",
         f"注册类别：{row.get('registration_category')}",
         f"发补意见：\n{row.get('opinion_text') or ''}",

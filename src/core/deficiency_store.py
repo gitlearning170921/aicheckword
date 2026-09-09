@@ -11,7 +11,12 @@ from src.core.db import _get_conn, init_db
 
 
 PRIORITY_VALUES = ("high", "medium", "low")
-STATUS_VALUES = ("open", "done")
+STATUS_VALUES = ("open", "in_progress", "done")
+STATUS_LABELS = {
+    "open": "未完成",
+    "in_progress": "正在整改中",
+    "done": "已完成",
+}
 TYPE_VALUES = ("registration_review", "type_testing")
 TRAIN_STATUS_VALUES = ("not_trained", "trained", "stale")
 ASSET_ROLES = ("before_doc", "after_doc", "opinion_file", "plan_file")
@@ -141,7 +146,7 @@ def _normalize_record_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     completed = _parse_date(data.get("completed_on"))
     if rem_status == "done" and not completed:
         completed = date.today()
-    if rem_status == "open":
+    if rem_status != "done":
         completed = None
     priority = str(data.get("priority") or "medium").strip() or "medium"
     if priority not in PRIORITY_VALUES:
@@ -715,7 +720,7 @@ def list_injectable_deficiency_records(
     registration_category: str,
     as_of_date: date,
 ) -> List[Dict[str, Any]]:
-    """注入用：active + 国家/类别一致 + issued_on <= as_of；含 open 与 done。"""
+    """注入用：active + 国家/类别一致 + issued_on <= as_of；含未完成、正在整改中与已完成。"""
     ensure_deficiency_tables()
     country = (registration_country or "").strip()
     category = (registration_category or "").strip()
